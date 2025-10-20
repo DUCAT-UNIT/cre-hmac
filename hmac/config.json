@@ -1,0 +1,7 @@
+{
+  "client_id": "49f249ad-788f-4297-890e-7f5522036c6d",
+  "data_stream_url": "https://api.testnet-dataengine.chain.link",
+  "feed_id": "0x00037da06d56d083fe599397a4769a042d63aa73dc4ef57709d31e9971a5b439",
+  "relay_url": "http://localhost:8080",
+  "network": "Mutinynet"
+}
