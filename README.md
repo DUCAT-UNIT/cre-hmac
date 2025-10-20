@@ -386,13 +386,3 @@ Bottlenecks:
 1. **Price decode uses heuristic offsets**: Chainlink Data Streams schema is undocumented
 2. **Single relay**: No multi-relay failover (add manually if needed)
 3. **Static private key**: No automatic rotation mechanism
-
-## License
-
-MIT
-
-## Support
-
-For issues or questions:
-- GitHub Issues: https://github.com/your-org/ducat/issues
-- Documentation: https://docs.chain.link/cre
