@@ -1,6 +1,6 @@
 # DUCAT - Threshold Commitment Oracle
 
-Privacy-preserving price threshold commitments for Bitcoin DLCs using Chainlink DON and Nostr.
+Privacy-preserving price threshold commitments for Bitcoin hashlocks using Chainlink CRE and Nostr.
 
 ## What It Does
 
@@ -20,8 +20,8 @@ Creates Hash160 commitments to price thresholds that reveal their secret only wh
 ### 2. Clone & Setup
 
 ```bash
-git clone https://github.com/your-org/ducat
-cd ducat
+git clone https://github.com/DUCAT-UNIT/cre-hmac
+cd cre-hmac
 
 # Install dependencies
 go mod download
@@ -32,7 +32,8 @@ go mod download
 DUCAT needs a Nostr relay to store threshold events. Start the included strfry relay:
 
 ```bash
-cd ../strfry
+git clone https://github.com/DUCAT-UNIT/strfry-http
+cd ../strfry-http
 docker-compose up -d
 
 # Verify it's running
@@ -84,7 +85,7 @@ Public Key:   6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621
 
 #### Step 3: Whitelist Your Public Key in strfry
 
-Edit `../strfry/strfry.conf` and add your public key:
+Edit `../strfry-http/strfry.conf` and add your public key:
 
 ```conf
 relay {
@@ -108,7 +109,7 @@ relay {
 ```bash
 cd ../strfry
 docker-compose restart
-cd ../ducat
+cd ../
 ```
 
 **Why?** strfry only accepts events signed by whitelisted public keys. Your DUCAT_PRIVATE_KEY signs events, and strfry verifies them using the derived public key.
@@ -116,9 +117,8 @@ cd ../ducat
 ### 5. Run Tests
 
 ```bash
-# Make sure you're in the ducat directory
-cd /path/to/ducat
-
+# Make sure you're in the http-cre directory
+cd ./cre-hmac
 # Set secrets (if not already set)
 export DUCAT_PRIVATE_KEY="8ce73a2db5cbaf4b0ab3cabece9408e3b898c64474c0dbe27826c65d1180370e"
 export DUCAT_CLIENT_SECRET="mNbl97whllgPRsk6smy69J884DnS0LIhTY478bVQyFdl47sB3GMOAsHOnDg8B9JYilERQ07Eqd2CNU76NXSkb1J6SFT6MeaR5du6ow4zudWymixR00mv4va7f957qmrK"
@@ -161,7 +161,7 @@ Expected: `main.wasm` created successfully.
 ```bash
 cre workflow simulate hmac \
   --target local-simulation \
-  --http-payload '{"domain":"alice.com","thold_price":94000}' \
+  --http-payload '{"domain":"cre.com","thold_price":94000}' \
   --trigger-index 0
 ```
 
@@ -177,7 +177,7 @@ cre workflow simulate hmac \
 ```bash
 cre workflow simulate hmac \
   --target local-simulation \
-  --http-payload '{"domain":"alice.com","thold_hash":"YOUR_HASH"}' \
+  --http-payload '{"domain":"cre.com","thold_hash":"YOUR_HASH"}' \
   --trigger-index 0
 ```
 
@@ -185,7 +185,8 @@ cre workflow simulate hmac \
 
 ```
 ┌─────────────────┐       ┌──────────────┐       ┌──────────────┐
-│ Chainlink DON   │──────▶│ DUCAT WASM   │──────▶│ Nostr Relay  │
+│ Chainlink DON   │       │ Chainlink    │       │ Nostr Relay  │
+|                 │──────▶│ Runtime Env  │──────▶│              │
 │ (Price Feed)    │       │ (Processing) │       │ (Storage)    │
 └─────────────────┘       └──────────────┘       └──────────────┘
         │                         │                       │
@@ -195,7 +196,7 @@ cre workflow simulate hmac \
 ```
 
 **Key Components**:
-- **Chainlink DON**: Byzantine fault tolerant consensus for price data
+- **Chainlink CRE**: Byzantine fault tolerant consensus for price data
 - **HMAC-SHA256**: Domain-separated, deterministic secret generation
 - **Hash160**: Bitcoin-style commitments (RIPEMD160(SHA256))
 - **Schnorr Signatures**: BIP-340 for signing Nostr events
@@ -347,7 +348,7 @@ Bottlenecks:
 ### CREATE Request
 ```json
 {
-  "domain": "alice.example.com",
+  "domain": "cre.com",
   "thold_price": 94000.00
 }
 ```
@@ -366,7 +367,7 @@ Bottlenecks:
 ### CHECK Request
 ```json
 {
-  "domain": "alice.example.com",
+  "domain": "cre.com",
   "thold_hash": "fc176ec8edc32092ab1d19178eb3d117a6d6b114"
 }
 ```
