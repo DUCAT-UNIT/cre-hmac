@@ -115,7 +115,7 @@ echo ""
 
 cre workflow simulate hmac \
   --target local-simulation \
-  --http-payload '{"domain":"case2.immediate.breach","thold_price":110000}' \
+  --http-payload '{"domain":"case2.immediate.breach","thold_price":120000}' \
   --trigger-index 0 \
   --non-interactive \
   > "$OUTPUT_DIR/case2_full.txt" 2>&1
@@ -130,7 +130,7 @@ CASE2_EVENT_ID=$(grep -o '"ID": "[^"]*"' "$OUTPUT_DIR/case2_full.txt" | head -1 
 CASE2_REQ_ID=$(echo "$CASE2_CONTENT" | grep -o '"req_id":"[^"]*"' | head -1 | cut -d':' -f2 | tr -d '"')
 
 print_field "Current Price" "\$$(printf "%.2f" $CASE2_PRICE)" "$GREEN"
-print_field "Threshold" "\$110,000.00" "$YELLOW"
+print_field "Threshold" "\$120,000.00" "$YELLOW"
 print_field "Event Type" "$CASE2_EVENT_TYPE"
 print_field "Threshold Hash" "$CASE2_THOLD_HASH" "$MAGENTA"
 echo ""
@@ -174,7 +174,7 @@ CASE3_REQ_ID=$(echo "$CASE3_CONTENT" | grep -o '"req_id":"[^"]*"' | head -1 | cu
 
 print_field "Quote Price" "\$$(printf "%.2f" $CASE3_QUOTE_PRICE)" "$GREEN"
 print_field "Current Price" "\$$(printf "%.2f" $CASE3_CURRENT_PRICE)" "$GREEN"
-print_field "Threshold" "\$110,000.00" "$YELLOW"
+print_field "Threshold" "\$120,000.00" "$YELLOW"
 print_field "Event Type" "$CASE3_EVENT_TYPE" "$RED"
 print_field "Is Expired" "$CASE3_IS_EXPIRED" "$RED"
 print_field "Revealed Secret" "${CASE3_THOLD_KEY:0:40}..." "$YELLOW"
@@ -305,7 +305,7 @@ Test 1: Active Quote (Downside Protection)
 
 Test 2: Create Quote (Immediate Breach Mode)
   Current Price: \$$(printf "%.2f" $CASE2_PRICE)
-  Threshold: \$110,000
+  Threshold: \$120,000
   Event Type: $CASE2_EVENT_TYPE
   Is Expired: $CASE2_IS_EXPIRED
   Threshold Hash: $CASE2_THOLD_HASH
@@ -349,7 +349,7 @@ cat > "$OUTPUT_DIR/results.json" << EOF
     },
     "case2_immediate_breach_create": {
       "current_price": $CASE2_PRICE,
-      "threshold_price": 110000,
+      "threshold_price": 120000,
       "event_type": "$CASE2_EVENT_TYPE",
       "is_expired": $CASE2_IS_EXPIRED,
       "threshold_hash": "$CASE2_THOLD_HASH",
@@ -360,7 +360,7 @@ cat > "$OUTPUT_DIR/results.json" << EOF
       "quote_price": $CASE3_QUOTE_PRICE,
       "current_price": $CASE3_CURRENT_PRICE,
       "breach_price": $CASE3_EVENT_PRICE,
-      "threshold_price": 110000,
+      "threshold_price": 120000,
       "event_type": "$CASE3_EVENT_TYPE",
       "is_expired": $CASE3_IS_EXPIRED,
       "event_origin": "$CASE3_EVENT_ORIGIN",
