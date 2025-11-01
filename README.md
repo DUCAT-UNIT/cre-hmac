@@ -45,22 +45,26 @@ The relay is now running on:
 - **Port 8080**: HTTP API (used by DUCAT)
 - **Port 7777**: WebSocket (standard Nostr)
 
-### 4. Configure Cryptographic Keys
+### 4. Configure Cryptographic Secrets
 
-DUCAT uses secp256k1 keys for signing Nostr events.
-
-#### Step 1: Set Your Private Key
+#### Step 1: Set Your Private Key & HMAC Secret
 
 ```bash
+# 32 bytes long secp256k1 private key, used to sign Nostr events
 export DUCAT_PRIVATE_KEY="8ce73a2db5cbaf4b0ab3cabece9408e3b898c64474c0dbe27826c65d1180370e"
-export DUCAT_CLIENT_SECRET="your_chainlink_data_streams_secret"
+# min. 32 bytes long HMAC secret, used to generate price threshold commitments
+export DUCAT_CLIENT_SECRET="mNbl97whllgPRsk6smy69J884DnS0LIhTY478bVQyFdl47sB3GMOAsHOnDg8B9JYilERQ07Eqd2CNU76NXSkb1J6SFT6MeaR5du6ow4zudWymixR00mv4va7f957qmrK"
 ```
 
-**⚠️ IMPORTANT**: Use the test key above for testing only. Generate a secure key for production.
+**⚠️ IMPORTANT**: Use the above values for testing only. Generate a secure key for production.
 
 **Private Key Requirements**:
 - 64-character lowercase hex string (32 bytes)
 - Valid secp256k1 private key
+- Store securely (use Chainlink secrets management in production)
+
+**HMAC Secret Requirements**:
+- ???
 - Store securely (use Chainlink secrets management in production)
 
 #### Step 2: Derive Your Public Key
@@ -153,8 +157,8 @@ Expected: `main.wasm` created successfully.
 
 1. User provides: `domain` + `threshold_price`
 2. Fetch current BTC/USD from Chainlink Data Streams
-3. Generate secret: `HMAC(domain || prices || timestamp)`
-4. Create commitment: `Hash160(secret)`
+3. Generate secret threshold key: `Thold_key == HMAC(DUCAT_CLIENT_SECRET||domain || prices || timestamp)`
+4. Create price threshold commitment: `Thold_hash == Hash160(Thold_key)`
 5. Publish to Nostr relay with secret hidden
 
 **Example**:
@@ -170,7 +174,7 @@ cre workflow simulate hmac \
 1. User provides: `domain` + `commitment_hash`
 2. Fetch current BTC/USD price
 3. Check if `current_price < threshold_price`
-4. If breached: regenerate secret and reveal it
+4. If breached: regenerate secret threshold key `Thold_key` and reveal it
 5. Update Nostr event with revealed secret
 
 **Example**:
@@ -187,7 +191,7 @@ cre workflow simulate hmac \
 ┌─────────────────┐       ┌──────────────┐       ┌──────────────┐
 │ Chainlink DON   │       │ Chainlink    │       │ Nostr Relay  │
 |                 │──────▶│ Runtime Env  │──────▶│              │
-│ (Price Feed)    │       │ (Processing) │       │ (Storage)    │
+│ (Data Stream)   │       │ (Processing) │       │ (Storage)    │
 └─────────────────┘       └──────────────┘       └──────────────┘
         │                         │                       │
     Real-time                 Compute                NIP-33
