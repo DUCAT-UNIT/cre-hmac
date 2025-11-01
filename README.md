@@ -157,7 +157,7 @@ Expected: `main.wasm` created successfully.
 
 1. User provides: `domain` + `threshold_price`
 2. Fetch current BTC/USD from Chainlink Data Streams
-3. Generate secret threshold key: `Thold_key == HMAC(DUCAT_CLIENT_SECRET||domain || prices || timestamp)`
+3. Generate secret threshold key: `Thold_key == HMAC(DUCAT_CLIENT_SECRET ||domain || prices || timestamp)`
 4. Create price threshold commitment: `Thold_hash == Hash160(Thold_key)`
 5. Publish to Nostr relay with secret hidden
 
