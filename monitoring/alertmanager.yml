@@ -1,0 +1,65 @@
+global:
+  resolve_timeout: 5m
+
+# Default route
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 12h
+  receiver: 'default'
+
+  routes:
+    # Critical alerts - immediate notification
+    - match:
+        severity: critical
+      receiver: 'critical'
+      group_wait: 0s
+      repeat_interval: 4h
+
+    # Warning alerts - grouped notifications
+    - match:
+        severity: warning
+      receiver: 'warning'
+      group_wait: 30s
+      repeat_interval: 12h
+
+# Receivers (configure these with your actual endpoints)
+receivers:
+  - name: 'default'
+    # Add your default notification channel here
+    # webhook_configs:
+    #   - url: 'http://your-webhook-url'
+
+  - name: 'critical'
+    # Add your critical alert channels here (PagerDuty, Slack, etc.)
+    # Example: Slack
+    # slack_configs:
+    #   - api_url: 'YOUR_SLACK_WEBHOOK_URL'
+    #     channel: '#alerts-critical'
+    #     title: '{{ .GroupLabels.alertname }}'
+    #     text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+
+  - name: 'warning'
+    # Add your warning alert channels here
+    # slack_configs:
+    #   - api_url: 'YOUR_SLACK_WEBHOOK_URL'
+    #     channel: '#alerts-warning'
+    #     title: '{{ .GroupLabels.alertname }}'
+    #     text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+
+# Inhibition rules (suppress certain alerts when others are firing)
+inhibit_rules:
+  # Suppress warning if critical alert is firing
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'instance']
+
+  # Suppress capacity warnings if gateway is down
+  - source_match:
+      alertname: 'GatewayDown'
+    target_match_re:
+      alertname: 'Gateway.*'
+    equal: ['instance']

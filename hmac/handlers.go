@@ -105,7 +105,7 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		SrvNetwork:   wc.Config.Network,      // Bitcoin network
 		SrvPubkey:    keys.SchnorrPubkey, // Server Schnorr public key
 		TholdHash:    tholdHash,         // Hash160 commitment
-		TholdKey:     "",                // Secret is NOT revealed (empty for active)
+		TholdKey:     nil,               // Secret is NOT revealed (null for active)
 		TholdPrice:   tholdPrice,        // Threshold price
 		ReqID:        "",                // Will be computed next
 		ReqSig:       "",                // Will be computed next
@@ -176,6 +176,19 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 
 	logger.Info("Successfully published quote to relay", "eventId", nostrEvent.ID)
 
+	// Send webhook callback if URL provided (single node execution after consensus)
+	if requestData.CallbackURL != nil && *requestData.CallbackURL != "" {
+		webhookPromise := http.SendRequest(wc, runtime, client,
+			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
+				sendWebhookCallback(wc.Config, log, sr, *requestData.CallbackURL, nostrEvent, "create")
+				return &RelayResponse{Success: true, Message: "webhook sent"}, nil
+			},
+			cre.ConsensusAggregationFromTags[*RelayResponse](),
+		)
+		// Await to ensure single execution, but ignore errors (best-effort)
+		_, _ = webhookPromise.Await()
+	}
+
 	return nostrEvent, nil
 }
 
@@ -236,6 +249,20 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 	// Check if threshold breached (price fell below threshold)
 	if currentPrice >= originalData.TholdPrice {
 		logger.Info("Threshold NOT breached, returning original event", "currentPrice", currentPrice, "tholdPrice", originalData.TholdPrice)
+
+		// Send webhook callback if URL provided (single node execution after consensus)
+		if requestData.CallbackURL != nil && *requestData.CallbackURL != "" {
+			webhookPromise := http.SendRequest(wc, runtime, client,
+				func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
+					sendWebhookCallback(wc.Config, log, sr, *requestData.CallbackURL, originalEvent, "check_no_breach")
+					return &RelayResponse{Success: true, Message: "webhook sent"}, nil
+				},
+				cre.ConsensusAggregationFromTags[*RelayResponse](),
+			)
+			// Await to ensure single execution, but ignore errors (best-effort)
+			_, _ = webhookPromise.Await()
+		}
+
 		return originalEvent, nil
 	}
 
@@ -286,7 +313,7 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 		SrvNetwork:   originalData.SrvNetwork,   // Bitcoin network
 		SrvPubkey:    originalData.SrvPubkey,    // Server Schnorr public key
 		TholdHash:    originalData.TholdHash,    // Hash160 commitment
-		TholdKey:     tholdSecret,               // SECRET IS NOW REVEALED
+		TholdKey:     &tholdSecret,              // SECRET IS NOW REVEALED (pointer to string)
 		TholdPrice:   originalData.TholdPrice,   // Threshold price
 		ReqID:        "",                        // Will be computed next
 		ReqSig:       "",                        // Will be computed next
@@ -358,5 +385,65 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 
 	logger.Info("Successfully published breach event to relay", "eventId", breachEvent.ID)
 
+	// Send webhook callback if URL provided (single node execution after consensus)
+	if requestData.CallbackURL != nil && *requestData.CallbackURL != "" {
+		webhookPromise := http.SendRequest(wc, runtime, client,
+			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
+				sendWebhookCallback(wc.Config, log, sr, *requestData.CallbackURL, breachEvent, "breach")
+				return &RelayResponse{Success: true, Message: "webhook sent"}, nil
+			},
+			cre.ConsensusAggregationFromTags[*RelayResponse](),
+		)
+		// Await to ensure single execution, but ignore errors (best-effort)
+		_, _ = webhookPromise.Await()
+	}
+
 	return breachEvent, nil
+}
+
+// sendWebhookCallback sends HTTP POST notification to callback URL
+// Notifies external systems of workflow completion with results
+// This is a best-effort notification - failures are logged but don't block the workflow
+func sendWebhookCallback(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, event *NostrEvent, eventType string) {
+	logger.Info("Sending webhook callback", "url", callbackURL, "eventType", eventType)
+
+	// Prepare callback payload
+	callbackPayload := map[string]interface{}{
+		"event_type":  eventType,
+		"event_id":    event.ID,
+		"pubkey":      event.PubKey,
+		"created_at":  event.CreatedAt,
+		"kind":        event.Kind,
+		"tags":        event.Tags,
+		"content":     event.Content,
+		"sig":         event.Sig,
+		"nostr_event": event,
+	}
+
+	callbackJSON, err := json.Marshal(callbackPayload)
+	if err != nil {
+		logger.Error("Failed to marshal callback payload", "error", err)
+		return
+	}
+
+	// Send POST request to callback URL (no consensus required for notifications)
+	resp, err := sendRequester.SendRequest(&http.Request{
+		Url:    callbackURL,
+		Method: "POST",
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+		Body: callbackJSON,
+	}).Await()
+
+	if err != nil {
+		logger.Error("Webhook callback failed", "url", callbackURL, "error", err)
+		return
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		logger.Info("Webhook callback successful", "url", callbackURL, "status", resp.StatusCode)
+	} else {
+		logger.Warn("Webhook callback returned non-2xx status", "url", callbackURL, "status", resp.StatusCode, "body", string(resp.Body))
+	}
 }

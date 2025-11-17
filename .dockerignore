@@ -1,0 +1,63 @@
+# Git
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+docs/
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Test files
+*_test.go
+coverage.out
+*.test
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+build/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files (never include secrets in image)
+.env
+.env.*
+!.env.example
+
+# Node modules (if any)
+node_modules/
+
+# Tools binaries
+tools/gateway-server
+tools/trigger-http
+tools/webhook-server
+tools/derive_key
+
+# Test scripts
+tools/test_*.sh
+tools/*.sh
+
+# Wasm files
+*.wasm
+*.wasm.br
+*.b64

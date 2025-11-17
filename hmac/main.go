@@ -104,8 +104,19 @@ func InitWorkflow(config *Config, logger *slog.Logger, secrets cre.SecretsProvid
 
 	logger.Info("DUCAT workflow initialized", "network", config.Network, "relayUrl", config.RelayURL)
 
+	// Configure HTTP trigger with authorized Ethereum address
+	// This allows JWT authentication from the specified address
+	httpConfig := &http.Config{
+		AuthorizedKeys: []*http.AuthorizedKey{
+			{
+				Type:      http.KeyType_KEY_TYPE_ECDSA_EVM,
+				PublicKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82",
+			},
+		},
+	}
+
 	return cre.Workflow[*Config]{
-		cre.Handler(http.Trigger(&http.Config{}), onHttpTrigger),
+		cre.Handler(http.Trigger(httpConfig), onHttpTrigger),
 	}, nil
 }
 

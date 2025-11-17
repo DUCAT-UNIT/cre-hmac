@@ -26,7 +26,19 @@ staging:
   cre-cli:
     don-family: "zone-a"
   account:
-    workflow-owner-address: "(optional) Multi-signature contract address"
+    workflow-owner-address: "0x531c76d8c5ed926d0d735605481289393fb41397"
   rpcs:
     - chain-name: ethereum-testnet-sepolia
       url: https://ethereum-sepolia-rpc.publicnode.com
+
+# ==========================================================================
+production-testnet:
+  cre-cli:
+    don-family: "zone-a"
+  account:
+    workflow-owner-address: "0x531c76d8c5ed926d0d735605481289393fb41397"
+  rpcs:
+    - chain-name: ethereum-testnet-sepolia
+      url: https://ethereum-sepolia-rpc.publicnode.com
+    - chain-name: ethereum-mainnet
+      url: https://ethereum-rpc.publicnode.com

@@ -31,4 +31,12 @@ staging:
     workflow-path: "."
     config-path: "./config.json"
     secrets-path: "../secrets.yaml"
-    
+
+# ==========================================================================
+production-testnet:
+  user-workflow:
+    workflow-name: "hmac"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.json"
+    secrets-path: "../secrets.yaml"

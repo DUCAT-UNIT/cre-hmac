@@ -42,9 +42,10 @@ type PriceData struct {
 
 // HttpRequestData represents incoming HTTP request
 type HttpRequestData struct {
-	Domain     string   `json:"domain"`
-	TholdPrice *float64 `json:"thold_price,omitempty"`
-	TholdHash  *string  `json:"thold_hash,omitempty"`
+	Domain      string   `json:"domain"`
+	TholdPrice  *float64 `json:"thold_price,omitempty"`
+	TholdHash   *string  `json:"thold_hash,omitempty"`
+	CallbackURL *string  `json:"callback_url,omitempty"` // Optional webhook for result notification
 }
 
 // Validate validates request data
@@ -134,14 +135,14 @@ type PriceEvent struct {
 	QuoteStamp   int64    `json:"quote_stamp"`    // quote creation timestamp
 
 	// DUCAT cryptographic extensions (from price-oracle EventQuoteTemplate)
-	IsExpired  bool    `json:"is_expired"`  // true if threshold breached
-	SrvNetwork string  `json:"srv_network"` // Bitcoin network (Mainnet/Testnet/Mutinynet)
-	SrvPubkey  string  `json:"srv_pubkey"`  // Server Schnorr public key
-	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment
-	TholdKey   string  `json:"thold_key"`   // Secret (empty if not breached, populated if breached)
-	TholdPrice float64 `json:"thold_price"` // Threshold price
-	ReqID      string  `json:"req_id"`      // Deterministic request ID
-	ReqSig     string  `json:"req_sig"`     // Schnorr signature of request ID
+	IsExpired  bool     `json:"is_expired"`  // true if threshold breached
+	SrvNetwork string   `json:"srv_network"` // Bitcoin network (Mainnet/Testnet/Mutinynet)
+	SrvPubkey  string   `json:"srv_pubkey"`  // Server Schnorr public key
+	TholdHash  string   `json:"thold_hash"`  // Hash160 commitment
+	TholdKey   *string  `json:"thold_key"`   // Secret (null if not breached, populated if breached)
+	TholdPrice float64  `json:"thold_price"` // Threshold price
+	ReqID      string   `json:"req_id"`      // Deterministic request ID
+	ReqSig     string   `json:"req_sig"`     // Schnorr signature of request ID
 }
 
 // NostrEvent represents a Nostr NIP-01 event
