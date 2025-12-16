@@ -154,7 +154,8 @@ type WebhookPayload struct {
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
-type PriceEvent struct {
+// CREPriceEvent represents the response format from CRE workflow
+type CREPriceEvent struct {
 	EventOrigin  interface{} `json:"event_origin"`
 	EventPrice   interface{} `json:"event_price"`
 	EventStamp   interface{} `json:"event_stamp"`
@@ -169,10 +170,84 @@ type PriceEvent struct {
 	SrvNetwork   string      `json:"srv_network"`
 	SrvPubkey    string      `json:"srv_pubkey"`
 	TholdHash    string      `json:"thold_hash"`
-	TholdKey     string      `json:"thold_key"`
+	TholdKey     *string     `json:"thold_key"`
 	TholdPrice   float64     `json:"thold_price"`
 	ReqID        string      `json:"req_id"`
 	ReqSig       string      `json:"req_sig"`
+}
+
+// ClientSDKResponse represents the response format expected by client-sdk v3
+// Field mapping from CRE -> ClientSDK:
+//   latest_origin -> spot_origin
+//   latest_price  -> spot_price
+//   latest_stamp  -> spot_stamp
+//   quote_origin  -> base_origin
+//   quote_price   -> base_price
+//   quote_stamp   -> base_stamp
+//   is_expired    -> is_triggered
+//   srv_network   -> network
+//   srv_pubkey    -> pubkey
+//   req_id        -> id
+//   req_sig       -> sig
+type ClientSDKResponse struct {
+	// Spot (latest) price data
+	SpotOrigin string `json:"spot_origin"`
+	SpotPrice  int64  `json:"spot_price"`
+	SpotStamp  int64  `json:"spot_stamp"`
+
+	// Base (quote) price data
+	BaseOrigin string `json:"base_origin"`
+	BasePrice  int64  `json:"base_price"`
+	BaseStamp  int64  `json:"base_stamp"`
+
+	// Event metadata
+	EventType   string `json:"event_type"`
+	IsTriggered bool   `json:"is_triggered"`
+	Kind        int    `json:"kind"`
+	Network     string `json:"network"`
+	Pubkey      string `json:"pubkey"`
+
+	// Contract identifiers
+	ID    string `json:"id"`
+	Sig   string `json:"sig"`
+	Stamp int64  `json:"stamp"`
+
+	// Threshold data
+	TholdHash  string  `json:"thold_hash"`
+	TholdKey   *string `json:"thold_key"`
+	TholdPrice int64   `json:"thold_price"`
+}
+
+// transformToClientSDKFormat converts CRE response to client-sdk expected format
+func transformToClientSDKFormat(cre *CREPriceEvent) *ClientSDKResponse {
+	return &ClientSDKResponse{
+		// Map latest -> spot
+		SpotOrigin: cre.LatestOrigin,
+		SpotPrice:  int64(cre.LatestPrice),
+		SpotStamp:  cre.LatestStamp,
+
+		// Map quote -> base
+		BaseOrigin: cre.QuoteOrigin,
+		BasePrice:  int64(cre.QuotePrice),
+		BaseStamp:  cre.QuoteStamp,
+
+		// Event metadata
+		EventType:   cre.EventType,
+		IsTriggered: cre.IsExpired,
+		Kind:        8000, // NIP-33 parameterized replaceable event kind
+		Network:     cre.SrvNetwork,
+		Pubkey:      cre.SrvPubkey,
+
+		// Contract identifiers
+		ID:    cre.ReqID,
+		Sig:   cre.ReqSig,
+		Stamp: cre.QuoteStamp,
+
+		// Threshold data (unchanged)
+		TholdHash:  cre.TholdHash,
+		TholdKey:   cre.TholdKey,
+		TholdPrice: int64(cre.TholdPrice),
+	}
 }
 
 // Response types
@@ -489,26 +564,24 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		pending.Result = result
 		requestsMutex.Unlock()
 
-		// Parse the content field to JSON and return only data
-		var contentData map[string]interface{}
-		if err := json.Unmarshal([]byte(result.Content), &contentData); err != nil {
+		// Parse CRE response and transform to client-sdk format
+		var creEvent CREPriceEvent
+		if err := json.Unmarshal([]byte(result.Content), &creEvent); err != nil {
 			logger.Warn("Failed to parse webhook content JSON",
 				zap.String("domain", domain),
 				zap.Error(err),
 			)
-			contentData = map[string]interface{}{"raw": result.Content}
+			// Fall back to raw content on parse error
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"raw": result.Content})
+			return
 		}
 
-		// Round down quote_price and latest_price to whole numbers
-		if quotePrice, ok := contentData["quote_price"].(float64); ok {
-			contentData["quote_price"] = float64(int64(quotePrice))
-		}
-		if latestPrice, ok := contentData["latest_price"].(float64); ok {
-			contentData["latest_price"] = float64(int64(latestPrice))
-		}
+		// Transform to client-sdk expected format
+		clientResponse := transformToClientSDKFormat(&creEvent)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(contentData)
+		json.NewEncoder(w).Encode(clientResponse)
 
 	case <-time.After(BLOCK_TIMEOUT):
 		// Timeout - return 202 with request_id for polling
@@ -567,21 +640,34 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 
 	// Check if we've hit the max pending requests limit
 	requestsMutex.Lock()
-	if len(pendingRequests) >= MAX_PENDING {
+	currentPending := len(pendingRequests)
+	if currentPending >= MAX_PENDING {
 		requestsMutex.Unlock()
-		log.Printf("⚠️  Max pending requests reached (%d), rejecting CHECK request", MAX_PENDING)
+		logger.Warn("Max pending requests reached, rejecting CHECK request",
+			zap.Int("current_pending", currentPending),
+			zap.Int("max_pending", MAX_PENDING),
+		)
 		http.Error(w, "Server at capacity, please retry later", http.StatusServiceUnavailable)
 		return
 	}
 	pendingRequests[trackingKey] = pending
+	currentPending = len(pendingRequests)
 	requestsMutex.Unlock()
 
-	log.Printf("🔍 CHECK: %s | Hash: %s | Tracking Key: %s | Pending: %d/%d",
-		req.Domain, req.TholdHash, trackingKey, len(pendingRequests), MAX_PENDING)
+	logger.Info("CHECK request initiated",
+		zap.String("domain", req.Domain),
+		zap.String("thold_hash", req.TholdHash),
+		zap.String("tracking_key", trackingKey),
+		zap.Int("pending_count", currentPending),
+		zap.Int("max_pending", MAX_PENDING),
+	)
 
 	// Trigger CRE workflow with configured callback URL
 	if err := triggerWorkflow("check", req.Domain, nil, &req.TholdHash, CALLBACK_URL); err != nil {
-		log.Printf("❌ Failed to trigger workflow: %v", err)
+		logger.Error("Failed to trigger workflow",
+			zap.String("domain", req.Domain),
+			zap.Error(err),
+		)
 		http.Error(w, fmt.Sprintf("Failed to trigger workflow: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -592,9 +678,14 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		// Webhook arrived! Return result immediately
 		eventType := result.EventType
 		if eventType == "breach" {
-			log.Printf("🚨 BREACH detected: %s | Secret revealed!", req.Domain)
+			logger.Info("BREACH detected - secret revealed",
+				zap.String("domain", req.Domain),
+			)
 		} else {
-			log.Printf("✅ CHECK completed: %s | Status: %s", req.Domain, eventType)
+			logger.Info("CHECK completed",
+				zap.String("domain", req.Domain),
+				zap.String("status", eventType),
+			)
 		}
 
 		requestsMutex.Lock()
@@ -602,27 +693,32 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		pending.Result = result
 		requestsMutex.Unlock()
 
-		// Parse the content field to JSON and return only data
-		var contentData map[string]interface{}
-		if err := json.Unmarshal([]byte(result.Content), &contentData); err != nil {
-			log.Printf("⚠️  Failed to parse content JSON: %v", err)
-			contentData = map[string]interface{}{"raw": result.Content}
+		// Parse CRE response and transform to client-sdk format
+		var creEvent CREPriceEvent
+		if err := json.Unmarshal([]byte(result.Content), &creEvent); err != nil {
+			logger.Warn("Failed to parse content JSON",
+				zap.String("domain", req.Domain),
+				zap.Error(err),
+			)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"raw": result.Content})
+			return
 		}
 
-		// Round down quote_price and latest_price to whole numbers
-		if quotePrice, ok := contentData["quote_price"].(float64); ok {
-			contentData["quote_price"] = float64(int64(quotePrice))
-		}
-		if latestPrice, ok := contentData["latest_price"].(float64); ok {
-			contentData["latest_price"] = float64(int64(latestPrice))
-		}
+		// Transform to client-sdk expected format
+		clientResponse := transformToClientSDKFormat(&creEvent)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(contentData)
+		json.NewEncoder(w).Encode(clientResponse)
 
 	case <-time.After(BLOCK_TIMEOUT):
 		// Timeout - return 202 with request_id for polling
-		log.Printf("⏱️  CHECK timeout: %s | Request ID: %s (use /status to poll)", req.Domain, trackingKey)
+		requestTimeouts.WithLabelValues("check").Inc()
+		logger.Warn("CHECK request timeout",
+			zap.String("domain", req.Domain),
+			zap.String("request_id", trackingKey),
+			zap.Duration("timeout", BLOCK_TIMEOUT),
+		)
 
 		requestsMutex.Lock()
 		pending.Status = "timeout"
@@ -733,18 +829,14 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If completed, parse and round down quote_price
+	// If completed, transform to client-sdk format
 	if pending.Status == "completed" && pending.Result != nil {
-		var contentData map[string]interface{}
-		if err := json.Unmarshal([]byte(pending.Result.Content), &contentData); err == nil {
-			// Round down quote_price to whole number
-			if quotePrice, ok := contentData["quote_price"].(float64); ok {
-				contentData["quote_price"] = float64(int64(quotePrice))
-			}
-
-			// Return modified content data directly
+		var creEvent CREPriceEvent
+		if err := json.Unmarshal([]byte(pending.Result.Content), &creEvent); err == nil {
+			// Transform to client-sdk expected format
+			clientResponse := transformToClientSDKFormat(&creEvent)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(contentData)
+			json.NewEncoder(w).Encode(clientResponse)
 			return
 		}
 	}
@@ -1243,7 +1335,7 @@ func getTag(tags [][]string, key string) string {
 }
 
 func getTholdHash(payload *WebhookPayload) string {
-	var priceEvent PriceEvent
+	var priceEvent CREPriceEvent
 	json.Unmarshal([]byte(payload.Content), &priceEvent)
 	return priceEvent.TholdHash
 }
