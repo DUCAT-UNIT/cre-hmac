@@ -4,8 +4,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -13,16 +13,38 @@ import (
 	"golang.org/x/crypto/ripemd160"
 )
 
-// Domain separators for key derivation
+// Tagged hash tags - matches TypeScript core-ts implementation
 const (
-	DomainSeparatorServer    = "DUCAT_SERVER_KEY_V1"
-	DomainSeparatorThreshold = "DUCAT_THRESHOLD_V1"
+	TagPriceCommitHash = "ducat/price_commit_hash"
+	TagPriceContractID = "ducat/price_contract_id"
 )
 
 // KeyDerivation contains derived cryptographic keys
 type KeyDerivation struct {
 	PrivateKey    []byte
 	SchnorrPubkey string
+}
+
+// PriceObservation contains price observation data for commit hash computation
+type PriceObservation struct {
+	OraclePubkey string
+	ChainNetwork string
+	BasePrice    uint32
+	BaseStamp    uint32
+}
+
+// PriceContract represents a complete price contract matching TypeScript schema
+type PriceContract struct {
+	BasePrice    uint32  `json:"base_price"`
+	BaseStamp    uint32  `json:"base_stamp"`
+	ChainNetwork string  `json:"chain_network"`
+	CommitHash   string  `json:"commit_hash"`
+	ContractID   string  `json:"contract_id"`
+	OraclePubkey string  `json:"oracle_pubkey"`
+	OracleSig    string  `json:"oracle_sig"`
+	TholdHash    string  `json:"thold_hash"`
+	TholdKey     *string `json:"thold_key"` // null when sealed, revealed when breached
+	TholdPrice   uint32  `json:"thold_price"`
 }
 
 // HexToBytes decodes hex string to bytes
@@ -65,56 +87,201 @@ func DeriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 	}, nil
 }
 
-// GetServerHMAC generates server-level HMAC key with domain separation
-// HMAC-SHA256(privKey, "DUCAT_SERVER_KEY_V1" || domain)
-func GetServerHMAC(privateKeyHex, domain string) (string, error) {
-	privKeyBytes, err := hex.DecodeString(privateKeyHex)
+// Hash340 computes BIP-340 style tagged hash
+// SHA256(SHA256(tag) || SHA256(tag) || data)
+// Matches TypeScript: hash340(tag, data)
+func Hash340(tag string, data []byte) []byte {
+	tagHash := sha256.Sum256([]byte(tag))
+	h := sha256.New()
+	h.Write(tagHash[:])
+	h.Write(tagHash[:])
+	h.Write(data)
+	return h.Sum(nil)
+}
+
+// Hash340Hex computes BIP-340 style tagged hash and returns hex string
+func Hash340Hex(tag string, data []byte) string {
+	return hex.EncodeToString(Hash340(tag, data))
+}
+
+// GetPriceCommitHash computes the commitment hash for a price observation and threshold price
+// Matches TypeScript: get_price_commit_hash(price_config, thold_price)
+// Preimage: oracle_pubkey(32B) || chain_network(string) || base_price(4B) || base_stamp(4B) || thold_price(4B)
+func GetPriceCommitHash(obs PriceObservation, tholdPrice uint32) (string, error) {
+	// Decode oracle pubkey
+	pubkeyBytes, err := hex.DecodeString(obs.OraclePubkey)
 	if err != nil {
-		return "", fmt.Errorf("invalid private key hex: %w", err)
+		return "", fmt.Errorf("invalid oracle pubkey hex: %w", err)
+	}
+	if len(pubkeyBytes) != 32 {
+		return "", fmt.Errorf("invalid oracle pubkey length: expected 32 bytes, got %d", len(pubkeyBytes))
 	}
 
-	if len(privKeyBytes) != 32 {
-		return "", fmt.Errorf("invalid private key length: expected 32 bytes, got %d", len(privKeyBytes))
+	// Build preimage matching TypeScript Buff.join([...])
+	preimage := make([]byte, 0, 32+len(obs.ChainNetwork)+4+4+4)
+	preimage = append(preimage, pubkeyBytes...)
+	preimage = append(preimage, []byte(obs.ChainNetwork)...)
+
+	priceBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(priceBytes, obs.BasePrice)
+	preimage = append(preimage, priceBytes...)
+
+	stampBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(stampBytes, obs.BaseStamp)
+	preimage = append(preimage, stampBytes...)
+
+	tholdBytes := make([]byte, 4)
+	binary.BigEndian.PutUint32(tholdBytes, tholdPrice)
+	preimage = append(preimage, tholdBytes...)
+
+	return Hash340Hex(TagPriceCommitHash, preimage), nil
+}
+
+// GetTholdKey generates threshold key from oracle secret key and commit hash
+// Matches TypeScript: thold_key = hmac256(oracle_seckey, commit_hash).hex
+func GetTholdKey(oracleSeckey string, commitHash string) (string, error) {
+	seckeyBytes, err := hex.DecodeString(oracleSeckey)
+	if err != nil {
+		return "", fmt.Errorf("invalid oracle seckey hex: %w", err)
+	}
+	if len(seckeyBytes) != 32 {
+		return "", fmt.Errorf("invalid oracle seckey length: expected 32 bytes, got %d", len(seckeyBytes))
 	}
 
-	if domain == "" {
-		return "", fmt.Errorf("domain cannot be empty")
+	commitBytes, err := hex.DecodeString(commitHash)
+	if err != nil {
+		return "", fmt.Errorf("invalid commit hash hex: %w", err)
+	}
+	if len(commitBytes) != 32 {
+		return "", fmt.Errorf("invalid commit hash length: expected 32 bytes, got %d", len(commitBytes))
 	}
 
-	h := hmac.New(sha256.New, privKeyBytes)
-	h.Write([]byte(DomainSeparatorServer))
-	h.Write([]byte(domain))
+	h := hmac.New(sha256.New, seckeyBytes)
+	h.Write(commitBytes)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// GetThresholdKey generates threshold commitment secret
-// HMAC-SHA256(serverKey, "DUCAT_THRESHOLD_V1" || domain || quotePrice || quoteStamp || tholdPrice)
-func GetThresholdKey(serverHMAC, domain string, quotePrice float64, quoteStamp int64, tholdPrice float64) (string, error) {
-	keyBytes, err := hex.DecodeString(serverHMAC)
+// GetPriceContractID computes the contract ID from commit hash and thold hash
+// Matches TypeScript: get_price_contract_id(commit_hash, thold_hash)
+// Preimage: commit_hash(32B) || thold_hash(20B)
+func GetPriceContractID(commitHash string, tholdHash string) (string, error) {
+	commitBytes, err := hex.DecodeString(commitHash)
 	if err != nil {
-		return "", fmt.Errorf("invalid server HMAC hex: %w", err)
+		return "", fmt.Errorf("invalid commit hash hex: %w", err)
+	}
+	if len(commitBytes) != 32 {
+		return "", fmt.Errorf("invalid commit hash length: expected 32 bytes, got %d", len(commitBytes))
 	}
 
-	if len(keyBytes) != 32 {
-		return "", fmt.Errorf("invalid server HMAC length: expected 32 bytes, got %d", len(keyBytes))
+	tholdBytes, err := hex.DecodeString(tholdHash)
+	if err != nil {
+		return "", fmt.Errorf("invalid thold hash hex: %w", err)
+	}
+	if len(tholdBytes) != 20 {
+		return "", fmt.Errorf("invalid thold hash length: expected 20 bytes, got %d", len(tholdBytes))
 	}
 
-	if domain == "" {
-		return "", fmt.Errorf("domain cannot be empty")
+	preimage := make([]byte, 0, 52)
+	preimage = append(preimage, commitBytes...)
+	preimage = append(preimage, tholdBytes...)
+
+	return Hash340Hex(TagPriceContractID, preimage), nil
+}
+
+// CreatePriceContract creates a complete signed price contract
+// Matches TypeScript: create_price_contract(oracle_seckey, price_config, thold_price)
+func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice uint32) (*PriceContract, error) {
+	// Compute commit hash
+	commitHash, err := GetPriceCommitHash(obs, tholdPrice)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute commit hash: %w", err)
 	}
 
-	if quotePrice <= 0 || tholdPrice <= 0 {
-		return "", fmt.Errorf("prices must be positive")
+	// Compute threshold key: HMAC(oracle_seckey, commit_hash)
+	tholdKey, err := GetTholdKey(oracleSeckey, commitHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute thold key: %w", err)
 	}
 
-	if quoteStamp <= 0 {
-		return "", fmt.Errorf("timestamp must be positive")
+	// Compute threshold hash: Hash160(thold_key)
+	// Must decode hex to bytes first - tholdKey is hex string, hash160 operates on bytes
+	tholdKeyBytes, err := hex.DecodeString(tholdKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode thold key: %w", err)
+	}
+	tholdHash, err := Hash160(tholdKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute thold hash: %w", err)
 	}
 
-	h := hmac.New(sha256.New, keyBytes)
-	h.Write([]byte(DomainSeparatorThreshold))
-	h.Write([]byte(fmt.Sprintf("%s|%.8f|%d|%.8f", domain, quotePrice, quoteStamp, tholdPrice)))
-	return hex.EncodeToString(h.Sum(nil)), nil
+	// Compute contract ID
+	contractID, err := GetPriceContractID(commitHash, tholdHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute contract id: %w", err)
+	}
+
+	// Sign contract ID with oracle secret key
+	seckeyBytes, err := hex.DecodeString(oracleSeckey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid oracle seckey hex: %w", err)
+	}
+
+	oracleSig, err := SignSchnorr(seckeyBytes, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign contract: %w", err)
+	}
+
+	return &PriceContract{
+		BasePrice:    obs.BasePrice,
+		BaseStamp:    obs.BaseStamp,
+		ChainNetwork: obs.ChainNetwork,
+		CommitHash:   commitHash,
+		ContractID:   contractID,
+		OraclePubkey: obs.OraclePubkey,
+		OracleSig:    oracleSig,
+		TholdHash:    tholdHash,
+		TholdKey:     &tholdKey, // Revealed in creation, set to nil when publishing sealed
+		TholdPrice:   tholdPrice,
+	}, nil
+}
+
+// VerifyPriceContract verifies the integrity and authenticity of a price contract
+// Matches TypeScript: verify_price_contract(contract)
+func VerifyPriceContract(contract *PriceContract) error {
+	if contract == nil {
+		return fmt.Errorf("contract cannot be nil")
+	}
+
+	// Recompute commit hash
+	obs := PriceObservation{
+		OraclePubkey: contract.OraclePubkey,
+		ChainNetwork: contract.ChainNetwork,
+		BasePrice:    contract.BasePrice,
+		BaseStamp:    contract.BaseStamp,
+	}
+	commitHash, err := GetPriceCommitHash(obs, contract.TholdPrice)
+	if err != nil {
+		return fmt.Errorf("failed to recompute commit hash: %w", err)
+	}
+	if commitHash != contract.CommitHash {
+		return fmt.Errorf("commit hash mismatch: expected %s, got %s", contract.CommitHash, commitHash)
+	}
+
+	// Recompute contract ID
+	contractID, err := GetPriceContractID(commitHash, contract.TholdHash)
+	if err != nil {
+		return fmt.Errorf("failed to recompute contract id: %w", err)
+	}
+	if contractID != contract.ContractID {
+		return fmt.Errorf("contract id mismatch: expected %s, got %s", contract.ContractID, contractID)
+	}
+
+	// Verify oracle signature
+	if err := VerifySchnorrSignature(contract.OraclePubkey, contractID, contract.OracleSig); err != nil {
+		return fmt.Errorf("oracle signature verification failed: %w", err)
+	}
+
+	return nil
 }
 
 // Hash160 computes RIPEMD160(SHA256(data))
@@ -132,6 +299,20 @@ func Hash160(data []byte) (string, error) {
 	return hex.EncodeToString(ripemd.Sum(nil)), nil
 }
 
+// Hash160Bytes computes RIPEMD160(SHA256(data)) and returns bytes
+func Hash160Bytes(data []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("cannot hash empty data")
+	}
+
+	sha := sha256.Sum256(data)
+
+	ripemd := ripemd160.New()
+	ripemd.Write(sha[:])
+
+	return ripemd.Sum(nil), nil
+}
+
 // VerifyThresholdCommitment verifies secret matches hash160 commitment
 // Uses constant-time comparison
 func VerifyThresholdCommitment(secret, expectedHash string) error {
@@ -146,7 +327,13 @@ func VerifyThresholdCommitment(secret, expectedHash string) error {
 		return fmt.Errorf("invalid hash length: expected 40 hex chars, got %d", len(expectedHash))
 	}
 
-	actualHash, err := Hash160([]byte(secret))
+	// Secret is a hex string, decode to bytes before hashing
+	secretBytes, err := hex.DecodeString(secret)
+	if err != nil {
+		return fmt.Errorf("invalid secret hex: %w", err)
+	}
+
+	actualHash, err := Hash160(secretBytes)
 	if err != nil {
 		return fmt.Errorf("failed to compute hash: %w", err)
 	}
@@ -156,21 +343,6 @@ func VerifyThresholdCommitment(secret, expectedHash string) error {
 	}
 
 	return nil
-}
-
-// ComputeRequestID computes deterministic request ID from preimage array
-func ComputeRequestID(preimage []interface{}) (string, error) {
-	if preimage == nil {
-		return "", fmt.Errorf("preimage cannot be nil")
-	}
-
-	data, err := json.Marshal(preimage)
-	if err != nil {
-		return "", fmt.Errorf("failed to serialize preimage: %w", err)
-	}
-
-	hash := sha256.Sum256(data)
-	return hex.EncodeToString(hash[:]), nil
 }
 
 // SignSchnorr creates BIP-340 Schnorr signature
@@ -293,3 +465,4 @@ func VerifySchnorrEventSignature(pubKeyHex, eventID, sigHex string) error {
 
 	return nil
 }
+

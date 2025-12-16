@@ -69,23 +69,23 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	// Use price timestamp from data stream (DON consensus time via data)
 	quoteStamp := priceData.Stamp
 
-	// Generate server HMAC key (using private key from secrets)
-	serverHMAC, err := getServerHMAC(wc.PrivateKey, requestData.Domain)
+	// Create price contract using new core-ts aligned crypto
+	// This computes: commit_hash, thold_key, thold_hash, contract_id, oracle_sig
+	contract, err := createPriceContract(
+		wc.PrivateKey,
+		keys.SchnorrPubkey,
+		wc.Config.Network,
+		uint32(currentPrice),
+		uint32(quoteStamp),
+		uint32(tholdPrice),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("server HMAC generation failed: %w", err)
+		return nil, fmt.Errorf("price contract creation failed: %w", err)
 	}
 
-	// Generate threshold secret key
-	tholdSecret, err := getThresholdKey(serverHMAC, requestData.Domain, currentPrice, quoteStamp, tholdPrice)
-	if err != nil {
-		return nil, fmt.Errorf("threshold key generation failed: %w", err)
-	}
-
-	// Compute Hash160 commitment
-	tholdHash, err := hash160([]byte(tholdSecret))
-	if err != nil {
-		return nil, fmt.Errorf("hash160 failed: %w", err)
-	}
+	// Extract values from contract (secret is not revealed for active quotes)
+	tholdHash := contract.TholdHash
+	_ = contract.TholdKey // Secret exists but not revealed for active quotes
 
 	// Build PriceEvent template (active quote with hidden secret)
 	// Event fields are nil for active quotes (not breached yet)
@@ -111,12 +111,9 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		ReqSig:       "",                // Will be computed next
 	}
 
-	// Compute deterministic request ID from complete template
-	// This matches price-oracle's get_event_quote_request_id
-	reqID, err := computeRequestID(requestData.Domain, &eventTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("request ID computation failed: %w", err)
-	}
+	// Use contract ID from price contract as request ID
+	// This matches core-ts's get_price_contract_id(commit_hash, thold_hash)
+	reqID := contract.ContractID
 
 	// Sign request ID with Schnorr
 	reqSig, err := signSchnorr(keys.PrivateKey, reqID)
@@ -269,20 +266,20 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 	// Threshold BREACHED - regenerate secret and reveal it
 	logger.Info("THRESHOLD BREACHED - revealing secret", "currentPrice", currentPrice, "tholdPrice", originalData.TholdPrice)
 
-	// Regenerate server HMAC (using private key from secrets)
-	serverHMAC, err := getServerHMAC(wc.PrivateKey, requestData.Domain)
+	// Regenerate commit hash to derive threshold key
+	commitHash, err := getPriceCommitHash(
+		originalData.SrvPubkey,
+		originalData.SrvNetwork,
+		uint32(originalData.QuotePrice),
+		uint32(originalData.QuoteStamp),
+		uint32(originalData.TholdPrice),
+	)
 	if err != nil {
-		return nil, fmt.Errorf("server HMAC regeneration failed: %w", err)
+		return nil, fmt.Errorf("commit hash regeneration failed: %w", err)
 	}
 
 	// Regenerate threshold secret (should match original)
-	tholdSecret, err := getThresholdKey(
-		serverHMAC,
-		requestData.Domain,
-		originalData.QuotePrice,
-		originalData.QuoteStamp,
-		originalData.TholdPrice,
-	)
+	tholdSecret, err := getTholdKey(wc.PrivateKey, commitHash)
 	if err != nil {
 		return nil, fmt.Errorf("threshold key regeneration failed: %w", err)
 	}
@@ -319,10 +316,10 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 		ReqSig:       "",                        // Will be computed next
 	}
 
-	// Compute deterministic request ID from complete template
-	reqID, err := computeRequestID(requestData.Domain, &breachTemplate)
+	// Compute contract ID for breach event
+	reqID, err := getPriceContractID(commitHash, originalData.TholdHash)
 	if err != nil {
-		return nil, fmt.Errorf("request ID computation failed: %w", err)
+		return nil, fmt.Errorf("contract ID computation failed: %w", err)
 	}
 
 	// Sign request ID with Schnorr

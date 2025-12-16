@@ -27,14 +27,44 @@ func deriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 	}, nil
 }
 
-// getServerHMAC generates server-level HMAC key with domain separation
-func getServerHMAC(privateKeyHex, domain string) (string, error) {
-	return crypto.GetServerHMAC(privateKeyHex, domain)
+// getPriceCommitHash computes the commitment hash for a price observation
+// Matches TypeScript: get_price_commit_hash(price_config, thold_price)
+func getPriceCommitHash(oraclePubkey, chainNetwork string, basePrice, baseStamp, tholdPrice uint32) (string, error) {
+	obs := crypto.PriceObservation{
+		OraclePubkey: oraclePubkey,
+		ChainNetwork: chainNetwork,
+		BasePrice:    basePrice,
+		BaseStamp:    baseStamp,
+	}
+	return crypto.GetPriceCommitHash(obs, tholdPrice)
 }
 
-// getThresholdKey generates threshold commitment secret
-func getThresholdKey(serverHMAC, domain string, quotePrice float64, quoteStamp int64, tholdPrice float64) (string, error) {
-	return crypto.GetThresholdKey(serverHMAC, domain, quotePrice, quoteStamp, tholdPrice)
+// getTholdKey generates threshold key from oracle secret key and commit hash
+// Matches TypeScript: thold_key = hmac256(oracle_seckey, commit_hash)
+func getTholdKey(oracleSeckey, commitHash string) (string, error) {
+	return crypto.GetTholdKey(oracleSeckey, commitHash)
+}
+
+// getPriceContractID computes the contract ID from commit hash and thold hash
+// Matches TypeScript: get_price_contract_id(commit_hash, thold_hash)
+func getPriceContractID(commitHash, tholdHash string) (string, error) {
+	return crypto.GetPriceContractID(commitHash, tholdHash)
+}
+
+// createPriceContract creates a complete signed price contract
+func createPriceContract(oracleSeckey string, oraclePubkey, chainNetwork string, basePrice, baseStamp, tholdPrice uint32) (*crypto.PriceContract, error) {
+	obs := crypto.PriceObservation{
+		OraclePubkey: oraclePubkey,
+		ChainNetwork: chainNetwork,
+		BasePrice:    basePrice,
+		BaseStamp:    baseStamp,
+	}
+	return crypto.CreatePriceContract(oracleSeckey, obs, tholdPrice)
+}
+
+// verifyPriceContract verifies the integrity and authenticity of a price contract
+func verifyPriceContract(contract *crypto.PriceContract) error {
+	return crypto.VerifyPriceContract(contract)
 }
 
 // hash160 computes RIPEMD160(SHA256(data))
@@ -58,40 +88,6 @@ func bytesToHex(b []byte) string {
 
 func getPublicKey(privateKey []byte) []byte {
 	return crypto.GetPublicKey(privateKey)
-}
-
-// computeRequestID computes deterministic request ID
-// Matches price-oracle EventQuotePreimage structure for cross-implementation compatibility
-func computeRequestID(domain string, template *PriceEvent) (string, error) {
-	// Validate inputs
-	if domain == "" {
-		return "", fmt.Errorf("domain cannot be empty")
-	}
-	if template == nil {
-		return "", fmt.Errorf("template cannot be nil")
-	}
-
-	// Build preimage array matching price-oracle's EventQuotePreimage structure
-	preimage := []interface{}{
-		domain,
-		template.SrvNetwork,
-		template.SrvPubkey,
-		template.QuoteOrigin,
-		template.QuotePrice,
-		template.QuoteStamp,
-		template.LatestOrigin,
-		template.LatestPrice,
-		template.LatestStamp,
-		template.EventOrigin,
-		template.EventPrice,
-		template.EventStamp,
-		template.EventType,
-		template.TholdHash,
-		template.TholdKey,
-		template.TholdPrice,
-	}
-
-	return crypto.ComputeRequestID(preimage)
 }
 
 // signSchnorr creates BIP-340 Schnorr signature
