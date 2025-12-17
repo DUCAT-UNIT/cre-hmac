@@ -87,10 +87,15 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	tholdHash := contract.TholdHash
 	_ = contract.TholdKey // Secret exists but not revealed for active quotes
 
-	// Build PriceEvent template (active quote with hidden secret)
-	// Event fields are nil for active quotes (not breached yet)
-	// This matches price-oracle's EventActiveQuote structure
-	eventTemplate := PriceEvent{
+	// Sign contract ID with Schnorr (this is oracle_sig in core-ts)
+	oracleSig, err := signSchnorr(keys.PrivateKey, contract.ContractID)
+	if err != nil {
+		return nil, fmt.Errorf("request signing failed: %w", err)
+	}
+
+	// Build PriceEvent with both core-ts PriceContract fields and legacy fields
+	eventData := PriceEvent{
+		// Core price event fields
 		EventOrigin:  nil,               // No breach yet (null for active)
 		EventPrice:   nil,               // No breach yet (null for active)
 		EventStamp:   nil,               // No breach yet (null for active)
@@ -100,31 +105,27 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		LatestStamp:  priceData.Stamp,   // current timestamp
 		QuoteOrigin:  priceData.Origin,  // quote creation origin
 		QuotePrice:   currentPrice,      // quote creation price
-		QuoteStamp:   quoteStamp,             // quote creation timestamp
-		IsExpired:    false,                  // not expired (active quote)
-		SrvNetwork:   wc.Config.Network,      // Bitcoin network
-		SrvPubkey:    keys.SchnorrPubkey, // Server Schnorr public key
-		TholdHash:    tholdHash,         // Hash160 commitment
-		TholdKey:     nil,               // Secret is NOT revealed (null for active)
-		TholdPrice:   tholdPrice,        // Threshold price
-		ReqID:        "",                // Will be computed next
-		ReqSig:       "",                // Will be computed next
+		QuoteStamp:   quoteStamp,        // quote creation timestamp
+
+		// Core-ts PriceContract fields (for client-sdk compatibility)
+		ChainNetwork: wc.Config.Network,      // Bitcoin network
+		OraclePubkey: keys.SchnorrPubkey,     // Server Schnorr public key
+		BasePrice:    int64(currentPrice),    // Quote price as int
+		BaseStamp:    quoteStamp,             // Quote timestamp
+		CommitHash:   contract.CommitHash,    // hash340 commitment
+		ContractID:   contract.ContractID,    // Contract identifier
+		OracleSig:    oracleSig,              // Schnorr signature
+		TholdHash:    tholdHash,              // Hash160 commitment
+		TholdKey:     nil,                    // Secret is NOT revealed (null for active)
+		TholdPrice:   tholdPrice,             // Threshold price
+
+		// Legacy fields (for backwards compatibility)
+		IsExpired:  false,                    // not expired (active quote)
+		SrvNetwork: wc.Config.Network,        // Bitcoin network (legacy)
+		SrvPubkey:  keys.SchnorrPubkey,       // Server public key (legacy)
+		ReqID:      contract.ContractID,      // Same as contract_id (legacy)
+		ReqSig:     oracleSig,                // Same as oracle_sig (legacy)
 	}
-
-	// Use contract ID from price contract as request ID
-	// This matches core-ts's get_price_contract_id(commit_hash, thold_hash)
-	reqID := contract.ContractID
-
-	// Sign request ID with Schnorr
-	reqSig, err := signSchnorr(keys.PrivateKey, reqID)
-	if err != nil {
-		return nil, fmt.Errorf("request signing failed: %w", err)
-	}
-
-	// Update template with req_id and req_sig
-	eventTemplate.ReqID = reqID
-	eventTemplate.ReqSig = reqSig
-	eventData := eventTemplate
 
 	// Marshal to JSON for Nostr event content
 	eventJSON, err := json.Marshal(eventData)
@@ -292,10 +293,21 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 
 	logger.Info("Commitment verified successfully")
 
-	// Build breach PriceEvent template with REVEALED secret
-	// Event fields are now populated with breach data
-	// This matches price-oracle's EventExpiredQuote structure
-	breachTemplate := PriceEvent{
+	// Compute contract ID for breach event
+	contractID, err := getPriceContractID(commitHash, originalData.TholdHash)
+	if err != nil {
+		return nil, fmt.Errorf("contract ID computation failed: %w", err)
+	}
+
+	// Sign contract ID with Schnorr
+	oracleSig, err := signSchnorr(keys.PrivateKey, contractID)
+	if err != nil {
+		return nil, fmt.Errorf("request signing failed: %w", err)
+	}
+
+	// Build breach PriceEvent with REVEALED secret
+	breachData := PriceEvent{
+		// Core price event fields
 		EventOrigin:  &priceData.Origin,         // Breach origin (populated for expired)
 		EventPrice:   &currentPrice,             // Breach price (populated for expired)
 		EventStamp:   &currentStamp,             // Breach timestamp (populated for expired)
@@ -306,32 +318,26 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 		QuoteOrigin:  originalData.QuoteOrigin,  // quote creation origin
 		QuotePrice:   originalData.QuotePrice,   // quote creation price
 		QuoteStamp:   originalData.QuoteStamp,   // quote creation timestamp
-		IsExpired:    true,                      // expired (breached quote)
-		SrvNetwork:   originalData.SrvNetwork,   // Bitcoin network
-		SrvPubkey:    originalData.SrvPubkey,    // Server Schnorr public key
-		TholdHash:    originalData.TholdHash,    // Hash160 commitment
-		TholdKey:     &tholdSecret,              // SECRET IS NOW REVEALED (pointer to string)
-		TholdPrice:   originalData.TholdPrice,   // Threshold price
-		ReqID:        "",                        // Will be computed next
-		ReqSig:       "",                        // Will be computed next
-	}
 
-	// Compute contract ID for breach event
-	reqID, err := getPriceContractID(commitHash, originalData.TholdHash)
-	if err != nil {
-		return nil, fmt.Errorf("contract ID computation failed: %w", err)
-	}
+		// Core-ts PriceContract fields (for client-sdk compatibility)
+		ChainNetwork: originalData.ChainNetwork,     // Bitcoin network
+		OraclePubkey: originalData.OraclePubkey,     // Server Schnorr public key
+		BasePrice:    originalData.BasePrice,        // Original quote price
+		BaseStamp:    originalData.BaseStamp,        // Original quote timestamp
+		CommitHash:   commitHash,                    // hash340 commitment
+		ContractID:   contractID,                    // Contract identifier
+		OracleSig:    oracleSig,                     // Schnorr signature
+		TholdHash:    originalData.TholdHash,        // Hash160 commitment
+		TholdKey:     &tholdSecret,                  // SECRET IS NOW REVEALED
+		TholdPrice:   originalData.TholdPrice,       // Threshold price
 
-	// Sign request ID with Schnorr
-	reqSig, err := signSchnorr(keys.PrivateKey, reqID)
-	if err != nil {
-		return nil, fmt.Errorf("request signing failed: %w", err)
+		// Legacy fields (for backwards compatibility)
+		IsExpired:  true,                            // expired (breached quote)
+		SrvNetwork: originalData.SrvNetwork,         // Bitcoin network (legacy)
+		SrvPubkey:  originalData.SrvPubkey,          // Server public key (legacy)
+		ReqID:      contractID,                      // Same as contract_id (legacy)
+		ReqSig:     oracleSig,                       // Same as oracle_sig (legacy)
 	}
-
-	// Update template with req_id and req_sig
-	breachTemplate.ReqID = reqID
-	breachTemplate.ReqSig = reqSig
-	breachData := breachTemplate
 
 	// Marshal to JSON
 	breachJSON, err := json.Marshal(breachData)

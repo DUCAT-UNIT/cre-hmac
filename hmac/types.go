@@ -119,10 +119,10 @@ func isValidHex(s string) bool {
 	return validHex.MatchString(s)
 }
 
-// PriceEvent represents a price threshold event (matches price-oracle structure)
-// Core price-oracle fields with DUCAT cryptographic extensions
+// PriceEvent represents a price threshold event
+// Aligned with core-ts PriceContract schema for client-sdk compatibility
 type PriceEvent struct {
-	// Core price event fields (from price-oracle PriceEvent)
+	// Core price event fields
 	EventOrigin  *string  `json:"event_origin"`   // nullable - null if not breached
 	EventPrice   *float64 `json:"event_price"`    // nullable - null if not breached
 	EventStamp   *int64   `json:"event_stamp"`    // nullable - null if not breached
@@ -134,15 +134,24 @@ type PriceEvent struct {
 	QuotePrice   float64  `json:"quote_price"`    // quote creation price
 	QuoteStamp   int64    `json:"quote_stamp"`    // quote creation timestamp
 
-	// DUCAT cryptographic extensions (from price-oracle EventQuoteTemplate)
-	IsExpired  bool     `json:"is_expired"`  // true if threshold breached
-	SrvNetwork string   `json:"srv_network"` // Bitcoin network (Mainnet/Testnet/Mutinynet)
-	SrvPubkey  string   `json:"srv_pubkey"`  // Server Schnorr public key
-	TholdHash  string   `json:"thold_hash"`  // Hash160 commitment
-	TholdKey   *string  `json:"thold_key"`   // Secret (null if not breached, populated if breached)
-	TholdPrice float64  `json:"thold_price"` // Threshold price
-	ReqID      string   `json:"req_id"`      // Deterministic request ID
-	ReqSig     string   `json:"req_sig"`     // Schnorr signature of request ID
+	// Core-ts PriceContract fields (for client-sdk compatibility)
+	ChainNetwork string  `json:"chain_network"` // Bitcoin network (maps to srv_network)
+	OraclePubkey string  `json:"oracle_pubkey"` // Server Schnorr public key (maps to srv_pubkey)
+	BasePrice    int64   `json:"base_price"`    // Quote creation price as int
+	BaseStamp    int64   `json:"base_stamp"`    // Quote creation timestamp
+	CommitHash   string  `json:"commit_hash"`   // hash340(tag, preimage) - 32 bytes hex
+	ContractID   string  `json:"contract_id"`   // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig    string  `json:"oracle_sig"`    // Schnorr signature - 64 bytes hex
+	TholdHash    string  `json:"thold_hash"`    // Hash160 commitment - 20 bytes hex
+	TholdKey     *string `json:"thold_key"`     // Secret (null if not breached) - 32 bytes hex
+	TholdPrice   float64 `json:"thold_price"`   // Threshold price
+
+	// Legacy fields (kept for backwards compatibility during transition)
+	IsExpired  bool   `json:"is_expired"`  // true if threshold breached
+	SrvNetwork string `json:"srv_network"` // Bitcoin network (legacy name)
+	SrvPubkey  string `json:"srv_pubkey"`  // Server Schnorr public key (legacy name)
+	ReqID      string `json:"req_id"`      // Same as contract_id (legacy name)
+	ReqSig     string `json:"req_sig"`     // Same as oracle_sig (legacy name)
 }
 
 // NostrEvent represents a Nostr NIP-01 event

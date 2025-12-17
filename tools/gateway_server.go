@@ -155,7 +155,9 @@ type WebhookPayload struct {
 }
 
 // CREPriceEvent represents the response format from CRE workflow
+// Aligned with core-ts PriceContract schema
 type CREPriceEvent struct {
+	// Core price event fields
 	EventOrigin  interface{} `json:"event_origin"`
 	EventPrice   interface{} `json:"event_price"`
 	EventStamp   interface{} `json:"event_stamp"`
@@ -166,84 +168,58 @@ type CREPriceEvent struct {
 	QuoteOrigin  string      `json:"quote_origin"`
 	QuotePrice   float64     `json:"quote_price"`
 	QuoteStamp   int64       `json:"quote_stamp"`
-	IsExpired    bool        `json:"is_expired"`
-	SrvNetwork   string      `json:"srv_network"`
-	SrvPubkey    string      `json:"srv_pubkey"`
-	TholdHash    string      `json:"thold_hash"`
-	TholdKey     *string     `json:"thold_key"`
-	TholdPrice   float64     `json:"thold_price"`
-	ReqID        string      `json:"req_id"`
-	ReqSig       string      `json:"req_sig"`
+
+	// Core-ts PriceContract fields
+	ChainNetwork string  `json:"chain_network"`
+	OraclePubkey string  `json:"oracle_pubkey"`
+	BasePrice    int64   `json:"base_price"`
+	BaseStamp    int64   `json:"base_stamp"`
+	CommitHash   string  `json:"commit_hash"`
+	ContractID   string  `json:"contract_id"`
+	OracleSig    string  `json:"oracle_sig"`
+	TholdHash    string  `json:"thold_hash"`
+	TholdKey     *string `json:"thold_key"`
+	TholdPrice   float64 `json:"thold_price"`
+
+	// Legacy fields
+	IsExpired  bool   `json:"is_expired"`
+	SrvNetwork string `json:"srv_network"`
+	SrvPubkey  string `json:"srv_pubkey"`
+	ReqID      string `json:"req_id"`
+	ReqSig     string `json:"req_sig"`
 }
 
-// ClientSDKResponse represents the response format expected by client-sdk v3
-// Field mapping from CRE -> ClientSDK:
-//   latest_origin -> spot_origin
-//   latest_price  -> spot_price
-//   latest_stamp  -> spot_stamp
-//   quote_origin  -> base_origin
-//   quote_price   -> base_price
-//   quote_stamp   -> base_stamp
-//   is_expired    -> is_triggered
-//   srv_network   -> network
-//   srv_pubkey    -> pubkey
-//   req_id        -> id
-//   req_sig       -> sig
-type ClientSDKResponse struct {
-	// Spot (latest) price data
-	SpotOrigin string `json:"spot_origin"`
-	SpotPrice  int64  `json:"spot_price"`
-	SpotStamp  int64  `json:"spot_stamp"`
+// PriceContractResponse matches core-ts PriceContract schema exactly
+// This is what client-sdk expects from the gateway
+type PriceContractResponse struct {
+	// PriceObservation fields (from core-ts)
+	ChainNetwork string `json:"chain_network"` // Bitcoin network
+	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
+	BasePrice    int64  `json:"base_price"`    // Quote creation price
+	BaseStamp    int64  `json:"base_stamp"`    // Quote creation timestamp
 
-	// Base (quote) price data
-	BaseOrigin string `json:"base_origin"`
-	BasePrice  int64  `json:"base_price"`
-	BaseStamp  int64  `json:"base_stamp"`
-
-	// Event metadata
-	EventType   string `json:"event_type"`
-	IsTriggered bool   `json:"is_triggered"`
-	Kind        int    `json:"kind"`
-	Network     string `json:"network"`
-	Pubkey      string `json:"pubkey"`
-
-	// Contract identifiers
-	ID    string `json:"id"`
-	Sig   string `json:"sig"`
-	Stamp int64  `json:"stamp"`
-
-	// Threshold data
-	TholdHash  string  `json:"thold_hash"`
-	TholdKey   *string `json:"thold_key"`
-	TholdPrice int64   `json:"thold_price"`
+	// PriceContract fields (from core-ts)
+	CommitHash string  `json:"commit_hash"` // hash340(tag, preimage) - 32 bytes hex
+	ContractID string  `json:"contract_id"` // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig  string  `json:"oracle_sig"`  // Schnorr signature - 64 bytes hex
+	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdKey   *string `json:"thold_key"`   // Secret (null if sealed) - 32 bytes hex
+	TholdPrice int64   `json:"thold_price"` // Threshold price
 }
 
-// transformToClientSDKFormat converts CRE response to client-sdk expected format
-func transformToClientSDKFormat(cre *CREPriceEvent) *ClientSDKResponse {
-	return &ClientSDKResponse{
-		// Map latest -> spot
-		SpotOrigin: cre.LatestOrigin,
-		SpotPrice:  int64(cre.LatestPrice),
-		SpotStamp:  cre.LatestStamp,
+// transformToPriceContract converts CRE response to core-ts PriceContract format
+func transformToPriceContract(cre *CREPriceEvent) *PriceContractResponse {
+	return &PriceContractResponse{
+		// PriceObservation fields
+		ChainNetwork: cre.ChainNetwork,
+		OraclePubkey: cre.OraclePubkey,
+		BasePrice:    cre.BasePrice,
+		BaseStamp:    cre.BaseStamp,
 
-		// Map quote -> base
-		BaseOrigin: cre.QuoteOrigin,
-		BasePrice:  int64(cre.QuotePrice),
-		BaseStamp:  cre.QuoteStamp,
-
-		// Event metadata
-		EventType:   cre.EventType,
-		IsTriggered: cre.IsExpired,
-		Kind:        8000, // NIP-33 parameterized replaceable event kind
-		Network:     cre.SrvNetwork,
-		Pubkey:      cre.SrvPubkey,
-
-		// Contract identifiers
-		ID:    cre.ReqID,
-		Sig:   cre.ReqSig,
-		Stamp: cre.QuoteStamp,
-
-		// Threshold data (unchanged)
+		// PriceContract fields
+		CommitHash: cre.CommitHash,
+		ContractID: cre.ContractID,
+		OracleSig:  cre.OracleSig,
 		TholdHash:  cre.TholdHash,
 		TholdKey:   cre.TholdKey,
 		TholdPrice: int64(cre.TholdPrice),
@@ -577,11 +553,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Transform to client-sdk expected format
-		clientResponse := transformToClientSDKFormat(&creEvent)
+		// Transform to core-ts PriceContract format
+		priceContract := transformToPriceContract(&creEvent)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(clientResponse)
+		json.NewEncoder(w).Encode(priceContract)
 
 	case <-time.After(BLOCK_TIMEOUT):
 		// Timeout - return 202 with request_id for polling
@@ -705,11 +681,11 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Transform to client-sdk expected format
-		clientResponse := transformToClientSDKFormat(&creEvent)
+		// Transform to core-ts PriceContract format
+		priceContract := transformToPriceContract(&creEvent)
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(clientResponse)
+		json.NewEncoder(w).Encode(priceContract)
 
 	case <-time.After(BLOCK_TIMEOUT):
 		// Timeout - return 202 with request_id for polling
@@ -829,14 +805,14 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If completed, transform to client-sdk format
+	// If completed, transform to PriceContract format
 	if pending.Status == "completed" && pending.Result != nil {
 		var creEvent CREPriceEvent
 		if err := json.Unmarshal([]byte(pending.Result.Content), &creEvent); err == nil {
-			// Transform to client-sdk expected format
-			clientResponse := transformToClientSDKFormat(&creEvent)
+			// Transform to core-ts PriceContract format
+			priceContract := transformToPriceContract(&creEvent)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(clientResponse)
+			json.NewEncoder(w).Encode(priceContract)
 			return
 		}
 	}

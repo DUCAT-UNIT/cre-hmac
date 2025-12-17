@@ -522,8 +522,8 @@ func TestHandleStatus(t *testing.T) {
 					CreatedAt: time.Now(),
 					Status:    "completed",
 					Result: &WebhookPayload{
-						// Full CRE format payload for transform to work
-						Content: `{"event_type":"active","latest_origin":"chainlink","latest_price":105.7,"latest_stamp":1700000000,"quote_origin":"chainlink","quote_price":100.7,"quote_stamp":1699999000,"is_expired":false,"srv_network":"mutiny","srv_pubkey":"abc123","thold_hash":"abc123def456","thold_key":null,"thold_price":95.0,"req_id":"req123","req_sig":"sig456"}`,
+						// Full CRE format payload with core-ts PriceContract fields
+						Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":100,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":95.0}`,
 					},
 				}
 			},
@@ -533,20 +533,23 @@ func TestHandleStatus(t *testing.T) {
 				if err := json.Unmarshal(body, &result); err != nil {
 					t.Fatalf("failed to parse response: %v", err)
 				}
-				// Check transformed fields (quote_price -> base_price, rounded down)
+				// Check core-ts PriceContract fields
 				if basePrice, ok := result["base_price"].(float64); ok {
 					if basePrice != 100.0 {
-						t.Errorf("base_price = %f, want 100.0 (rounded down from quote_price)", basePrice)
+						t.Errorf("base_price = %f, want 100.0", basePrice)
 					}
 				} else {
 					t.Error("base_price not found in response")
 				}
-				// Verify other transformed fields exist
-				if _, ok := result["spot_price"]; !ok {
-					t.Error("spot_price not found in response")
+				// Verify PriceContract fields exist
+				if _, ok := result["chain_network"]; !ok {
+					t.Error("chain_network not found in response")
 				}
-				if _, ok := result["network"]; !ok {
-					t.Error("network not found in response")
+				if _, ok := result["commit_hash"]; !ok {
+					t.Error("commit_hash not found in response")
+				}
+				if _, ok := result["contract_id"]; !ok {
+					t.Error("contract_id not found in response")
 				}
 			},
 		},
@@ -1331,8 +1334,8 @@ func TestHandleCheckSuccess(t *testing.T) {
 			payload := &WebhookPayload{
 				EventType: "check_no_breach",
 				EventID:   "check-event-123",
-				// Full CRE format payload
-				Content: `{"event_type":"active","latest_origin":"chainlink","latest_price":150.7,"latest_stamp":1700000000,"quote_origin":"chainlink","quote_price":95.8,"quote_stamp":1699999000,"is_expired":false,"srv_network":"mutiny","srv_pubkey":"abc123","thold_hash":"abc123def456","thold_key":null,"thold_price":100.0,"req_id":"req123","req_sig":"sig456"}`,
+				// Full CRE format payload with core-ts PriceContract fields
+				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":95,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100.0}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1352,17 +1355,15 @@ func TestHandleCheckSuccess(t *testing.T) {
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 
-	// Verify prices were transformed and rounded down (quote_price -> base_price, latest_price -> spot_price)
+	// Verify core-ts PriceContract fields
 	if basePrice, ok := result["base_price"].(float64); ok {
 		if basePrice != 95.0 {
-			t.Errorf("base_price = %f, want 95.0 (rounded down from quote_price)", basePrice)
+			t.Errorf("base_price = %f, want 95.0", basePrice)
 		}
 	}
 
-	if spotPrice, ok := result["spot_price"].(float64); ok {
-		if spotPrice != 150.0 {
-			t.Errorf("spot_price = %f, want 150.0 (rounded down from latest_price)", spotPrice)
-		}
+	if _, ok := result["chain_network"]; !ok {
+		t.Error("chain_network not found in response")
 	}
 }
 
@@ -1644,8 +1645,8 @@ func TestHandleCreateSuccess(t *testing.T) {
 				EventType: "create",
 				EventID:   "create-event-123",
 				Tags:      [][]string{{"domain", domain}},
-				// Full CRE format payload
-				Content: `{"event_type":"active","latest_origin":"chainlink","latest_price":105.3,"latest_stamp":1700000000,"quote_origin":"chainlink","quote_price":99.8,"quote_stamp":1699999000,"is_expired":false,"srv_network":"mutiny","srv_pubkey":"abc123","thold_hash":"abc123def456","thold_key":null,"thold_price":100.5,"req_id":"req123","req_sig":"sig456"}`,
+				// Full CRE format payload with core-ts PriceContract fields
+				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":99,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100.5}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1665,21 +1666,23 @@ func TestHandleCreateSuccess(t *testing.T) {
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 
-	// Verify prices were transformed and rounded down (quote_price -> base_price, latest_price -> spot_price)
+	// Verify core-ts PriceContract fields
 	if basePrice, ok := result["base_price"].(float64); ok {
 		if basePrice != 99.0 {
-			t.Errorf("base_price = %f, want 99.0 (rounded down from quote_price)", basePrice)
+			t.Errorf("base_price = %f, want 99.0", basePrice)
 		}
 	}
 
-	if spotPrice, ok := result["spot_price"].(float64); ok {
-		if spotPrice != 105.0 {
-			t.Errorf("spot_price = %f, want 105.0 (rounded down from latest_price)", spotPrice)
-		}
+	// Verify PriceContract fields exist
+	if network, ok := result["chain_network"].(string); !ok || network != "mutiny" {
+		t.Errorf("chain_network = %v, want 'mutiny'", result["chain_network"])
 	}
 
-	// Verify other transformed fields
-	if network, ok := result["network"].(string); !ok || network != "mutiny" {
-		t.Errorf("network = %v, want 'mutiny'", result["network"])
+	if _, ok := result["commit_hash"]; !ok {
+		t.Error("commit_hash not found in response")
+	}
+
+	if _, ok := result["contract_id"]; !ok {
+		t.Error("contract_id not found in response")
 	}
 }
