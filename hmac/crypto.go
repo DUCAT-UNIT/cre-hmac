@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"ducat/crypto"
+	"ducat/shared"
 )
 
 // Cryptographic primitives for DUCAT threshold commitments
@@ -164,5 +165,5 @@ func serializeNostrEvent(event *NostrEvent) string {
 
 // validateQuoteAge validates quote timestamp freshness
 func validateQuoteAge(quoteStamp, currentTime int64) error {
-	return crypto.ValidateQuoteAge(quoteStamp, currentTime, MaxQuoteAge)
+	return shared.ValidateQuoteAge(quoteStamp, currentTime, MaxQuoteAge)
 }

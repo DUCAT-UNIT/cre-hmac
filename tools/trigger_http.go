@@ -1,26 +1,25 @@
+//go:build ignore
+
 package main
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/btcsuite/btcd/btcec/v2"
+	"ducat/internal/ethsign"
+
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/google/uuid"
-	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -47,21 +46,6 @@ type JSONRPCResponse struct {
 type JSONRPCError struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
-}
-
-// JWTHeader represents the JWT header
-type JWTHeader struct {
-	Alg string `json:"alg"`
-	Typ string `json:"typ"`
-}
-
-// JWTPayload represents the JWT payload
-type JWTPayload struct {
-	Digest string `json:"digest"`
-	Iss    string `json:"iss"`
-	Iat    int64  `json:"iat"`
-	Exp    int64  `json:"exp"`
-	Jti    string `json:"jti"`
 }
 
 // main is the CLI entry point that constructs and sends a JWT-authenticated JSON-RPC
@@ -111,19 +95,16 @@ func main() {
 	// Remove 0x prefix if present
 	privateKeyHex = strings.TrimPrefix(privateKeyHex, "0x")
 
-	// Parse private key
-	privateKeyBytes, err := hex.DecodeString(privateKeyHex)
+	// Parse private key using go-ethereum crypto
+	privKey, err := crypto.HexToECDSA(privateKeyHex)
 	if err != nil {
-		fmt.Printf("Error decoding private key: %v\n", err)
+		fmt.Printf("Error parsing private key: %v\n", err)
 		os.Exit(1)
 	}
 
-	privKey, _ := btcec.PrivKeyFromBytes(privateKeyBytes)
-	pubKey := privKey.PubKey()
-
-	// Derive Ethereum address
-	address := pubKeyToAddress(pubKey.ToECDSA())
-	fmt.Printf("📝 Using address: %s\n", address)
+	// Derive Ethereum address using shared package
+	address := ethsign.PubKeyToAddress(&privKey.PublicKey)
+	fmt.Printf("Using address: %s\n", address)
 
 	// Build input based on operation
 	input := map[string]interface{}{
@@ -133,7 +114,7 @@ func main() {
 	// Add optional callback URL if provided
 	if *callbackURL != "" {
 		input["callback_url"] = *callbackURL
-		fmt.Printf("📞 Callback URL: %s\n", *callbackURL)
+		fmt.Printf("Callback URL: %s\n", *callbackURL)
 	}
 
 	switch strings.ToLower(*operation) {
@@ -150,7 +131,7 @@ func main() {
 			os.Exit(1)
 		}
 		input["thold_price"] = priceFloat
-		fmt.Printf("🔨 CREATE operation: domain=%s, thold_price=%.2f\n", *domain, priceFloat)
+		fmt.Printf("CREATE operation: domain=%s, thold_price=%.2f\n", *domain, priceFloat)
 	case "check":
 		if *tholdHash == "" {
 			fmt.Println("Error: --thold-hash is required for CHECK operation")
@@ -166,7 +147,7 @@ func main() {
 			os.Exit(1)
 		}
 		input["thold_hash"] = *tholdHash
-		fmt.Printf("🔍 CHECK operation: domain=%s, thold_hash=%s\n", *domain, *tholdHash)
+		fmt.Printf("CHECK operation: domain=%s, thold_hash=%s\n", *domain, *tholdHash)
 	default:
 		fmt.Printf("Error: invalid operation '%s' (must be 'create' or 'check')\n", *operation)
 		os.Exit(1)
@@ -193,27 +174,27 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("\n📦 JSON-RPC Request:\n%s\n\n", string(requestBody))
+	fmt.Printf("\nJSON-RPC Request:\n%s\n\n", string(requestBody))
 
 	// Compute digest
 	digest := computeDigest(requestBody)
-	fmt.Printf("🔐 Digest: %s\n", digest)
+	fmt.Printf("Digest: %s\n", digest)
 
-	// Generate JWT
-	jwt, err := generateJWT(privKey.ToECDSA(), address, digest)
+	// Generate JWT using shared ethsign package
+	jwt, err := ethsign.GenerateJWT(privKey, address, digest, uuid.New().String())
 	if err != nil {
 		fmt.Printf("Error generating JWT: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("🎫 JWT: %s\n\n", jwt)
+	fmt.Printf("JWT: %s\n\n", jwt)
 
 	// Send request to gateway
-	fmt.Printf("🚀 Sending request to %s\n\n", GatewayURL)
+	fmt.Printf("Sending request to %s\n\n", GatewayURL)
 
 	resp, err := sendRequest(GatewayURL, requestBody, jwt)
 	if err != nil {
-		fmt.Printf("❌ Error: %v\n", err)
+		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -226,18 +207,18 @@ func main() {
 	}
 
 	if jsonResp.Error != nil {
-		fmt.Printf("❌ RPC Error [%d]: %s\n", jsonResp.Error.Code, jsonResp.Error.Message)
+		fmt.Printf("RPC Error [%d]: %s\n", jsonResp.Error.Code, jsonResp.Error.Message)
 		os.Exit(1)
 	}
 
-	fmt.Printf("✅ Success!\n\n")
-	fmt.Printf("📊 Response:\n")
+	fmt.Printf("Success!\n\n")
+	fmt.Printf("Response:\n")
 	prettyResp, _ := json.MarshalIndent(jsonResp, "", "  ")
 	fmt.Printf("%s\n\n", string(prettyResp))
 
 	// Extract execution ID
 	if execID, ok := jsonResp.Result["workflow_execution_id"].(string); ok {
-		fmt.Printf("🔗 Track execution at: https://cre.chain.link/workflows?execution=%s\n", execID)
+		fmt.Printf("Track execution at: https://cre.chain.link/workflows?execution=%s\n", execID)
 	}
 }
 
@@ -318,248 +299,6 @@ func marshalSortedRecursive(buf *bytes.Buffer, v interface{}) error {
 func computeDigest(data []byte) string {
 	hash := sha256.Sum256(data)
 	return "0x" + hex.EncodeToString(hash[:])
-}
-
-// generateJWT creates a JWT whose header uses alg "ETH" and whose payload contains
-// the provided digest, issuer (address), issued-at, expiration (5 minutes) and a
-// unique jti. It signs the "header.payload" string using an Ethereum-style
-// signing prefix and returns the final token in the form
-// "header.payload.signature" where the signature is base64url-encoded. An error
-// is returned if encoding or signing fails.
-func generateJWT(privKey *ecdsa.PrivateKey, address, digest string) (string, error) {
-	now := time.Now().Unix()
-
-	// Create header
-	header := JWTHeader{
-		Alg: "ETH",
-		Typ: "JWT",
-	}
-	headerJSON, err := json.Marshal(header)
-	if err != nil {
-		return "", err
-	}
-	headerB64 := base64.RawURLEncoding.EncodeToString(headerJSON)
-
-	// Create payload
-	payload := JWTPayload{
-		Digest: digest,
-		Iss:    address,
-		Iat:    now,
-		Exp:    now + 300, // 5 minutes
-		Jti:    uuid.New().String(),
-	}
-	payloadJSON, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
-	}
-	payloadB64 := base64.RawURLEncoding.EncodeToString(payloadJSON)
-
-	// Create message to sign
-	message := headerB64 + "." + payloadB64
-
-	// Sign with Ethereum prefix
-	signature, err := signEthereumMessage(privKey, message)
-	if err != nil {
-		return "", err
-	}
-
-	signatureB64 := base64.RawURLEncoding.EncodeToString(signature)
-
-	return message + "." + signatureB64, nil
-}
-
-// signEthereumMessage signs a message using Ethereum's prefixed message format and returns a 65-byte signature in the form r||s||v.
-// The message is prefixed with "\x19Ethereum Signed Message:\n" and hashed with Keccak256 before ECDSA signing; `s` is normalized to the lower half of the curve order and `v` is the recovery identifier.
-// Returns the 65-byte signature (32-byte `r`, 32-byte `s`, 1-byte `v`) or an error if the signing operation fails.
-func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, error) {
-	// Create Ethereum signed message prefix
-	prefix := fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(message), message)
-
-	// Hash with Keccak256
-	hash := sha3.NewLegacyKeccak256()
-	hash.Write([]byte(prefix))
-	messageHash := hash.Sum(nil)
-
-	// Convert to btcec private key for proper signing
-	privKeyBytes := privKey.D.Bytes()
-	if len(privKeyBytes) < 32 {
-		padded := make([]byte, 32)
-		copy(padded[32-len(privKeyBytes):], privKeyBytes)
-		privKeyBytes = padded
-	}
-	btcPrivKey, btcPubKey := btcec.PrivKeyFromBytes(privKeyBytes)
-
-	// Sign using standard ECDSA
-	r, s, err := ecdsa.Sign(rand.Reader, privKey, messageHash)
-	if err != nil {
-		return nil, err
-	}
-
-	// Normalize s to lower value (BIP-62)
-	curve := btcec.S256()
-	halfOrder := new(big.Int).Rsh(curve.Params().N, 1)
-	if s.Cmp(halfOrder) > 0 {
-		s = new(big.Int).Sub(curve.Params().N, s)
-	}
-
-	// Pad r and s to 32 bytes
-	rBytes := r.Bytes()
-	sBytes := s.Bytes()
-	rPadded := make([]byte, 32)
-	sPadded := make([]byte, 32)
-	copy(rPadded[32-len(rBytes):], rBytes)
-	copy(sPadded[32-len(sBytes):], sBytes)
-
-	// Compute recovery ID using proper elliptic curve recovery
-	recoveryID, err := computeRecoveryID(btcPrivKey, btcPubKey, messageHash, r, s)
-	if err != nil {
-		return nil, fmt.Errorf("recovery ID computation failed: %w", err)
-	}
-
-	// Format: r || s || v
-	result := make([]byte, 65)
-	copy(result[0:32], rPadded)
-	copy(result[32:64], sPadded)
-	result[64] = recoveryID
-
-	return result, nil
-}
-
-// computeRecoveryID computes the Ethereum recovery ID (0-3) that, when used with the provided
-// signature components and message hash, recovers the given public key.
-// Returns an error if no valid recovery ID is found (indicates a bug in signature generation).
-func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *big.Int) (byte, error) {
-	// Get uncompressed public key bytes
-	pubKeyBytes := pubKey.SerializeUncompressed()
-	targetX := pubKeyBytes[1:33]
-	targetY := pubKeyBytes[33:65]
-
-	// Try each recovery ID (0-3)
-	for v := byte(0); v < 4; v++ {
-		recovered := tryRecoverPublicKey(messageHash, r, s, v)
-		if recovered != nil {
-			recoveredBytes := recovered.SerializeUncompressed()
-			recoveredX := recoveredBytes[1:33]
-			recoveredY := recoveredBytes[33:65]
-
-			if bytes.Equal(targetX, recoveredX) && bytes.Equal(targetY, recoveredY) {
-				return v, nil
-			}
-		}
-	}
-
-	// This should never happen with a valid ECDSA signature
-	return 0, fmt.Errorf("failed to compute recovery ID: no valid recovery ID (0-3) matched for pubkey=%x, r=%x, s=%x",
-		pubKeyBytes[:8], r.Bytes()[:8], s.Bytes()[:8])
-}
-
-// success or nil if recovery fails.
-func tryRecoverPublicKey(messageHash []byte, r, s *big.Int, recoveryID byte) *btcec.PublicKey {
-	curve := btcec.S256()
-
-	// Compute R point x-coordinate
-	rX := new(big.Int).Set(r)
-	if recoveryID >= 2 {
-		// Add N (curve order) for recovery IDs 2 and 3
-		rX.Add(rX, curve.Params().N)
-	}
-
-	// Check if x is valid (must be < field prime)
-	if rX.Cmp(curve.Params().P) >= 0 {
-		return nil
-	}
-
-	// Compute y from x: y^2 = x^3 + 7 (secp256k1 curve equation)
-	// y^2 = x^3 + ax + b, for secp256k1: a=0, b=7
-	ySquared := new(big.Int).Mul(rX, rX)
-	ySquared.Mul(ySquared, rX)
-	ySquared.Add(ySquared, big.NewInt(7))
-	ySquared.Mod(ySquared, curve.Params().P)
-
-	// Compute y = sqrt(y^2) mod P
-	y := new(big.Int).ModSqrt(ySquared, curve.Params().P)
-	if y == nil {
-		return nil
-	}
-
-	// Choose y based on recovery ID LSB
-	if (y.Bit(0) == 1) != (recoveryID&1 == 1) {
-		y.Sub(curve.Params().P, y)
-	}
-
-	// Verify point is on curve
-	if !curve.IsOnCurve(rX, y) {
-		return nil
-	}
-
-	// Now recover the public key Q from R point
-	// Q = r^-1 * (s*R - e*G) where e is the message hash as integer
-
-	// Compute r^-1 (modular inverse of r mod N)
-	rInv := new(big.Int).ModInverse(r, curve.Params().N)
-	if rInv == nil {
-		return nil
-	}
-
-	// e = message hash as big int
-	e := new(big.Int).SetBytes(messageHash)
-
-	// Compute s*R
-	sRx, sRy := curve.ScalarMult(rX, y, s.Bytes())
-
-	// Compute e*G (G is the generator point)
-	eGx, eGy := curve.ScalarBaseMult(e.Bytes())
-
-	// Compute -e*G (negate y coordinate)
-	negEGy := new(big.Int).Sub(curve.Params().P, eGy)
-
-	// Compute s*R - e*G = s*R + (-e*G)
-	diffX, diffY := curve.Add(sRx, sRy, eGx, negEGy)
-
-	// Compute Q = r^-1 * (s*R - e*G)
-	qX, qY := curve.ScalarMult(diffX, diffY, rInv.Bytes())
-
-	// Verify recovered point is on curve
-	if !curve.IsOnCurve(qX, qY) {
-		return nil
-	}
-
-	// Create public key using btcec
-	var xFieldVal, yFieldVal btcec.FieldVal
-	xFieldVal.SetByteSlice(qX.Bytes())
-	yFieldVal.SetByteSlice(qY.Bytes())
-
-	pubKey := btcec.NewPublicKey(&xFieldVal, &yFieldVal)
-
-	return pubKey
-}
-
-// pubKeyToAddress derives an Ethereum address from an ECDSA public key.
-// 
-// pubKeyToAddress computes the Keccak-256 hash of the uncompressed public key
-// (X concatenated with Y, each represented as 32-byte big-endian values), takes
-// the last 20 bytes of the hash, and returns the hex-encoded address prefixed
-// with "0x". Coordinates shorter than 32 bytes are left-padded with zeros.
-func pubKeyToAddress(pubKey *ecdsa.PublicKey) string {
-	// Serialize uncompressed public key (remove 0x04 prefix)
-	pubKeyBytes := append(pubKey.X.Bytes(), pubKey.Y.Bytes()...)
-
-	// Pad to 64 bytes if needed
-	if len(pubKeyBytes) < 64 {
-		padded := make([]byte, 64)
-		copy(padded[32-len(pubKey.X.Bytes()):32], pubKey.X.Bytes())
-		copy(padded[64-len(pubKey.Y.Bytes()):64], pubKey.Y.Bytes())
-		pubKeyBytes = padded
-	}
-
-	// Keccak256 hash
-	hash := sha3.NewLegacyKeccak256()
-	hash.Write(pubKeyBytes)
-	hashBytes := hash.Sum(nil)
-
-	// Take last 20 bytes as address
-	address := hashBytes[len(hashBytes)-20:]
-	return "0x" + hex.EncodeToString(address)
 }
 
 // sendRequest sends an HTTP POST with the given JSON body and a Bearer JWT in the Authorization header.

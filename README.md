@@ -168,8 +168,14 @@ cre-hmac/
 │   ├── crypto.go            # Pure crypto functions
 │   └── crypto_test.go       # Unit tests
 │
-├── shared/                  # Shared types
-│   └── types.go             # NostrEvent, etc.
+├── internal/
+│   └── ethsign/             # Ethereum signing utilities
+│       ├── ethsign.go       # JWT generation, Ethereum message signing
+│       └── ethsign_test.go  # Signing and recovery tests
+│
+├── shared/                  # Shared validation and types
+│   ├── types.go             # NostrEvent, etc.
+│   └── validation.go        # Input validation helpers
 │
 ├── tools/                   # Gateway and utilities
 │   ├── gateway_server.go    # HTTP gateway with SQLite cache
