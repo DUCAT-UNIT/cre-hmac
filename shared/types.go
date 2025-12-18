@@ -14,11 +14,12 @@ type Config struct {
 	Network       string `json:"network"`
 
 	// Cron-based quote generation settings
-	CronSchedule string  `json:"cron_schedule,omitempty"` // Cron expression (e.g., "0 */5 * * * *" for every 5 minutes)
-	RateMin      float64 `json:"rate_min,omitempty"`      // Minimum rate (e.g., 1.35 for 135%)
-	RateMax      float64 `json:"rate_max,omitempty"`      // Maximum rate (e.g., 5.00 for 500%)
-	StepSize     float64 `json:"step_size,omitempty"`     // Step increment (e.g., 0.05 for 5%)
-	QuoteDomain  string  `json:"quote_domain,omitempty"`  // Domain prefix for generated quotes
+	CronSchedule       string  `json:"cron_schedule,omitempty"`        // Cron expression (e.g., "0 */5 * * * *" for every 5 minutes)
+	RateMin            float64 `json:"rate_min,omitempty"`             // Minimum rate (e.g., 1.35 for 135%)
+	RateMax            float64 `json:"rate_max,omitempty"`             // Maximum rate (e.g., 5.00 for 500%)
+	StepSize           float64 `json:"step_size,omitempty"`            // Step increment (e.g., 0.05 for 5%)
+	QuoteDomain        string  `json:"quote_domain,omitempty"`         // Domain prefix for generated quotes
+	GatewayCallbackURL string  `json:"gateway_callback_url,omitempty"` // Gateway URL for batch completion notifications
 }
 
 // Validate validates the configuration

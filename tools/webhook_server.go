@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -21,10 +25,12 @@ const (
 
 // TTLCache provides a bounded, thread-safe cache with automatic expiration
 type TTLCache struct {
-	mu      sync.RWMutex
-	entries map[string]time.Time
-	ttl     time.Duration
-	maxSize int
+	mu       sync.RWMutex
+	entries  map[string]time.Time
+	ttl      time.Duration
+	maxSize  int
+	stopChan chan struct{}
+	stopped  bool
 }
 
 // NewTTLCache creates a TTLCache with the specified entry TTL, maximum size, and cleanup interval.
@@ -32,12 +38,23 @@ type TTLCache struct {
 // cleanupInterval controls how frequently a background goroutine removes expired entries.
 func NewTTLCache(ttl time.Duration, maxSize int, cleanupInterval time.Duration) *TTLCache {
 	cache := &TTLCache{
-		entries: make(map[string]time.Time),
-		ttl:     ttl,
-		maxSize: maxSize,
+		entries:  make(map[string]time.Time),
+		ttl:      ttl,
+		maxSize:  maxSize,
+		stopChan: make(chan struct{}),
 	}
 	go cache.cleanupLoop(cleanupInterval)
 	return cache
+}
+
+// Stop stops the cleanup goroutine. Safe to call multiple times.
+func (c *TTLCache) Stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.stopped {
+		close(c.stopChan)
+		c.stopped = true
+	}
 }
 
 // Contains checks if the key exists and is not expired
@@ -72,15 +89,20 @@ func (c *TTLCache) Add(key string) bool {
 	return true
 }
 
-// cleanupLoop periodically removes expired entries
+// cleanupLoop periodically removes expired entries until Stop is called
 func (c *TTLCache) cleanupLoop(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		c.mu.Lock()
-		c.cleanupExpiredLocked()
-		c.mu.Unlock()
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			c.cleanupExpiredLocked()
+			c.mu.Unlock()
+		case <-c.stopChan:
+			return
+		}
 	}
 }
 
@@ -226,25 +248,60 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// main starts the HTTP server, registers the webhook and health handlers, logs startup
-// information (including event cache configuration), and listens on port 8080.
-// The function terminates the process if the server fails to start or stops with an error.
+// main starts the HTTP server with graceful shutdown support.
+// It registers the webhook and health handlers, logs startup information,
+// and listens on port 8080. On SIGINT/SIGTERM, it gracefully shuts down
+// the server and stops the cache cleanup goroutine.
 func main() {
 	port := ":8080"
 
-	http.HandleFunc("/webhook/ducat", handleWebhook)
-	http.HandleFunc("/health", handleHealth)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook/ducat", handleWebhook)
+	mux.HandleFunc("/health", handleHealth)
 
-	log.Println("🎯 DUCAT Webhook Server")
-	log.Println(strings.Repeat("=", 80))
-	log.Printf("🚀 Server starting on http://localhost%s", port)
-	log.Printf("📍 Webhook endpoint: http://localhost%s/webhook/ducat", port)
-	log.Printf("❤️  Health check: http://localhost%s/health", port)
-	log.Printf("📊 Event cache: TTL=%v, MaxSize=%d, Cleanup=%v", EventTTL, MaxCacheSize, CleanupInterval)
-	log.Println(strings.Repeat("=", 80))
-	log.Println("Waiting for webhooks...\n")
-
-	if err := http.ListenAndServe(port, nil); err != nil {
-		log.Fatalf("❌ Server failed: %v", err)
+	server := &http.Server{
+		Addr:    port,
+		Handler: mux,
 	}
+
+	// Channel to listen for shutdown signals
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	// Start server in goroutine
+	go func() {
+		log.Println("🎯 DUCAT Webhook Server")
+		log.Println(strings.Repeat("=", 80))
+		log.Printf("🚀 Server starting on http://localhost%s", port)
+		log.Printf("📍 Webhook endpoint: http://localhost%s/webhook/ducat", port)
+		log.Printf("❤️  Health check: http://localhost%s/health", port)
+		log.Printf("📊 Event cache: TTL=%v, MaxSize=%d, Cleanup=%v", EventTTL, MaxCacheSize, CleanupInterval)
+		log.Println(strings.Repeat("=", 80))
+		log.Println("Waiting for webhooks...\n")
+
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("❌ Server failed: %v", err)
+		}
+	}()
+
+	// Wait for shutdown signal
+	<-shutdown
+	log.Println("\n⏳ Shutting down gracefully...")
+
+	// Create shutdown context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Stop the cache cleanup goroutine
+	processedEvents.Stop()
+	log.Println("✅ Cache cleanup stopped")
+
+	// Shutdown HTTP server
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("❌ Server shutdown error: %v", err)
+	} else {
+		log.Println("✅ Server stopped")
+	}
+
+	log.Println("👋 Goodbye!")
 }
