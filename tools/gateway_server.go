@@ -154,42 +154,8 @@ type WebhookPayload struct {
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
-// CREPriceEvent represents the response format from CRE workflow
-// Aligned with core-ts PriceContract schema
-type CREPriceEvent struct {
-	// Core price event fields
-	EventOrigin  interface{} `json:"event_origin"`
-	EventPrice   interface{} `json:"event_price"`
-	EventStamp   interface{} `json:"event_stamp"`
-	EventType    string      `json:"event_type"`
-	LatestOrigin string      `json:"latest_origin"`
-	LatestPrice  float64     `json:"latest_price"`
-	LatestStamp  int64       `json:"latest_stamp"`
-	QuoteOrigin  string      `json:"quote_origin"`
-	QuotePrice   float64     `json:"quote_price"`
-	QuoteStamp   int64       `json:"quote_stamp"`
-
-	// Core-ts PriceContract fields
-	ChainNetwork string  `json:"chain_network"`
-	OraclePubkey string  `json:"oracle_pubkey"`
-	BasePrice    int64   `json:"base_price"`
-	BaseStamp    int64   `json:"base_stamp"`
-	CommitHash   string  `json:"commit_hash"`
-	ContractID   string  `json:"contract_id"`
-	OracleSig    string  `json:"oracle_sig"`
-	TholdHash    string  `json:"thold_hash"`
-	TholdKey     *string `json:"thold_key"`
-	TholdPrice   float64 `json:"thold_price"`
-
-	// Legacy fields
-	IsExpired  bool   `json:"is_expired"`
-	SrvNetwork string `json:"srv_network"`
-	SrvPubkey  string `json:"srv_pubkey"`
-	ReqID      string `json:"req_id"`
-	ReqSig     string `json:"req_sig"`
-}
-
 // PriceContractResponse matches core-ts PriceContract schema exactly
+// CRE publishes this format directly to Nostr - no transformation needed
 // This is what client-sdk expects from the gateway
 type PriceContractResponse struct {
 	// PriceObservation fields (from core-ts)
@@ -205,25 +171,6 @@ type PriceContractResponse struct {
 	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
 	TholdKey   *string `json:"thold_key"`   // Secret (null if sealed) - 32 bytes hex
 	TholdPrice int64   `json:"thold_price"` // Threshold price
-}
-
-// transformToPriceContract converts CRE response to core-ts PriceContract format
-func transformToPriceContract(cre *CREPriceEvent) *PriceContractResponse {
-	return &PriceContractResponse{
-		// PriceObservation fields
-		ChainNetwork: cre.ChainNetwork,
-		OraclePubkey: cre.OraclePubkey,
-		BasePrice:    cre.BasePrice,
-		BaseStamp:    cre.BaseStamp,
-
-		// PriceContract fields
-		CommitHash: cre.CommitHash,
-		ContractID: cre.ContractID,
-		OracleSig:  cre.OracleSig,
-		TholdHash:  cre.TholdHash,
-		TholdKey:   cre.TholdKey,
-		TholdPrice: int64(cre.TholdPrice),
-	}
 }
 
 // Response types
@@ -540,9 +487,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		pending.Result = result
 		requestsMutex.Unlock()
 
-		// Parse CRE response and transform to client-sdk format
-		var creEvent CREPriceEvent
-		if err := json.Unmarshal([]byte(result.Content), &creEvent); err != nil {
+		// Parse CRE response - already in core-ts PriceContract format
+		var priceContract PriceContractResponse
+		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
 			logger.Warn("Failed to parse webhook content JSON",
 				zap.String("domain", domain),
 				zap.Error(err),
@@ -552,9 +499,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"raw": result.Content})
 			return
 		}
-
-		// Transform to core-ts PriceContract format
-		priceContract := transformToPriceContract(&creEvent)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(priceContract)
@@ -669,9 +613,9 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		pending.Result = result
 		requestsMutex.Unlock()
 
-		// Parse CRE response and transform to client-sdk format
-		var creEvent CREPriceEvent
-		if err := json.Unmarshal([]byte(result.Content), &creEvent); err != nil {
+		// Parse CRE response - already in core-ts PriceContract format
+		var priceContract PriceContractResponse
+		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
 			logger.Warn("Failed to parse content JSON",
 				zap.String("domain", req.Domain),
 				zap.Error(err),
@@ -680,9 +624,6 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(map[string]interface{}{"raw": result.Content})
 			return
 		}
-
-		// Transform to core-ts PriceContract format
-		priceContract := transformToPriceContract(&creEvent)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(priceContract)
@@ -805,12 +746,10 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If completed, transform to PriceContract format
+	// If completed, return PriceContract directly (CRE already outputs correct format)
 	if pending.Status == "completed" && pending.Result != nil {
-		var creEvent CREPriceEvent
-		if err := json.Unmarshal([]byte(pending.Result.Content), &creEvent); err == nil {
-			// Transform to core-ts PriceContract format
-			priceContract := transformToPriceContract(&creEvent)
+		var priceContract PriceContractResponse
+		if err := json.Unmarshal([]byte(pending.Result.Content), &priceContract); err == nil {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(priceContract)
 			return
@@ -1311,9 +1250,9 @@ func getTag(tags [][]string, key string) string {
 }
 
 func getTholdHash(payload *WebhookPayload) string {
-	var priceEvent CREPriceEvent
-	json.Unmarshal([]byte(payload.Content), &priceEvent)
-	return priceEvent.TholdHash
+	var priceContract PriceContractResponse
+	json.Unmarshal([]byte(payload.Content), &priceContract)
+	return priceContract.TholdHash
 }
 
 // Cleanup old completed/timed-out requests to prevent memory leak

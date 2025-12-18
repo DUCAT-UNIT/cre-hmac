@@ -1,217 +1,183 @@
 # Webhook Callbacks
 
-The DUCAT Oracle workflow now supports **webhook callbacks** to automatically notify your server when operations complete, eliminating the need to manually check the CRE console.
-
-## How It Works
-
-When you trigger a workflow (CREATE or CHECK), you can provide an optional `callback_url`. After the workflow completes and publishes to Nostr, it will POST the result to your webhook.
+The DUCAT Oracle workflow uses webhooks to notify the gateway when operations complete.
 
 ## Callback Types
 
-### 1. **CREATE** - New Threshold Created
-Sent when a new threshold commitment is successfully created.
+### 1. `create` - New Quote Created
+
+Sent when a new threshold commitment is created via `/api/quote`.
 
 ```json
 {
   "event_type": "create",
   "event_id": "263d59e582c1d4debe0f5b8dd89a1082e4872f390f617175fef297ce8f071a79",
-  "pubkey": "6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621",
-  "created_at": 1762876311,
-  "kind": 30078,
-  "tags": [
-    ["d", "240c124e4a188281668b4899b6456c101c568de8"],
-    ["domain", "test2.ducat.xyz"],
-    ["event_type", "active"],
-    ["thold_price", "95000.00000000"]
-  ],
-  "content": "{...full PriceEvent JSON...}",
-  "sig": "f3a545df05289bd476aa6a2447f990034d9124ce6cd1c7b0aa748fec233ad894...",
-  "nostr_event": {...full event...}
-}
-```
-
-### 2. **CHECK (No Breach)** - Threshold Still Safe
-Sent when CHECK confirms the threshold hasn't been breached yet.
-
-```json
-{
-  "event_type": "check_no_breach",
-  "event_id": "263d59e582c1d4debe0f5b8dd89a1082e4872f390f617175fef297ce8f071a79",
-  ...same structure as CREATE...
-}
-```
-
-### 3. **BREACH** - Secret Revealed!
-Sent when CHECK detects a threshold breach and reveals the secret.
-
-```json
-{
-  "event_type": "breach",
-  "event_id": "...",
-  "content": "{...PriceEvent with thold_key revealed...}",
-  ...
-}
-```
-
-The `content` field will contain the complete `PriceEvent` with:
-- `event_price`: Current price that breached threshold
-- `event_stamp`: Breach timestamp
-- `thold_key`: **THE REVEALED SECRET** 🔓
-
-## Usage
-
-### With trigger-http Tool
-
-```bash
-# CREATE with webhook
-./trigger-http \
-  --workflow-id 0084e4d5376fa916e50fc3e3b9997890402d6b880f8e682f7cc3d3708ce50fc7 \
-  --domain "example.com" \
-  --op create \
-  --thold-price "95000.00" \
-  --callback-url "https://your-server.com/webhook/ducat"
-
-# CHECK with webhook
-./trigger-http \
-  --workflow-id 0084e4d5376fa916e50fc3e3b9997890402d6b880f8e682f7cc3d3708ce50fc7 \
-  --domain "example.com" \
-  --op check \
-  --thold-hash "240c124e4a188281668b4899b6456c101c568de8" \
-  --callback-url "https://your-server.com/webhook/ducat"
-```
-
-### Raw JSON-RPC Request
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "unique-id",
-  "method": "workflows.execute",
-  "params": {
-    "input": {
-      "domain": "example.com",
-      "thold_price": 95000.00,
-      "callback_url": "https://your-server.com/webhook/ducat"
-    },
-    "workflow": {
-      "workflowID": "0084e4d5376fa916e50fc3e3b9997890402d6b880f8e682f7cc3d3708ce50fc7"
-    }
+  "domain": "test.ducat.xyz",
+  "thold_hash": "240c124e4a188281668b4899b6456c101c568de8",
+  "price_contract": {
+    "chain_network": "mutinynet",
+    "oracle_pubkey": "6b5008a293291c14...",
+    "base_price": 105000,
+    "base_stamp": 1734567890,
+    "commit_hash": "a1b2c3d4...",
+    "contract_id": "e5f6g7h8...",
+    "oracle_sig": "deadbeef...",
+    "thold_hash": "240c124e4a188281668b4899b6456c101c568de8",
+    "thold_key": null,
+    "thold_price": 141750
   }
 }
 ```
 
-## Webhook Server Example
+### 2. `batch_generated` - Cron Batch Complete
 
-Here's a simple Go webhook server to receive callbacks:
+Sent when the CRE cron job generates a new batch of quotes. Gateway caches this price.
 
-```go
-package main
-
-import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"log"
-	"net/http"
-)
-
-type WebhookPayload struct {
-	EventType   string                 `json:"event_type"`
-	EventID     string                 `json:"event_id"`
-	PubKey      string                 `json:"pubkey"`
-	CreatedAt   int64                  `json:"created_at"`
-	Content     string                 `json:"content"`
-	NostrEvent  map[string]interface{} `json:"nostr_event"`
-}
-
-func handleWebhook(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusBadRequest)
-		return
-	}
-
-	var payload WebhookPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("Received %s event: %s\n", payload.EventType, payload.EventID)
-
-	switch payload.EventType {
-	case "create":
-		log.Printf("New threshold created!")
-		// Handle new commitment
-	case "check_no_breach":
-		log.Printf("Threshold still safe")
-		// Continue monitoring
-	case "breach":
-		log.Printf("🚨 THRESHOLD BREACHED! Secret revealed!")
-		// Parse content to get thold_key
-		// Execute conditional logic (release funds, etc.)
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("OK"))
-}
-
-func main() {
-	http.HandleFunc("/webhook/ducat", handleWebhook)
-	log.Println("Webhook server listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+```json
+{
+  "event_type": "batch_generated",
+  "data": {
+    "base_price": 105000,
+    "base_stamp": 1734567890
+  }
 }
 ```
+
+### 3. `evaluate` - Batch Evaluation Complete
+
+Sent when `/api/evaluate` completes batch quote evaluation.
+
+```json
+{
+  "event_type": "evaluate",
+  "event_id": "evaluate-0",
+  "domain": "eval-abc123",
+  "data": {
+    "results": [
+      {
+        "thold_hash": "240c124e4a188281668b4899b6456c101c568de8",
+        "status": "active",
+        "thold_key": null,
+        "current_price": 105000.50,
+        "thold_price": 110000.00
+      },
+      {
+        "thold_hash": "350d235f5b299392779c5900c7567d212d679ef9",
+        "status": "breached",
+        "thold_key": "revealed_secret_here",
+        "current_price": 105000.50,
+        "thold_price": 100000.00
+      }
+    ],
+    "current_price": 105000.50,
+    "evaluated_at": 1734567890
+  }
+}
+```
+
+## Webhook Payload Structure
+
+All webhooks share a common structure:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event_type` | string | Type: `create`, `batch_generated`, `evaluate` |
+| `event_id` | string | Unique event identifier |
+| `domain` | string | Request domain (for create/evaluate) |
+| `thold_hash` | string | Threshold hash (for create) |
+| `price_contract` | object | PriceContract (for create) |
+| `data` | object | Response data (for batch_generated/evaluate) |
+
+## Nostr Event Structure
+
+Events are published to Nostr as NIP-33 replaceable events (kind 30078).
+
+### Tags
+
+| Tag | Value |
+|-----|-------|
+| `d` | `commit_hash` - NIP-33 replaceable identifier |
+
+### Content
+
+The event content is the `PriceContract` JSON (matches core-ts schema exactly):
+
+```json
+{
+  "chain_network": "mutinynet",
+  "oracle_pubkey": "6b5008a293291c14...",
+  "base_price": 105000,
+  "base_stamp": 1734567890,
+  "commit_hash": "a1b2c3d4...",
+  "contract_id": "e5f6g7h8...",
+  "oracle_sig": "deadbeef...",
+  "thold_hash": "240c124e4a18...",
+  "thold_key": null,
+  "thold_price": 141750
+}
+```
+
+When breached, `thold_key` contains the revealed 32-byte hex secret.
+
+## Gateway Webhook Handler
+
+The gateway handles webhooks at `POST /webhook/ducat`:
+
+```go
+// Handle batch_generated - cache base price
+if payload.EventType == "batch_generated" {
+    // Parse base_price and base_stamp
+    // Store in memory + SQLite
+    // Used by GET /api/price
+}
+
+// Handle create/evaluate - unblock waiting requests
+// Match by domain, send result to waiting HTTP client
+```
+
+## CRE Configuration
+
+Set the gateway callback URL in CRE config:
+
+```json
+{
+  "gateway_callback_url": "http://gateway:8080/webhook/ducat"
+}
+```
+
+The CRE cron job will POST `batch_generated` events to this URL after generating quotes.
 
 ## Security Considerations
 
-1. **HTTPS Only**: Always use HTTPS for webhook URLs in production
-2. **Signature Verification**: Verify the Nostr event signature to ensure authenticity:
-   ```go
-   // The event.sig is a Schnorr signature that proves the event
-   // came from the DUCAT oracle with pubkey: event.pubkey
-   ```
-3. **Idempotency**: Use `event_id` to deduplicate callbacks (DON consensus may send multiple)
-4. **Timeouts**: Your webhook endpoint should respond within 10 seconds
-5. **Retry Logic**: The workflow won't retry failed webhooks - use a queue if processing is slow
+1. **Internal network**: Webhook endpoint should only be accessible from CRE
+2. **Idempotency**: Use `event_id` to deduplicate (DON consensus may send multiple)
+3. **Signature verification**: Verify `oracle_sig` in `price_contract` for authenticity
+4. **Timeouts**: Webhook should respond within 10 seconds
 
-## Benefits
+## Data Flow
 
-✅ **No Polling**: Instant notifications when events occur
-✅ **Automated Workflows**: Trigger actions immediately on breach
-✅ **Efficient**: Don't waste resources checking CRE console
-✅ **Reliable**: Uses DON consensus for delivery
-✅ **Flexible**: Any HTTP endpoint can receive callbacks
-
-## Testing
-
-Test your webhook endpoint with a local server:
-
-```bash
-# Run webhook server
-go run your-webhook-server.go
-
-# In another terminal, use ngrok for public URL
-ngrok http 8080
-
-# Use the ngrok HTTPS URL as callback
-./trigger-http \
-  --workflow-id 0084e4d5376fa916e50fc3e3b9997890402d6b880f8e682f7cc3d3708ce50fc7 \
-  --domain "test.com" \
-  --op create \
-  --thold-price "95000.00" \
-  --callback-url "https://abc123.ngrok.io/webhook/ducat"
 ```
-
-## Deployment
-
-Remember to **redeploy** the workflow after adding webhook support:
-
-```bash
-cd hmac
-GOOS=wasip1 GOARCH=wasm go build -o binary.wasm .
-cd ..
-cre workflow deploy ./hmac --target production-testnet --yes
+CRE (cron)                               Gateway
+    │                                       │
+    ├─ generateQuotesParallel()             │
+    ├─ publish to Nostr                     │
+    │                                       │
+    ├─ POST /webhook/ducat ────────────────►│
+    │   event_type: "batch_generated"       │
+    │   data: {base_price, base_stamp}      │
+    │                                       ├─ cache in SQLite
+    │                                       │
+    │                                       │
+CRE (HTTP trigger)                       Gateway
+    │                                       │
+    │◄───────────────── triggerWorkflow() ──┤
+    │                                       │
+    ├─ createQuote()                        │
+    ├─ publish to Nostr                     │
+    │                                       │
+    ├─ POST /webhook/ducat ────────────────►│
+    │   event_type: "create"                │
+    │   price_contract: {...}               │
+    │                                       ├─ unblock waiting request
+    │                                       │
 ```
-
-Then your workflow will support callback URLs! 🎉

@@ -32,28 +32,22 @@ Content-Type: application/json
 }
 ```
 
-### Expected Response (200 OK - if completes within 60s)
+### Expected Response (200 OK)
+
+Returns a `PriceContract` (matches core-ts schema exactly):
 
 ```json
 {
-  "status": "completed",
-  "request_id": "a1b2c3d4e5f6...",
-  "result": {
-    "event_type": "create",
-    "event_id": "a1b2c3d4e5f6...",
-    "pubkey": "6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621",
-    "created_at": 1762876311,
-    "kind": 30078,
-    "tags": [
-      ["d", "240c124e4a188281668b4899b6456c101c568de8"],
-      ["domain", "postman-test.ducat.xyz"],
-      ["event_type", "active"],
-      ["thold_price", "101500.00000000"]
-    ],
-    "content": "{\"event_origin\":null,\"event_price\":null,\"event_stamp\":null,\"event_type\":\"active\",\"latest_origin\":\"chainlink\",\"latest_price\":103315.5,\"latest_stamp\":1736620800,\"quote_origin\":\"chainlink\",\"quote_price\":103315.5,\"quote_stamp\":1736620800,\"is_expired\":false,\"srv_network\":\"Mutinynet\",\"srv_pubkey\":\"6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621\",\"thold_hash\":\"240c124e4a188281668b4899b6456c101c568de8\",\"thold_key\":\"\",\"thold_price\":101500,\"req_id\":\"postman-test.ducat.xyz:101500.00\",\"req_sig\":\"...\"}",
-    "sig": "f3a545df05289bd476aa6a2447f990034d9124ce6cd1c7b0aa748fec233ad894...",
-    "nostr_event": { ... }
-  }
+  "chain_network": "mutinynet",
+  "oracle_pubkey": "6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621",
+  "base_price": 103315,
+  "base_stamp": 1736620800,
+  "commit_hash": "a1b2c3d4e5f6...",
+  "contract_id": "e5f6g7h8i9j0...",
+  "oracle_sig": "deadbeef1234...",
+  "thold_hash": "240c124e4a188281668b4899b6456c101c568de8",
+  "thold_key": null,
+  "thold_price": 101500
 }
 ```
 
@@ -70,69 +64,11 @@ Content-Type: application/json
 ### Notes
 - **This request will block in Postman** - you'll see the spinner for up to 60 seconds
 - Watch the gateway server logs to see real-time progress
-- Save the `thold_hash` from the response for the CHECK test below
+- Save the `commit_hash` from the response to query the Nostr event later
 
 ---
 
-## 2. CHECK Threshold (Blocking Request)
-
-Checks if a threshold has been breached. **Blocks until CRE workflow completes** (up to 60s).
-
-### Request
-
-```
-POST http://localhost:8081/check
-Content-Type: application/json
-```
-
-### Body (raw JSON)
-
-**Replace `YOUR_THOLD_HASH_HERE` with the hash from the CREATE response above:**
-
-```json
-{
-  "domain": "postman-test.ducat.xyz",
-  "thold_hash": "240c124e4a188281668b4899b6456c101c568de8"
-}
-```
-
-### Expected Response (200 OK - No Breach)
-
-```json
-{
-  "status": "completed",
-  "request_id": "b2c3d4e5f6...",
-  "result": {
-    "event_type": "check_no_breach",
-    "event_id": "b2c3d4e5f6...",
-    "content": "{...\"event_type\":\"active\",\"is_expired\":false,\"thold_key\":\"\"...}",
-    ...
-  }
-}
-```
-
-### Expected Response (200 OK - BREACH!)
-
-If the price has dropped below your threshold:
-
-```json
-{
-  "status": "completed",
-  "request_id": "b2c3d4e5f6...",
-  "result": {
-    "event_type": "breach",
-    "event_id": "b2c3d4e5f6...",
-    "content": "{...\"event_type\":\"breach\",\"is_expired\":true,\"thold_key\":\"YOUR_SECRET_KEY_HERE\"...}",
-    ...
-  }
-}
-```
-
-**The secret is revealed in `result.content.thold_key`!** 🔓
-
----
-
-## 3. GET Status (Polling Fallback)
+## 2. GET Status (Polling Fallback)
 
 If a request times out (202 response), use this to manually poll for the result.
 
@@ -159,17 +95,26 @@ GET http://localhost:8081/status/a1b2c3d4e5f6789012345678
 
 ### Expected Response (Completed)
 
+Returns the `PriceContract`:
+
 ```json
 {
-  "status": "completed",
-  "request_id": "a1b2c3d4e5f6...",
-  "result": { ...full webhook payload... }
+  "chain_network": "mutinynet",
+  "oracle_pubkey": "6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621",
+  "base_price": 103315,
+  "base_stamp": 1736620800,
+  "commit_hash": "a1b2c3d4e5f6...",
+  "contract_id": "e5f6g7h8i9j0...",
+  "oracle_sig": "deadbeef1234...",
+  "thold_hash": "240c124e4a188281668b4899b6456c101c568de8",
+  "thold_key": null,
+  "thold_price": 101500
 }
 ```
 
 ---
 
-## 4. Health Check
+## 3. Health Check
 
 Simple endpoint to verify the gateway is running.
 
@@ -187,6 +132,46 @@ OK
 
 ---
 
+## Nostr Event Structure
+
+Events are stored in Nostr as NIP-33 replaceable events (kind 30078).
+
+### Tags
+
+| Tag | Value |
+|-----|-------|
+| `d` | `commit_hash` - NIP-33 replaceable identifier |
+
+### Content
+
+The event content is the `PriceContract` JSON:
+
+```json
+{
+  "chain_network": "mutinynet",
+  "oracle_pubkey": "6b5008a293291c14...",
+  "base_price": 103315,
+  "base_stamp": 1736620800,
+  "commit_hash": "a1b2c3d4e5f6...",
+  "contract_id": "e5f6g7h8i9j0...",
+  "oracle_sig": "deadbeef1234...",
+  "thold_hash": "240c124e4a18...",
+  "thold_key": null,
+  "thold_price": 101500
+}
+```
+
+When breached, `thold_key` contains the revealed 32-byte hex secret.
+
+### Querying Nostr
+
+```bash
+# Query by commit_hash
+GET /api/query?#d=<commit_hash>
+```
+
+---
+
 ## Testing Workflow
 
 ### Test 1: Basic CREATE (Happy Path)
@@ -194,17 +179,10 @@ OK
 1. Start gateway: `./tools/gateway-server`
 2. In Postman, send **POST /create** with the JSON above
 3. **Watch it block** - Postman will show spinner
-4. After ~10-30 seconds, you'll get the result
-5. **Save the `thold_hash`** from the response
+4. After ~10-30 seconds, you'll get the `PriceContract` result
+5. **Save the `commit_hash`** to query Nostr later
 
-### Test 2: CHECK (No Breach)
-
-1. Take the `thold_hash` from Test 1
-2. Send **POST /check** with that hash
-3. Should return `"event_type": "check_no_breach"`
-4. Current price is still above threshold
-
-### Test 3: Timeout Scenario
+### Test 2: Timeout Scenario
 
 To test the timeout fallback:
 
@@ -215,16 +193,6 @@ To test the timeout fallback:
 5. You'll get a 202 with `request_id`
 6. Use **GET /status/{request_id}** to poll
 
-### Test 4: Breach Detection
-
-To trigger a breach (for testing):
-
-1. Create a threshold at a **high price**: `"thold_price": 150000.00`
-2. Wait for it to complete - you'll get the hash
-3. Immediately run **POST /check** with that hash
-4. Since current BTC price (~$103k) is below $150k, it will breach!
-5. You'll get `"event_type": "breach"` with the secret revealed
-
 ---
 
 ## Current Configuration
@@ -232,15 +200,12 @@ To trigger a breach (for testing):
 - **Gateway Server**: http://localhost:8081
 - **Workflow ID**: `00035da0ef9df06335edb5c99686855121bd0c993b6938cfca03c7d3e55a813c`
 - **Network**: Mutinynet (Bitcoin testnet)
-- **Current BTC Price**: ~$103,315
 - **Block Timeout**: 60 seconds
 - **Authorized Address**: `0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82`
 
 ---
 
 ## Postman Collection Export
-
-You can also create a collection with these requests:
 
 ```json
 {
@@ -273,30 +238,7 @@ You can also create a collection with these requests:
       }
     },
     {
-      "name": "2. CHECK Threshold",
-      "request": {
-        "method": "POST",
-        "header": [
-          {
-            "key": "Content-Type",
-            "value": "application/json"
-          }
-        ],
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"domain\": \"postman-test.ducat.xyz\",\n  \"thold_hash\": \"YOUR_HASH_HERE\"\n}"
-        },
-        "url": {
-          "raw": "http://localhost:8081/check",
-          "protocol": "http",
-          "host": ["localhost"],
-          "port": "8081",
-          "path": ["check"]
-        }
-      }
-    },
-    {
-      "name": "3. GET Status",
+      "name": "2. GET Status",
       "request": {
         "method": "GET",
         "url": {
@@ -309,7 +251,7 @@ You can also create a collection with these requests:
       }
     },
     {
-      "name": "4. Health Check",
+      "name": "3. Health Check",
       "request": {
         "method": "GET",
         "url": {
@@ -351,10 +293,10 @@ You can also create a collection with these requests:
 
 ```bash
 # Terminal 1: Start Gateway
-cd /Users/lucasrodriguez/Desktop/Ducat/cre-hmac/tools
+cd tools
 ./gateway-server
 
-# Terminal 2: Test with curl (or use Postman)
+# Terminal 2: Test with curl
 curl -X POST http://localhost:8081/create \
   -H "Content-Type: application/json" \
   -d '{
@@ -363,15 +305,5 @@ curl -X POST http://localhost:8081/create \
   }'
 
 # This will block... watch Terminal 1 for logs...
-# After ~20s, you'll get the result with thold_hash
-
-# Now check it
-curl -X POST http://localhost:8081/check \
-  -H "Content-Type: application/json" \
-  -d '{
-    "domain": "curl-test.ducat.xyz",
-    "thold_hash": "PUT_HASH_FROM_ABOVE_HERE"
-  }'
+# After ~20s, you'll get the PriceContract result
 ```
-
-Happy testing! 🎯
