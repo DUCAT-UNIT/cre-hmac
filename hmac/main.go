@@ -9,12 +9,13 @@ import (
 
 	pb "github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
+	"github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron"
 	"github.com/smartcontractkit/cre-sdk-go/cre"
 	"github.com/smartcontractkit/cre-sdk-go/cre/wasm"
 )
 
 // DUCAT workflow entry point for CRE/WASM execution
-// Routes HTTP triggers to CREATE or CHECK handlers
+// Routes HTTP triggers to CREATE or EVALUATE handlers
 
 const (
 	SecretPrivateKey  = "private_key"
@@ -28,16 +29,121 @@ type WorkflowConfig struct {
 	ClientSecret string
 }
 
-// onHttpTrigger routes requests based on parameters
-// thold_price -> CREATE new quote
-// thold_hash -> CHECK existing quote
-func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (*NostrEvent, error) {
+// GenericHttpRequest is a wrapper to parse action field first
+type GenericHttpRequest struct {
+	Action string `json:"action"` // "create", "evaluate"
+}
+
+// onHttpTrigger routes requests based on action parameter
+// action=create OR thold_price -> CREATE new quote
+// action=evaluate -> EVALUATE batch quotes (with breach detection)
+func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (interface{}, error) {
 	logger := runtime.Logger()
 	logger.Info("HTTP trigger received")
 
 	if payload.Input == nil || len(payload.Input) == 0 {
 		return nil, fmt.Errorf("no input provided")
 	}
+
+	// Fetch secrets from runtime
+	wc, err := buildWorkflowConfig(config, runtime)
+	if err != nil {
+		return nil, err
+	}
+
+	// First, check if there's an explicit action field
+	var genericReq GenericHttpRequest
+	_ = json.Unmarshal(payload.Input, &genericReq)
+
+	// Route based on action field
+	switch genericReq.Action {
+	case "evaluate":
+		// Batch evaluate quotes
+		var evalReq EvaluateQuotesRequest
+		if err := json.Unmarshal(payload.Input, &evalReq); err != nil {
+			logger.Error("Failed to parse evaluate request", "error", err)
+			return nil, fmt.Errorf("invalid evaluate request format: %w", err)
+		}
+		if err := evalReq.Validate(); err != nil {
+			logger.Error("Evaluate request validation failed", "error", err)
+			return nil, fmt.Errorf("validation failed: %w", err)
+		}
+		logger.Info("Routing to evaluateQuotes", "tholdHashCount", len(evalReq.TholdHashes))
+		return evaluateQuotes(wc, runtime, &evalReq)
+
+	default:
+		// Create quote (legacy routing based on thold_price)
+		var requestData HttpRequestData
+		if err := json.Unmarshal(payload.Input, &requestData); err != nil {
+			logger.Error("Failed to parse request", "error", err)
+			return nil, fmt.Errorf("invalid request format: %w", err)
+		}
+
+		// Validate request
+		if err := requestData.Validate(); err != nil {
+			logger.Error("Request validation failed", "error", err)
+			return nil, fmt.Errorf("validation failed: %w", err)
+		}
+
+		logger.Info("Parsed request", "domain", requestData.Domain, "hasTholdPrice", requestData.TholdPrice != nil)
+
+		if requestData.TholdPrice != nil {
+			return createQuote(wc, runtime, &requestData)
+		}
+
+		return nil, fmt.Errorf("invalid request: must provide thold_price for create or action=evaluate")
+	}
+}
+
+// onCronTrigger handles scheduled quote generation
+// Fires based on cron_schedule in config
+// Generates quotes from rate_min to rate_max at step_size intervals
+func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (*GenerateQuotesResponse, error) {
+	logger := runtime.Logger()
+	scheduledTime := trigger.ScheduledExecutionTime.AsTime()
+	logger.Info("Cron trigger fired for quote generation", "scheduledTime", scheduledTime)
+
+	// Fetch secrets from runtime
+	wc, err := buildWorkflowConfig(config, runtime)
+	if err != nil {
+		return nil, err
+	}
+
+	// Use generation parameters from config
+	// Use QuoteDomain from config, or default to "auto-gen"
+	quoteDomain := config.QuoteDomain
+	if quoteDomain == "" {
+		quoteDomain = "auto-gen"
+	}
+
+	// Create request from config parameters
+	genReq := &GenerateQuotesRequest{
+		RateMin:     config.RateMin,
+		RateMax:     config.RateMax,
+		StepSize:    config.StepSize,
+		Domain:      fmt.Sprintf("%s-%d", quoteDomain, scheduledTime.Unix()),
+		QuoteDomain: quoteDomain,
+	}
+
+	// Validate request
+	if err := genReq.Validate(); err != nil {
+		logger.Error("Generate request validation failed", "error", err)
+		return nil, fmt.Errorf("validation failed: %w", err)
+	}
+
+	logger.Info("Starting quote generation",
+		"rateMin", genReq.RateMin,
+		"rateMax", genReq.RateMax,
+		"stepSize", genReq.StepSize,
+		"quoteDomain", quoteDomain,
+	)
+
+	return generateQuotesParallel(wc, runtime, genReq)
+}
+
+// buildWorkflowConfig fetches secrets and builds WorkflowConfig
+func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, error) {
+	logger := runtime.Logger()
 
 	// Fetch secrets from runtime
 	privateKeyReq := &pb.SecretRequest{Id: SecretPrivateKey}
@@ -60,38 +166,11 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 		return nil, fmt.Errorf("client_secret cannot be empty")
 	}
 
-	// Build workflow config with secrets
-	wc := &WorkflowConfig{
+	return &WorkflowConfig{
 		Config:       config,
 		PrivateKey:   privateKeySecret.Value,
 		ClientSecret: clientSecretSecret.Value,
-	}
-
-	// Parse request data
-	var requestData HttpRequestData
-	if err := json.Unmarshal(payload.Input, &requestData); err != nil {
-		logger.Error("Failed to parse request", "error", err)
-		return nil, fmt.Errorf("invalid request format: %w", err)
-	}
-
-	// Validate request
-	if err := requestData.Validate(); err != nil {
-		logger.Error("Request validation failed", "error", err)
-		return nil, fmt.Errorf("validation failed: %w", err)
-	}
-
-	logger.Info("Parsed request", "domain", requestData.Domain, "hasTholdPrice", requestData.TholdPrice != nil, "hasTholdHash", requestData.TholdHash != nil)
-
-	// Route to appropriate handler
-	if requestData.TholdPrice != nil {
-		// Create new quote
-		return createQuote(wc, runtime, &requestData)
-	} else if requestData.TholdHash != nil {
-		// Check existing quote
-		return checkQuote(wc, runtime, &requestData)
-	}
-
-	return nil, fmt.Errorf("invalid request: must provide either thold_price or thold_hash")
+	}, nil
 }
 
 // InitWorkflow initializes workflow with config validation
@@ -115,9 +194,25 @@ func InitWorkflow(config *Config, logger *slog.Logger, secrets cre.SecretsProvid
 		},
 	}
 
-	return cre.Workflow[*Config]{
+	// Build workflow handlers
+	handlers := cre.Workflow[*Config]{
 		cre.Handler(http.Trigger(httpConfig), onHttpTrigger),
-	}, nil
+	}
+
+	// Add Cron trigger for quote generation if schedule is configured
+	if config.CronSchedule != "" {
+		logger.Info("Configuring cron trigger for quote generation",
+			"schedule", config.CronSchedule,
+			"rateMin", config.RateMin,
+			"rateMax", config.RateMax,
+			"stepSize", config.StepSize,
+		)
+
+		cronTrigger := cron.Trigger(&cron.Config{Schedule: config.CronSchedule})
+		handlers = append(handlers, cre.Handler(cronTrigger, onCronTrigger))
+	}
+
+	return handlers, nil
 }
 
 // main is the WASM entry point

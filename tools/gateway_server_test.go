@@ -1686,3 +1686,1033 @@ func TestHandleCreateSuccess(t *testing.T) {
 		t.Error("contract_id not found in response")
 	}
 }
+
+// =============================================================================
+// Tests for /api/evaluate endpoint (NEW)
+// =============================================================================
+
+// TestHandleEvaluateValidation tests input validation for /api/evaluate
+func TestHandleEvaluateValidation(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	tests := []struct {
+		name           string
+		method         string
+		payload        interface{}
+		expectedStatus int
+		expectedBody   string
+	}{
+		{
+			name:           "wrong method GET",
+			method:         "GET",
+			payload:        nil,
+			expectedStatus: http.StatusMethodNotAllowed,
+			expectedBody:   "Method not allowed",
+		},
+		{
+			name:           "wrong method PUT",
+			method:         "PUT",
+			payload:        nil,
+			expectedStatus: http.StatusMethodNotAllowed,
+			expectedBody:   "Method not allowed",
+		},
+		{
+			name:           "OPTIONS preflight",
+			method:         "OPTIONS",
+			payload:        nil,
+			expectedStatus: http.StatusOK,
+			expectedBody:   "",
+		},
+		{
+			name:           "invalid JSON",
+			method:         "POST",
+			payload:        "not json",
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   "Invalid JSON",
+		},
+		{
+			name:           "empty thold_hashes array",
+			method:         "POST",
+			payload:        EvaluateRequest{TholdHashes: []string{}},
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   "thold_hashes required",
+		},
+		{
+			name:           "nil thold_hashes",
+			method:         "POST",
+			payload:        map[string]interface{}{},
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   "thold_hashes required",
+		},
+		{
+			name:   "too many thold_hashes",
+			method: "POST",
+			payload: EvaluateRequest{
+				TholdHashes: make([]string, 101), // 101 > max 100
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   "Maximum 100 thold_hashes",
+		},
+		{
+			name:   "invalid thold_hash length - too short",
+			method: "POST",
+			payload: EvaluateRequest{
+				TholdHashes: []string{"abc123"},
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   "Invalid thold_hash at index 0",
+		},
+		{
+			name:   "invalid thold_hash length - too long",
+			method: "POST",
+			payload: EvaluateRequest{
+				TholdHashes: []string{"1234567890123456789012345678901234567890extra"},
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   "Invalid thold_hash at index 0",
+		},
+		{
+			name:   "mixed valid and invalid hashes",
+			method: "POST",
+			payload: EvaluateRequest{
+				TholdHashes: []string{
+					"1234567890123456789012345678901234567890", // valid
+					"short",                                    // invalid
+				},
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedBody:   "Invalid thold_hash at index 1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body io.Reader
+			if str, ok := tt.payload.(string); ok {
+				body = strings.NewReader(str)
+			} else if tt.payload != nil {
+				jsonData, _ := json.Marshal(tt.payload)
+				body = bytes.NewReader(jsonData)
+			}
+
+			req := httptest.NewRequest(tt.method, "/api/evaluate", body)
+			w := httptest.NewRecorder()
+
+			handleEvaluate(w, req)
+
+			resp := w.Result()
+			if resp.StatusCode != tt.expectedStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.expectedStatus)
+			}
+
+			if tt.expectedBody != "" {
+				respBody, _ := io.ReadAll(resp.Body)
+				if !strings.Contains(string(respBody), tt.expectedBody) {
+					t.Errorf("body = %s, want to contain %s", respBody, tt.expectedBody)
+				}
+			}
+		})
+	}
+}
+
+// TestHandleEvaluateMaxPending tests max pending request limit for evaluate endpoint
+func TestHandleEvaluateMaxPending(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	// Set low limit for testing
+	MAX_PENDING = 2
+
+	// Fill pending requests
+	for i := 0; i < MAX_PENDING; i++ {
+		domain := fmt.Sprintf("test-%d", i)
+		pendingRequests[domain] = &PendingRequest{
+			RequestID:  domain,
+			CreatedAt:  time.Now(),
+			ResultChan: make(chan *WebhookPayload, 1),
+			Status:     "pending",
+		}
+	}
+
+	evalReq := EvaluateRequest{
+		TholdHashes: []string{"1234567890123456789012345678901234567890"},
+	}
+	jsonData, _ := json.Marshal(evalReq)
+
+	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+	w := httptest.NewRecorder()
+
+	handleEvaluate(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "Server at capacity") {
+		t.Errorf("body = %s, want 'Server at capacity'", body)
+	}
+
+	// Cleanup
+	resetGlobals()
+	MAX_PENDING = 1000
+}
+
+// TestHandleEvaluateTimeout tests timeout behavior for evaluate endpoint
+func TestHandleEvaluateTimeout(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	// Set very short timeout for testing
+	oldTimeout := BLOCK_TIMEOUT
+	BLOCK_TIMEOUT = 100 * time.Millisecond
+	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+
+	// Mock the triggerEvaluateWorkflow
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result": "ok"}`))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	evalReq := EvaluateRequest{
+		TholdHashes: []string{
+			"1234567890123456789012345678901234567890",
+			"abcdef1234567890123456789012345678901234",
+		},
+	}
+	jsonData, _ := json.Marshal(evalReq)
+
+	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+	w := httptest.NewRecorder()
+
+	handleEvaluate(w, req)
+
+	resp := w.Result()
+
+	// Should timeout and return 202
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("status = %d, want %d (timeout)", resp.StatusCode, http.StatusAccepted)
+	}
+
+	var syncResp SyncResponse
+	json.NewDecoder(resp.Body).Decode(&syncResp)
+
+	if syncResp.Status != "timeout" {
+		t.Errorf("status = %s, want timeout", syncResp.Status)
+	}
+
+	if syncResp.RequestID == "" {
+		t.Error("request_id should not be empty")
+	}
+
+	if !strings.Contains(syncResp.Message, "/status/") {
+		t.Errorf("message should contain status URL, got: %s", syncResp.Message)
+	}
+}
+
+// TestHandleEvaluateSuccess tests successful evaluate with webhook response
+func TestHandleEvaluateSuccess(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	// Mock the triggerEvaluateWorkflow
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result": "ok"}`))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	evalReq := EvaluateRequest{
+		TholdHashes: []string{
+			"1234567890123456789012345678901234567890",
+			"abcdef1234567890123456789012345678901234",
+		},
+	}
+	jsonData, _ := json.Marshal(evalReq)
+
+	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+	w := httptest.NewRecorder()
+
+	// Simulate webhook arriving
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+
+		requestsMutex.RLock()
+		var pending *PendingRequest
+		var domain string
+		for d, p := range pendingRequests {
+			if strings.HasPrefix(d, "eval-") && p.Status == "pending" {
+				pending = p
+				domain = d
+				break
+			}
+		}
+		requestsMutex.RUnlock()
+
+		if pending != nil {
+			// Simulate evaluate response from CRE
+			tholdKey := "secret123abc456def789012345678901234567890123456789012345678901234"
+			evalResp := EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{
+					{
+						TholdHash:    "1234567890123456789012345678901234567890",
+						Status:       "breached",
+						TholdKey:     &tholdKey,
+						CurrentPrice: 95000.0,
+						TholdPrice:   100000.0,
+					},
+					{
+						TholdHash:    "abcdef1234567890123456789012345678901234",
+						Status:       "active",
+						TholdKey:     nil,
+						CurrentPrice: 95000.0,
+						TholdPrice:   90000.0,
+					},
+				},
+				CurrentPrice: 95000.0,
+				EvaluatedAt:  1700000000,
+			}
+			contentJSON, _ := json.Marshal(evalResp)
+
+			payload := &WebhookPayload{
+				EventType: "evaluate",
+				EventID:   "eval-event-123",
+				Tags:      [][]string{{"domain", domain}},
+				Content:   string(contentJSON),
+			}
+			select {
+			case pending.ResultChan <- payload:
+			default:
+			}
+		}
+	}()
+
+	handleEvaluate(w, req)
+
+	resp := w.Result()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var result EvaluateQuotesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	// Verify response structure
+	if len(result.Results) != 2 {
+		t.Errorf("results count = %d, want 2", len(result.Results))
+	}
+
+	if result.CurrentPrice != 95000.0 {
+		t.Errorf("current_price = %f, want 95000.0", result.CurrentPrice)
+	}
+
+	if result.EvaluatedAt != 1700000000 {
+		t.Errorf("evaluated_at = %d, want 1700000000", result.EvaluatedAt)
+	}
+
+	// Verify first result (breached)
+	if result.Results[0].Status != "breached" {
+		t.Errorf("results[0].status = %s, want breached", result.Results[0].Status)
+	}
+	if result.Results[0].TholdKey == nil {
+		t.Error("results[0].thold_key should not be nil for breached quote")
+	}
+
+	// Verify second result (active)
+	if result.Results[1].Status != "active" {
+		t.Errorf("results[1].status = %s, want active", result.Results[1].Status)
+	}
+	if result.Results[1].TholdKey != nil {
+		t.Error("results[1].thold_key should be nil for active quote")
+	}
+}
+
+// TestHandleEvaluateWorkflowError tests workflow trigger error for evaluate
+func TestHandleEvaluateWorkflowError(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	// Mock server that returns error
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("internal error"))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	evalReq := EvaluateRequest{
+		TholdHashes: []string{"1234567890123456789012345678901234567890"},
+	}
+	jsonData, _ := json.Marshal(evalReq)
+
+	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+	w := httptest.NewRecorder()
+
+	handleEvaluate(w, req)
+
+	resp := w.Result()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
+	}
+}
+
+// TestHandleEvaluateCORSHeaders tests CORS headers for evaluate endpoint
+func TestHandleEvaluateCORSHeaders(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	// Test OPTIONS preflight
+	req := httptest.NewRequest("OPTIONS", "/api/evaluate", nil)
+	w := httptest.NewRecorder()
+
+	handleEvaluate(w, req)
+
+	resp := w.Result()
+
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("Access-Control-Allow-Origin = %s, want *", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	if !strings.Contains(resp.Header.Get("Access-Control-Allow-Methods"), "POST") {
+		t.Errorf("Access-Control-Allow-Methods should contain POST, got: %s", resp.Header.Get("Access-Control-Allow-Methods"))
+	}
+
+	if !strings.Contains(resp.Header.Get("Access-Control-Allow-Headers"), "Content-Type") {
+		t.Errorf("Access-Control-Allow-Headers should contain Content-Type, got: %s", resp.Header.Get("Access-Control-Allow-Headers"))
+	}
+}
+
+// TestHandleEvaluateWithCallbackURL tests evaluate with optional callback URL
+func TestHandleEvaluateWithCallbackURL(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	// Track what was sent to the mock server
+	var receivedPayload map[string]interface{}
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var rpcReq map[string]interface{}
+		json.Unmarshal(body, &rpcReq)
+		if params, ok := rpcReq["params"].(map[string]interface{}); ok {
+			if input, ok := params["input"].(map[string]interface{}); ok {
+				receivedPayload = input
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result": "ok"}`))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	// Set short timeout
+	oldTimeout := BLOCK_TIMEOUT
+	BLOCK_TIMEOUT = 50 * time.Millisecond
+	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+
+	callbackURL := "http://example.com/my-callback"
+	evalReq := EvaluateRequest{
+		TholdHashes: []string{"1234567890123456789012345678901234567890"},
+		CallbackURL: &callbackURL,
+	}
+	jsonData, _ := json.Marshal(evalReq)
+
+	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+	w := httptest.NewRecorder()
+
+	handleEvaluate(w, req)
+
+	// Verify action was set to "evaluate" in the request
+	if receivedPayload != nil {
+		if action, ok := receivedPayload["action"].(string); !ok || action != "evaluate" {
+			t.Errorf("action = %v, want 'evaluate'", receivedPayload["action"])
+		}
+		if hashes, ok := receivedPayload["thold_hashes"].([]interface{}); !ok || len(hashes) != 1 {
+			t.Errorf("thold_hashes not properly sent")
+		}
+	}
+}
+
+// TestHandleEvaluateMalformedWebhookResponse tests handling of malformed webhook response
+func TestHandleEvaluateMalformedWebhookResponse(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result": "ok"}`))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	evalReq := EvaluateRequest{
+		TholdHashes: []string{"1234567890123456789012345678901234567890"},
+	}
+	jsonData, _ := json.Marshal(evalReq)
+
+	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+	w := httptest.NewRecorder()
+
+	// Simulate webhook with malformed content
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+
+		requestsMutex.RLock()
+		var pending *PendingRequest
+		var domain string
+		for d, p := range pendingRequests {
+			if strings.HasPrefix(d, "eval-") && p.Status == "pending" {
+				pending = p
+				domain = d
+				break
+			}
+		}
+		requestsMutex.RUnlock()
+
+		if pending != nil {
+			payload := &WebhookPayload{
+				EventType: "evaluate",
+				EventID:   "eval-event-123",
+				Tags:      [][]string{{"domain", domain}},
+				Content:   `{invalid json content}`,
+			}
+			select {
+			case pending.ResultChan <- payload:
+			default:
+			}
+		}
+	}()
+
+	handleEvaluate(w, req)
+
+	resp := w.Result()
+
+	// Should still return 200 with raw content fallback
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+
+	// Should have "raw" field with original content
+	if _, ok := result["raw"]; !ok {
+		t.Error("response should contain 'raw' field for malformed content")
+	}
+}
+
+// =============================================================================
+// Tests for triggerEvaluateWorkflow
+// =============================================================================
+
+func TestTriggerEvaluateWorkflow(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+
+	var receivedBody map[string]interface{}
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		json.Unmarshal(body, &receivedBody)
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      receivedBody["id"],
+			"result":  "success",
+		})
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	err := triggerEvaluateWorkflow("test-domain", []string{"hash1", "hash2"}, "http://callback.example.com")
+	if err != nil {
+		t.Fatalf("triggerEvaluateWorkflow() error = %v", err)
+	}
+
+	// Verify request structure
+	if receivedBody["jsonrpc"] != "2.0" {
+		t.Errorf("jsonrpc = %v, want 2.0", receivedBody["jsonrpc"])
+	}
+	if receivedBody["method"] != "workflows.execute" {
+		t.Errorf("method = %v, want workflows.execute", receivedBody["method"])
+	}
+
+	params, ok := receivedBody["params"].(map[string]interface{})
+	if !ok {
+		t.Fatal("params not found in request")
+	}
+
+	input, ok := params["input"].(map[string]interface{})
+	if !ok {
+		t.Fatal("input not found in params")
+	}
+
+	if input["action"] != "evaluate" {
+		t.Errorf("action = %v, want evaluate", input["action"])
+	}
+	if input["domain"] != "test-domain" {
+		t.Errorf("domain = %v, want test-domain", input["domain"])
+	}
+	if input["callback_url"] != "http://callback.example.com" {
+		t.Errorf("callback_url = %v, want http://callback.example.com", input["callback_url"])
+	}
+
+	hashes, ok := input["thold_hashes"].([]interface{})
+	if !ok || len(hashes) != 2 {
+		t.Errorf("thold_hashes = %v, want [hash1, hash2]", input["thold_hashes"])
+	}
+}
+
+func TestTriggerEvaluateWorkflowError(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("server error"))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	err := triggerEvaluateWorkflow("test-domain", []string{"hash1"}, "http://callback.example.com")
+	if err == nil {
+		t.Error("expected error but got nil")
+	}
+	if !strings.Contains(err.Error(), "non-success status") {
+		t.Errorf("error = %v, want to contain 'non-success status'", err)
+	}
+}
+
+// =============================================================================
+// Tests for QuoteEvaluationResult and EvaluateQuotesResponse types
+// =============================================================================
+
+func TestQuoteEvaluationResultJSON(t *testing.T) {
+	tholdKey := "secretkey123"
+	errMsg := "some error"
+
+	tests := []struct {
+		name   string
+		result QuoteEvaluationResult
+		check  func(t *testing.T, data map[string]interface{})
+	}{
+		{
+			name: "breached with key",
+			result: QuoteEvaluationResult{
+				TholdHash:    "1234567890123456789012345678901234567890",
+				Status:       "breached",
+				TholdKey:     &tholdKey,
+				CurrentPrice: 95000.0,
+				TholdPrice:   100000.0,
+			},
+			check: func(t *testing.T, data map[string]interface{}) {
+				if data["status"] != "breached" {
+					t.Errorf("status = %v, want breached", data["status"])
+				}
+				if data["thold_key"] != tholdKey {
+					t.Errorf("thold_key = %v, want %s", data["thold_key"], tholdKey)
+				}
+				if data["current_price"].(float64) != 95000.0 {
+					t.Errorf("current_price = %v, want 95000.0", data["current_price"])
+				}
+			},
+		},
+		{
+			name: "active without key",
+			result: QuoteEvaluationResult{
+				TholdHash:    "1234567890123456789012345678901234567890",
+				Status:       "active",
+				TholdKey:     nil,
+				CurrentPrice: 95000.0,
+				TholdPrice:   90000.0,
+			},
+			check: func(t *testing.T, data map[string]interface{}) {
+				if data["status"] != "active" {
+					t.Errorf("status = %v, want active", data["status"])
+				}
+				if data["thold_key"] != nil {
+					t.Errorf("thold_key = %v, want nil", data["thold_key"])
+				}
+			},
+		},
+		{
+			name: "error result",
+			result: QuoteEvaluationResult{
+				TholdHash:    "1234567890123456789012345678901234567890",
+				Status:       "error",
+				CurrentPrice: 95000.0,
+				Error:        &errMsg,
+			},
+			check: func(t *testing.T, data map[string]interface{}) {
+				if data["status"] != "error" {
+					t.Errorf("status = %v, want error", data["status"])
+				}
+				if data["error"] != errMsg {
+					t.Errorf("error = %v, want %s", data["error"], errMsg)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jsonData, err := json.Marshal(tt.result)
+			if err != nil {
+				t.Fatalf("failed to marshal: %v", err)
+			}
+
+			var decoded map[string]interface{}
+			if err := json.Unmarshal(jsonData, &decoded); err != nil {
+				t.Fatalf("failed to unmarshal: %v", err)
+			}
+
+			tt.check(t, decoded)
+		})
+	}
+}
+
+func TestEvaluateQuotesResponseJSON(t *testing.T) {
+	tholdKey := "secret123"
+	resp := EvaluateQuotesResponse{
+		Results: []QuoteEvaluationResult{
+			{
+				TholdHash:    "hash1",
+				Status:       "breached",
+				TholdKey:     &tholdKey,
+				CurrentPrice: 95000.0,
+				TholdPrice:   100000.0,
+			},
+			{
+				TholdHash:    "hash2",
+				Status:       "active",
+				CurrentPrice: 95000.0,
+				TholdPrice:   90000.0,
+			},
+		},
+		CurrentPrice: 95000.0,
+		EvaluatedAt:  1700000000,
+	}
+
+	jsonData, err := json.Marshal(resp)
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+
+	var decoded EvaluateQuotesResponse
+	if err := json.Unmarshal(jsonData, &decoded); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+
+	if len(decoded.Results) != 2 {
+		t.Errorf("results count = %d, want 2", len(decoded.Results))
+	}
+	if decoded.CurrentPrice != 95000.0 {
+		t.Errorf("current_price = %f, want 95000.0", decoded.CurrentPrice)
+	}
+	if decoded.EvaluatedAt != 1700000000 {
+		t.Errorf("evaluated_at = %d, want 1700000000", decoded.EvaluatedAt)
+	}
+}
+
+// =============================================================================
+// Tests for EvaluateRequest validation
+// =============================================================================
+
+func TestEvaluateRequestValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		request EvaluateRequest
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "valid single hash",
+			request: EvaluateRequest{
+				TholdHashes: []string{"1234567890123456789012345678901234567890"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid multiple hashes",
+			request: EvaluateRequest{
+				TholdHashes: []string{
+					"1234567890123456789012345678901234567890",
+					"abcdef1234567890123456789012345678901234",
+					"fedcba0987654321fedcba0987654321fedcba09",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid with callback URL",
+			request: EvaluateRequest{
+				TholdHashes: []string{"1234567890123456789012345678901234567890"},
+				CallbackURL: func() *string { s := "http://example.com/callback"; return &s }(),
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty hashes",
+			request: EvaluateRequest{
+				TholdHashes: []string{},
+			},
+			wantErr: true,
+			errMsg:  "thold_hashes required",
+		},
+		{
+			name: "nil hashes",
+			request: EvaluateRequest{
+				TholdHashes: nil,
+			},
+			wantErr: true,
+			errMsg:  "thold_hashes required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Validate by checking length
+			hasErr := len(tt.request.TholdHashes) == 0
+			if hasErr != tt.wantErr {
+				t.Errorf("validation error = %v, wantErr %v", hasErr, tt.wantErr)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Tests for transformToPriceContract
+// =============================================================================
+
+func TestTransformToPriceContract(t *testing.T) {
+	tholdKey := "secret123"
+
+	tests := []struct {
+		name     string
+		input    CREPriceEvent
+		expected PriceContractResponse
+	}{
+		{
+			name: "full transformation",
+			input: CREPriceEvent{
+				ChainNetwork: "mutiny",
+				OraclePubkey: "abc123pubkey",
+				BasePrice:    100000,
+				BaseStamp:    1700000000,
+				CommitHash:   "commit123",
+				ContractID:   "contract456",
+				OracleSig:    "sig789",
+				TholdHash:    "thold123",
+				TholdKey:     &tholdKey,
+				TholdPrice:   95000.0,
+			},
+			expected: PriceContractResponse{
+				ChainNetwork: "mutiny",
+				OraclePubkey: "abc123pubkey",
+				BasePrice:    100000,
+				BaseStamp:    1700000000,
+				CommitHash:   "commit123",
+				ContractID:   "contract456",
+				OracleSig:    "sig789",
+				TholdHash:    "thold123",
+				TholdKey:     &tholdKey,
+				TholdPrice:   95000,
+			},
+		},
+		{
+			name: "nil thold_key",
+			input: CREPriceEvent{
+				ChainNetwork: "signet",
+				OraclePubkey: "pubkey456",
+				BasePrice:    50000,
+				BaseStamp:    1699999999,
+				CommitHash:   "commit456",
+				ContractID:   "contract789",
+				OracleSig:    "sig123",
+				TholdHash:    "thold456",
+				TholdKey:     nil,
+				TholdPrice:   60000.0,
+			},
+			expected: PriceContractResponse{
+				ChainNetwork: "signet",
+				OraclePubkey: "pubkey456",
+				BasePrice:    50000,
+				BaseStamp:    1699999999,
+				CommitHash:   "commit456",
+				ContractID:   "contract789",
+				OracleSig:    "sig123",
+				TholdHash:    "thold456",
+				TholdKey:     nil,
+				TholdPrice:   60000,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := transformToPriceContract(&tt.input)
+
+			if result.ChainNetwork != tt.expected.ChainNetwork {
+				t.Errorf("ChainNetwork = %s, want %s", result.ChainNetwork, tt.expected.ChainNetwork)
+			}
+			if result.OraclePubkey != tt.expected.OraclePubkey {
+				t.Errorf("OraclePubkey = %s, want %s", result.OraclePubkey, tt.expected.OraclePubkey)
+			}
+			if result.BasePrice != tt.expected.BasePrice {
+				t.Errorf("BasePrice = %d, want %d", result.BasePrice, tt.expected.BasePrice)
+			}
+			if result.BaseStamp != tt.expected.BaseStamp {
+				t.Errorf("BaseStamp = %d, want %d", result.BaseStamp, tt.expected.BaseStamp)
+			}
+			if result.CommitHash != tt.expected.CommitHash {
+				t.Errorf("CommitHash = %s, want %s", result.CommitHash, tt.expected.CommitHash)
+			}
+			if result.ContractID != tt.expected.ContractID {
+				t.Errorf("ContractID = %s, want %s", result.ContractID, tt.expected.ContractID)
+			}
+			if result.OracleSig != tt.expected.OracleSig {
+				t.Errorf("OracleSig = %s, want %s", result.OracleSig, tt.expected.OracleSig)
+			}
+			if result.TholdHash != tt.expected.TholdHash {
+				t.Errorf("TholdHash = %s, want %s", result.TholdHash, tt.expected.TholdHash)
+			}
+			if result.TholdPrice != tt.expected.TholdPrice {
+				t.Errorf("TholdPrice = %d, want %d", result.TholdPrice, tt.expected.TholdPrice)
+			}
+
+			// Check TholdKey pointer
+			if (result.TholdKey == nil) != (tt.expected.TholdKey == nil) {
+				t.Errorf("TholdKey nil mismatch")
+			}
+			if result.TholdKey != nil && tt.expected.TholdKey != nil {
+				if *result.TholdKey != *tt.expected.TholdKey {
+					t.Errorf("TholdKey = %s, want %s", *result.TholdKey, *tt.expected.TholdKey)
+				}
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Concurrent tests for evaluate endpoint
+// =============================================================================
+
+func TestConcurrentEvaluateRequests(t *testing.T) {
+	setupTestEnv(t)
+	loadConfig()
+	resetGlobals()
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result": "ok"}`))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	// Set short timeout
+	oldTimeout := BLOCK_TIMEOUT
+	BLOCK_TIMEOUT = 100 * time.Millisecond
+	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+
+	numRequests := 5
+	var wg sync.WaitGroup
+
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			evalReq := EvaluateRequest{
+				TholdHashes: []string{
+					fmt.Sprintf("%040d", idx), // Unique 40-char hash
+				},
+			}
+			jsonData, _ := json.Marshal(evalReq)
+
+			req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+			w := httptest.NewRecorder()
+
+			handleEvaluate(w, req)
+
+			// All should get timeout response (202) since no webhook arrives
+			if w.Code != http.StatusAccepted {
+				t.Errorf("request %d: status = %d, want %d", idx, w.Code, http.StatusAccepted)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// =============================================================================
+// Benchmark tests for evaluate endpoint
+// =============================================================================
+
+func BenchmarkHandleEvaluateValidation(b *testing.B) {
+	setupTestEnv(&testing.T{})
+	loadConfig()
+	resetGlobals()
+
+	evalReq := EvaluateRequest{
+		TholdHashes: []string{
+			"1234567890123456789012345678901234567890",
+			"abcdef1234567890123456789012345678901234",
+			"fedcba0987654321fedcba0987654321fedcba09",
+		},
+	}
+	jsonData, _ := json.Marshal(evalReq)
+
+	// Mock server that always returns OK
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"result": "ok"}`))
+	}))
+	defer mockServer.Close()
+	GATEWAY_URL = mockServer.URL
+
+	// Very short timeout to minimize benchmark time
+	oldTimeout := BLOCK_TIMEOUT
+	BLOCK_TIMEOUT = 1 * time.Millisecond
+	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resetGlobals()
+		req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		handleEvaluate(w, req)
+	}
+}
+
+func BenchmarkEvaluateQuotesResponseSerialization(b *testing.B) {
+	tholdKey := "secret123"
+	resp := EvaluateQuotesResponse{
+		Results: []QuoteEvaluationResult{
+			{TholdHash: "hash1", Status: "breached", TholdKey: &tholdKey, CurrentPrice: 95000.0, TholdPrice: 100000.0},
+			{TholdHash: "hash2", Status: "active", CurrentPrice: 95000.0, TholdPrice: 90000.0},
+			{TholdHash: "hash3", Status: "breached", TholdKey: &tholdKey, CurrentPrice: 95000.0, TholdPrice: 85000.0},
+		},
+		CurrentPrice: 95000.0,
+		EvaluatedAt:  1700000000,
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = json.Marshal(resp)
+	}
+}

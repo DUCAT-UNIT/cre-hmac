@@ -45,6 +45,7 @@ GATEWAY_CALLBACK_URL=https://your-public-url/webhook/ducat
 LOG_LEVEL=info
 LOG_FORMAT=json
 MAX_PENDING_REQUESTS=1000
+GATEWAY_DB_PATH=/data/gateway.db  # SQLite database for price cache
 ```
 
 ---
@@ -105,22 +106,26 @@ docker build --no-cache -t ducat-gateway:latest .
 ### Run
 
 ```bash
-# Run detached
+# Run detached with persistent SQLite
 docker run -d \
   --name ducat-gateway \
   -p 8080:8080 \
+  -v ducat-data:/data \
+  -e GATEWAY_DB_PATH=/data/gateway.db \
   --env-file .env \
   ducat-gateway:latest
 
 # Run with custom port
 docker run -d \
   -p 9000:8080 \
+  -v ducat-data:/data \
   --env-file .env \
   ducat-gateway:latest
 
 # Run in foreground (see logs)
 docker run --rm \
   -p 8080:8080 \
+  -v ducat-data:/data \
   --env-file .env \
   ducat-gateway:latest
 ```
@@ -260,10 +265,21 @@ spec:
               key: authorized-key
         - name: GATEWAY_CALLBACK_URL
           value: "https://gateway.example.com/webhook/ducat"
+        - name: GATEWAY_DB_PATH
+          value: "/data/gateway.db"
         - name: LOG_FORMAT
           value: "json"
         - name: LOG_LEVEL
           value: "info"
+
+        volumeMounts:
+        - name: data
+          mountPath: /data
+
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: ducat-gateway-pvc
 
         # Resource limits
         resources:
