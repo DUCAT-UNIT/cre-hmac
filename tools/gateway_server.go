@@ -379,7 +379,22 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// GET /api/quote?th=PRICE - Blocks until webhook arrives or timeout
+// handleCreate handles GET /api/quote?th=PRICE requests by creating a tracked threshold request,
+// triggering the CRE workflow, and blocking until a matching webhook arrives or the server timeout elapses.
+//
+// It validates the required `th` query parameter (must be a positive number), enqueues a PendingRequest
+// (rejecting with 503 if the server is at capacity), and invokes the external workflow. If a matching
+// webhook is received before the timeout, the handler returns the webhook's CRE `PriceContractResponse`
+// as JSON. If the wait times out, the handler responds with 202 Accepted and a SyncResponse containing
+// the request ID for polling via GET /status/{request_id}.
+//
+// Observed HTTP behaviors:
+//  - 200: successful CRE response returned as JSON.
+//  - 202: request timed out; polling instruction returned.
+//  - 400: missing or invalid `th` parameter.
+//  - 405: method not allowed (only GET and OPTIONS supported).
+//  - 500: failure to trigger the CRE workflow.
+//  - 503: server at capacity (too many pending requests).
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Set CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -528,7 +543,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /check - Blocks until webhook arrives or timeout
+// handleCheck handles POST /check requests by triggering a CRE "check" workflow and blocking until the corresponding webhook arrives or BLOCK_TIMEOUT elapses.
+// It validates the JSON body (domain and 40-char thold_hash), registers a PendingRequest keyed by domain (enforcing MAX_PENDING), and invokes the workflow.
+// If a matching webhook is received before timeout, the pending request is marked completed and the parsed PriceContractResponse is returned (falls back to raw content on JSON parse failure).
+// If BLOCK_TIMEOUT elapses, the pending request is marked timed out and a 202 Accepted SyncResponse containing the request ID is returned for polling.
 func handleCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -724,7 +742,16 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// GET /status/{request_id} - Manual polling fallback
+// handleStatus responds to GET /status/{request_id} with the current state of a tracked request.
+// 
+// If the request exists and its status is "completed" and the webhook payload can be unmarshaled
+// into a PriceContractResponse, the handler returns that PriceContractResponse as JSON.
+// Otherwise the handler returns a SyncResponse JSON envelope containing the request's status,
+// request ID, and any captured Result; when status is "pending" the response includes a message
+// indicating processing is still underway.
+// 
+// The handler returns HTTP 405 for non-GET methods, 400 when request_id is missing, and 404 when
+// the request_id is not found.
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1240,6 +1267,8 @@ func generateRequestID() string {
 	return hex.EncodeToString(b)
 }
 
+// getTag extracts the value for a given key from a Nostr-style tags slice.
+// It returns the second element of the first tag whose first element equals key, or an empty string if no match is found.
 func getTag(tags [][]string, key string) string {
 	for _, tag := range tags {
 		if len(tag) >= 2 && tag[0] == key {
@@ -1249,6 +1278,8 @@ func getTag(tags [][]string, key string) string {
 	return ""
 }
 
+// getTholdHash extracts the TholdHash field from the WebhookPayload's Content interpreted as a PriceContractResponse.
+// If the payload content cannot be parsed as a PriceContractResponse, it returns the empty string.
 func getTholdHash(payload *WebhookPayload) string {
 	var priceContract PriceContractResponse
 	json.Unmarshal([]byte(payload.Content), &priceContract)

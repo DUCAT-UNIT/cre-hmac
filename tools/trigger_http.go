@@ -64,6 +64,15 @@ type JWTPayload struct {
 	Jti    string `json:"jti"`
 }
 
+// main is the CLI entry point that constructs and sends a JWT-authenticated JSON-RPC
+// request to the configured gateway to trigger a workflow execution.
+// It parses command-line flags (workflow-id, domain, op, thold-price, thold-hash, callback-url),
+// validates inputs, loads an ECDSA private key from DUCAT_PRIVATE_KEY, derives an Ethereum-style
+// address, and builds the workflow input for either a "create" (includes thold_price) or
+// "check" (includes thold_hash) operation. The function marshals the request with stable key
+// ordering, computes a SHA-256 digest, produces an ETH-style signed JWT containing that digest,
+// sends the request with the JWT as a Bearer token, and prints the gateway response and a
+// workflow tracking URL when available.
 func main() {
 	// Command-line flags
 	workflowID := flag.String("workflow-id", "", "Workflow ID (64 hex characters, no 0x prefix)")
@@ -232,7 +241,9 @@ func main() {
 	}
 }
 
-// marshalSorted marshals JSON with keys sorted alphabetically at all levels
+// marshalSorted marshals v to JSON with all map keys sorted lexicographically at every level.
+// It normalizes the input using the standard encoding/json round-trip and then produces a
+// deterministic JSON encoding with stable key ordering; it returns the encoded bytes or an error.
 func marshalSorted(v interface{}) ([]byte, error) {
 	// Convert to map structure first
 	temp, err := json.Marshal(v)
@@ -254,6 +265,12 @@ func marshalSorted(v interface{}) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// marshalSortedRecursive writes the JSON encoding of v to buf with all map keys
+// sorted lexicographically at every level.
+//
+// It accepts maps of the concrete type map[string]interface{}, slices ([]interface{}),
+// and primitive values; nested structures are handled recursively. If encoding any
+// value fails, the encountered error is returned.
 func marshalSortedRecursive(buf *bytes.Buffer, v interface{}) error {
 	switch val := v.(type) {
 	case map[string]interface{}:
@@ -297,13 +314,18 @@ func marshalSortedRecursive(buf *bytes.Buffer, v interface{}) error {
 	return nil
 }
 
-// computeDigest computes SHA256 hash with 0x prefix
+// computeDigest returns the SHA-256 digest of the input data as a hex string prefixed with "0x".
 func computeDigest(data []byte) string {
 	hash := sha256.Sum256(data)
 	return "0x" + hex.EncodeToString(hash[:])
 }
 
-// generateJWT creates a JWT token signed with ECDSA
+// generateJWT creates a JWT whose header uses alg "ETH" and whose payload contains
+// the provided digest, issuer (address), issued-at, expiration (5 minutes) and a
+// unique jti. It signs the "header.payload" string using an Ethereum-style
+// signing prefix and returns the final token in the form
+// "header.payload.signature" where the signature is base64url-encoded. An error
+// is returned if encoding or signing fails.
 func generateJWT(privKey *ecdsa.PrivateKey, address, digest string) (string, error) {
 	now := time.Now().Unix()
 
@@ -346,7 +368,9 @@ func generateJWT(privKey *ecdsa.PrivateKey, address, digest string) (string, err
 	return message + "." + signatureB64, nil
 }
 
-// signEthereumMessage signs a message with Ethereum's "\x19Ethereum Signed Message:\n" prefix
+// signEthereumMessage signs a message using Ethereum's prefixed message format and returns a 65-byte signature in the form r||s||v.
+// The message is prefixed with "\x19Ethereum Signed Message:\n" and hashed with Keccak256 before ECDSA signing; `s` is normalized to the lower half of the curve order and `v` is the recovery identifier.
+// Returns the 65-byte signature (32-byte `r`, 32-byte `s`, 1-byte `v`) or an error if the signing operation fails.
 func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, error) {
 	// Create Ethereum signed message prefix
 	prefix := fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(message), message)
@@ -399,7 +423,8 @@ func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, err
 }
 
 // computeRecoveryID computes the Ethereum recovery ID (0-3)
-// Panics if no valid recovery ID is found (indicates a bug in signature generation)
+// computeRecoveryID computes the Ethereum recovery ID (0–3) that, when used with the provided signature components and message hash, recovers the given public key.
+// It returns the matching recovery ID. It panics if no recovery ID matches, indicating a bug in signature generation.
 func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *big.Int) byte {
 	// Get uncompressed public key bytes
 	pubKeyBytes := pubKey.SerializeUncompressed()
@@ -426,7 +451,7 @@ func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messa
 		pubKeyBytes[:8], r.Bytes()[:8], s.Bytes()[:8]))
 }
 
-// tryRecoverPublicKey attempts to recover the public key from a signature
+// success or nil if recovery fails.
 func tryRecoverPublicKey(messageHash []byte, r, s *big.Int, recoveryID byte) *btcec.PublicKey {
 	curve := btcec.S256()
 
@@ -507,7 +532,12 @@ func tryRecoverPublicKey(messageHash []byte, r, s *big.Int, recoveryID byte) *bt
 	return pubKey
 }
 
-// pubKeyToAddress derives Ethereum address from public key
+// pubKeyToAddress derives an Ethereum address from an ECDSA public key.
+// 
+// pubKeyToAddress computes the Keccak-256 hash of the uncompressed public key
+// (X concatenated with Y, each represented as 32-byte big-endian values), takes
+// the last 20 bytes of the hash, and returns the hex-encoded address prefixed
+// with "0x". Coordinates shorter than 32 bytes are left-padded with zeros.
 func pubKeyToAddress(pubKey *ecdsa.PublicKey) string {
 	// Serialize uncompressed public key (remove 0x04 prefix)
 	pubKeyBytes := append(pubKey.X.Bytes(), pubKey.Y.Bytes()...)
@@ -530,7 +560,9 @@ func pubKeyToAddress(pubKey *ecdsa.PublicKey) string {
 	return "0x" + hex.EncodeToString(address)
 }
 
-// sendRequest sends HTTP POST request with JWT authorization
+// sendRequest sends an HTTP POST with the given JSON body and a Bearer JWT in the Authorization header.
+// It returns the response body when the server responds with HTTP 200 or 202.
+// For any other HTTP status it returns an error containing the status code and the response body.
 func sendRequest(url string, body []byte, jwt string) ([]byte, error) {
 	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {

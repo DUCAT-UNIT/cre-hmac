@@ -23,7 +23,12 @@ import (
 // 2. Validate threshold distance (1% min)
 // 3. Derive threshold secret via HMAC
 // 4. Compute Hash160 commitment
-// 5. Sign and publish Nostr event (NIP-33)
+// createQuote creates a new threshold price commitment (quote) and publishes it as a Nostr event.
+// It fetches the current price, validates the requested threshold is at least 1% away from the current price,
+// constructs a PriceContractResponse (with the threshold secret withheld), signs a replaceable NIP-33 event,
+// publishes the event to configured relays using consensus, and optionally sends a webhook callback.
+// On success the published NostrEvent is returned; on failure an error is returned (for example: key derivation,
+// price fetch, contract creation, event signing, or relay publish failures).
 func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpRequestData) (*NostrEvent, error) {
 	logger := runtime.Logger()
 	logger.Info("Creating new quote", "domain", requestData.Domain, "tholdPrice", *requestData.TholdPrice)
@@ -164,7 +169,15 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 // evaluateQuotes batch evaluates multiple quotes by their thold_hash IN PARALLEL
 // Phase 1: Fetch price once, then launch ALL quote fetches in parallel
 // Phase 2: Process results, prepare breach events (synchronous, fast)
-// Phase 3: Launch ALL breach event publishes in parallel
+// evaluateQuotes evaluates a batch of threshold quotes and publishes breach events when thresholds are crossed.
+// 
+// evaluateQuotes fetches the current reference price once, retrieves each quote event in parallel, determines
+// whether each quote is active, already breached, or newly breached, and for newly breached quotes publishes
+// corresponding breach events (revealing the threshold secret). It returns a summary of per-quote evaluation
+// results, the current price used for evaluation, and the evaluation timestamp. If a callback URL is provided
+// on the request, a best-effort JSON callback is sent after evaluation.
+// 
+// The function may return an error if key derivation or the initial price fetch fail.
 func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *EvaluateQuotesRequest) (*EvaluateQuotesResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Evaluating quotes batch (parallel)", "count", len(requestData.TholdHashes))
@@ -469,7 +482,19 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 // 1. Fetch current BTC/USD price
 // 2. Calculate threshold prices at each step
 // 3. Create and publish quotes for each threshold
-// 4. Return summary with created thold_hashes
+// generateQuotes generates threshold quotes across the requested rate range, publishes each
+// quote as a signed Nostr threshold-commitment event, and returns a summary containing
+// created thold_hashes and price range information.
+//
+// It fetches the current BTC/USD price, iterates rates from RateMin to RateMax by StepSize,
+// creates a price contract for each rate (secret withheld), signs the contract ID with the
+// oracle Schnorr key, publishes the resulting Nostr event, and collects successfully published
+// thold_hash values. Failures to create, sign, marshal, or publish an individual quote are
+// skipped and do not abort the overall generation process. The function returns an error only
+// for unrecoverable setup failures (for example, key derivation or the initial price fetch).
+//
+// If CallbackURL is provided, a best-effort JSON callback with the generation summary is sent
+// asynchronously; callback failures are ignored.
 func generateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *GenerateQuotesRequest) (*GenerateQuotesResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Generating quotes", "rateMin", requestData.RateMin, "rateMax", requestData.RateMax, "stepSize", requestData.StepSize)
@@ -635,7 +660,11 @@ type QuoteResult struct {
 }
 
 // generateQuotesParallel auto-generates price quotes in parallel
-// Uses CRE's promise-based async pattern to publish all quotes concurrently
+// generateQuotesParallel generates threshold quotes across the specified rate range, publishes each as a Nostr threshold-commitment event in parallel, and returns a summary of the successfully created quotes.
+// 
+// The function obtains the current reference price, creates and signs price contracts for each rate step, publishes the signed Nostr events concurrently, and aggregates the created threshold hashes and counts. If a gateway callback URL is configured, a best-effort batch callback is sent after publishing.
+// 
+// It returns a GenerateQuotesResponse containing counts, generated thold hashes, the base price and timestamp, and an error if a fatal step (such as price fetch or key derivation) fails.
 func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData *GenerateQuotesRequest) (*GenerateQuotesResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Generating quotes (parallel)", "rateMin", requestData.RateMin, "rateMax", requestData.RateMax, "stepSize", requestData.StepSize)
@@ -837,7 +866,9 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 // sendWebhookCallback sends HTTP POST notification to callback URL
 // Notifies external systems of workflow completion with results
 // This is a best-effort notification - failures are logged but don't block the workflow
-// Sends PriceContractResponse directly - no transformation needed on gateway
+// sendWebhookCallback sends a JSON webhook POST containing the price contract and related metadata to the provided callback URL.
+// It performs best-effort delivery: errors and non-2xx responses are logged but not returned to the caller.
+// The payload includes `event_type`, `event_id`, `domain` (extracted from the event tags), `thold_hash`, and `price_contract`.
 func sendWebhookCallback(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, event *NostrEvent, priceContract *PriceContractResponse, eventType string) {
 	logger.Info("Sending webhook callback", "url", callbackURL, "eventType", eventType)
 
@@ -880,7 +911,8 @@ func sendWebhookCallback(config *Config, logger *slog.Logger, sendRequester *htt
 
 // getDomainFromTags extracts identifier from Nostr event tags
 // Looks for "d" tag (NIP-33 replaceable event identifier) which contains commit_hash
-// Falls back to "domain" for backwards compatibility
+// getDomainFromTags extracts the domain identifier from a Nostr event's tags.
+// It returns the value of the first tag whose key is "d" or "domain", or an empty string if no such tag is present.
 func getDomainFromTags(tags [][]string) string {
 	for _, tag := range tags {
 		if len(tag) >= 2 && (tag[0] == "d" || tag[0] == "domain") {
@@ -891,7 +923,11 @@ func getDomainFromTags(tags [][]string) string {
 }
 
 // sendJSONCallback sends HTTP POST notification with JSON payload
-// Used for evaluate and generate handlers that return structured responses instead of NostrEvent
+// sendJSONCallback sends a best-effort JSON POST to the provided callbackURL containing an event wrapper
+// with keys "event_type", "event_id" (formatted as "<eventType>-0"), "domain", and "data".
+//
+// The function marshals the wrapper to JSON, POSTs it with Content-Type "application/json" using
+// sendRequester, and logs failures or non-2xx responses. Errors are handled locally and not returned.
 func sendJSONCallback(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, domain string, eventType string, data interface{}) {
 	logger.Info("Sending JSON callback", "url", callbackURL, "eventType", eventType, "domain", domain)
 
@@ -932,7 +968,9 @@ func sendJSONCallback(config *Config, logger *slog.Logger, sendRequester *http.S
 }
 
 // sendBatchGeneratedCallback notifies gateway that a new batch of quotes was generated
-// Gateway uses this to update the current base price served to clients
+// sendBatchGeneratedCallback sends a best-effort HTTP POST notifying a gateway that a new batch of quotes was generated.
+// The JSON payload has an `event_type` of "batch_generated" and a `data` field containing the provided BatchGeneratedInfo.
+// It logs success for 2xx responses and logs errors or non-2xx responses; failures are not propagated.
 func sendBatchGeneratedCallback(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, batchInfo *BatchGeneratedInfo) {
 	logger.Info("Sending batch generated callback", "url", callbackURL, "basePrice", batchInfo.BasePrice, "baseStamp", batchInfo.BaseStamp)
 

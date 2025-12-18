@@ -52,7 +52,8 @@ type PriceContract struct {
 	TholdPrice   uint32  `json:"thold_price"`
 }
 
-// HexToBytes decodes hex string to bytes
+// HexToBytes decodes a hex-encoded string into the corresponding bytes.
+// It returns an error if the input string contains invalid hexadecimal characters or has an odd length.
 func HexToBytes(hexStr string) ([]byte, error) {
 	b, err := hex.DecodeString(hexStr)
 	if err != nil {
@@ -72,7 +73,11 @@ func GetPublicKey(privateKey []byte) []byte {
 	return schnorr.SerializePubKey(pubKey)
 }
 
-// DeriveKeys derives ECDSA and Schnorr public keys from secp256k1 private key
+// DeriveKeys derives ECDSA and Schnorr public keys from a secp256k1 private key hex string.
+// 
+// privateKeyHex is a hex-encoded 32-byte private key. On success it returns a KeyDerivation
+// containing the raw private key bytes and the serialized Schnorr public key as a hex string.
+// Returns an error if the hex decoding fails or the decoded key is not exactly 32 bytes.
 func DeriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 	privKeyBytes, err := hex.DecodeString(privateKeyHex)
 	if err != nil {
@@ -94,7 +99,8 @@ func DeriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 
 // Hash340 computes BIP-340 style tagged hash
 // SHA256(SHA256(tag) || SHA256(tag) || data)
-// Matches TypeScript: hash340(tag, data)
+// Hash340 computes the BIP-340-style tagged hash of data using tag.
+// The result is the 32-byte SHA-256 digest of SHA256(tag) || SHA256(tag) || data.
 func Hash340(tag string, data []byte) []byte {
 	tagHash := sha256.Sum256([]byte(tag))
 	h := sha256.New()
@@ -104,14 +110,19 @@ func Hash340(tag string, data []byte) []byte {
 	return h.Sum(nil)
 }
 
-// Hash340Hex computes BIP-340 style tagged hash and returns hex string
+// Hash340Hex returns the hex-encoded BIP-340-style tagged hash of data using tag.
+// The tagged hash is computed as SHA256(SHA256(tag) || SHA256(tag) || data) and then hex-encoded.
 func Hash340Hex(tag string, data []byte) string {
 	return hex.EncodeToString(Hash340(tag, data))
 }
 
 // GetPriceCommitHash computes the commitment hash for a price observation and threshold price
 // Matches TypeScript: get_price_commit_hash(price_config, thold_price)
-// Preimage: oracle_pubkey(32B) || chain_network(string) || base_price(4B) || base_stamp(4B) || thold_price(4B)
+// GetPriceCommitHash computes the tagged commit hash for a price observation and threshold price.
+// The preimage is: oracle_pubkey (32 bytes) || chain_network (UTF-8 string) || base_price (4 bytes big-endian) || base_stamp (4 bytes big-endian) || thold_price (4 bytes big-endian).
+//
+// GetPriceCommitHash returns the hex-encoded BIP-340-style tagged hash (using TagPriceCommitHash) of that preimage.
+// An error is returned if obs.OraclePubkey is not valid hex or does not decode to 32 bytes.
 func GetPriceCommitHash(obs PriceObservation, tholdPrice uint32) (string, error) {
 	// Decode oracle pubkey
 	pubkeyBytes, err := hex.DecodeString(obs.OraclePubkey)
@@ -143,7 +154,9 @@ func GetPriceCommitHash(obs PriceObservation, tholdPrice uint32) (string, error)
 }
 
 // GetTholdKey generates threshold key from oracle secret key and commit hash
-// Matches TypeScript: thold_key = hmac256(oracle_seckey, commit_hash).hex
+// GetTholdKey computes the threshold key as the HMAC-SHA256 of the commit hash using the oracle secret key.
+// Both inputs are expected as hex-encoded strings: the oracle secret key must decode to 32 bytes and the commit hash must decode to 32 bytes.
+// It returns the hex-encoded HMAC-SHA256 value or an error if either input is invalid.
 func GetTholdKey(oracleSeckey string, commitHash string) (string, error) {
 	seckeyBytes, err := hex.DecodeString(oracleSeckey)
 	if err != nil {
@@ -168,7 +181,11 @@ func GetTholdKey(oracleSeckey string, commitHash string) (string, error) {
 
 // GetPriceContractID computes the contract ID from commit hash and thold hash
 // Matches TypeScript: get_price_contract_id(commit_hash, thold_hash)
-// Preimage: commit_hash(32B) || thold_hash(20B)
+// GetPriceContractID computes the price contract identifier from a commit hash and a threshold RIPEMD-160 hash.
+// The preimage format is: commit_hash (32 bytes) || thold_hash (20 bytes).
+//
+// It returns the hex-encoded tagged Hash340 value for the assembled preimage. An error is returned if either
+// input is not valid hex or does not decode to the expected length (32 bytes for commitHash, 20 bytes for tholdHash).
 func GetPriceContractID(commitHash string, tholdHash string) (string, error) {
 	commitBytes, err := hex.DecodeString(commitHash)
 	if err != nil {
@@ -194,7 +211,15 @@ func GetPriceContractID(commitHash string, tholdHash string) (string, error) {
 }
 
 // CreatePriceContract creates a complete signed price contract
-// Matches TypeScript: create_price_contract(oracle_seckey, price_config, thold_price)
+// CreatePriceContract constructs a signed PriceContract from an oracle secret key, a price observation, and a threshold price.
+// 
+// It computes the price commit hash from the observation and threshold, derives a threshold key as HMAC-SHA256(oracleSeckey, commitHash),
+// computes the threshold hash as RIPEMD160(SHA256(tholdKey)), derives the contract ID from the commit and threshold hashes,
+// and signs the contract ID with the oracle secret key using a Schnorr signature. The returned PriceContract has TholdKey set to the
+// hex-encoded threshold key (revealed); callers may nil this field when publishing a sealed contract.
+// 
+// oracleSeckey must be the hex-encoded 32-byte oracle secret key. obs supplies the oracle public key, chain/network, base price and stamp.
+// On success returns a fully populated *PriceContract; on failure returns a non-nil error explaining the failure.
 func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice uint32) (*PriceContract, error) {
 	// Compute commit hash
 	commitHash, err := GetPriceCommitHash(obs, tholdPrice)
@@ -251,7 +276,12 @@ func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice u
 }
 
 // VerifyPriceContract verifies the integrity and authenticity of a price contract
-// Matches TypeScript: verify_price_contract(contract)
+// VerifyPriceContract validates the integrity and oracle signature of a PriceContract.
+// 
+// VerifyPriceContract recomputes and checks the contract's commit hash, verifies the revealed
+// threshold key against the stored threshold hash when present, recomputes and checks the contract
+// ID, and verifies the oracle's Schnorr signature over the contract ID. It returns an error if
+// any of these validations fail or if the input contract is nil.
 func VerifyPriceContract(contract *PriceContract) error {
 	if contract == nil {
 		return fmt.Errorf("contract cannot be nil")
@@ -297,7 +327,9 @@ func VerifyPriceContract(contract *PriceContract) error {
 }
 
 // Hash160 computes RIPEMD160(SHA256(data))
-// Bitcoin-style commitment hash (20 bytes / 40 hex chars)
+// Hash160 computes the RIPEMD-160 digest of the SHA-256 hash of data (Bitcoin-style Hash160).
+// It returns the resulting 20-byte digest as a lowercase hex string.
+// An error is returned if the input data is empty.
 func Hash160(data []byte) (string, error) {
 	if len(data) == 0 {
 		return "", fmt.Errorf("cannot hash empty data")
@@ -311,7 +343,8 @@ func Hash160(data []byte) (string, error) {
 	return hex.EncodeToString(ripemd.Sum(nil)), nil
 }
 
-// Hash160Bytes computes RIPEMD160(SHA256(data)) and returns bytes
+// Hash160Bytes computes the RIPEMD-160 digest of the SHA-256 hash of data and returns the resulting 20-byte slice.
+// It returns an error if data is empty.
 func Hash160Bytes(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("cannot hash empty data")
@@ -326,7 +359,13 @@ func Hash160Bytes(data []byte) ([]byte, error) {
 }
 
 // VerifyThresholdCommitment verifies secret matches hash160 commitment
-// Uses constant-time comparison
+// VerifyThresholdCommitment verifies that the provided hex-encoded secret matches the expected
+// RIPEMD160(SHA256) hash (expressed as a 40-character hex string).
+//
+// The function decodes `secret` from hex, computes RIPEMD160(SHA256(secretBytes)), and compares
+// the resulting hex hash to `expectedHash` using a constant-time comparison. It returns an error
+// if inputs are empty, `expectedHash` has an invalid length, the secret is not valid hex, or the
+// computed hash does not match `expectedHash`.
 func VerifyThresholdCommitment(secret, expectedHash string) error {
 	if secret == "" {
 		return fmt.Errorf("secret cannot be empty")
@@ -357,7 +396,9 @@ func VerifyThresholdCommitment(secret, expectedHash string) error {
 	return nil
 }
 
-// SignSchnorr creates BIP-340 Schnorr signature
+// SignSchnorr signs a 32-byte message hash with a 32-byte private key using BIP-340 Schnorr
+// and returns the serialized signature as a hex-encoded string.
+// Errors are returned for invalid key or message lengths, invalid message hex, or if signing fails.
 func SignSchnorr(privKeyBytes []byte, messageHash string) (string, error) {
 	if len(privKeyBytes) != 32 {
 		return "", fmt.Errorf("invalid private key length: expected 32 bytes, got %d", len(privKeyBytes))
@@ -438,7 +479,9 @@ func ValidateQuoteAge(quoteStamp, currentTime, maxAge int64) error {
 	return nil
 }
 
-// VerifySchnorrEventSignature verifies Schnorr signature for pre-computed hash
+// VerifySchnorrEventSignature verifies that sigHex is a valid BIP-340 Schnorr signature
+// over the precomputed 32-byte eventID hash using the provided hex-encoded Schnorr public key.
+// It returns an error if any hex decoding, parsing, or signature verification fails.
 func VerifySchnorrEventSignature(pubKeyHex, eventID, sigHex string) error {
 	// Decode signature
 	sigBytes, err := hex.DecodeString(sigHex)
@@ -477,4 +520,3 @@ func VerifySchnorrEventSignature(pubKeyHex, eventID, sigHex string) error {
 
 	return nil
 }
-

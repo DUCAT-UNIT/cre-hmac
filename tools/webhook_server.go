@@ -27,7 +27,9 @@ type TTLCache struct {
 	maxSize int
 }
 
-// NewTTLCache creates a new TTL cache and starts the cleanup goroutine
+// NewTTLCache creates a TTLCache with the specified entry TTL, maximum size, and cleanup interval.
+// ttl is the duration each entry remains valid; maxSize is the maximum number of entries the cache will hold;
+// cleanupInterval controls how frequently a background goroutine removes expired entries.
 func NewTTLCache(ttl time.Duration, maxSize int, cleanupInterval time.Duration) *TTLCache {
 	cache := &TTLCache{
 		entries: make(map[string]time.Time),
@@ -135,6 +137,13 @@ type PriceEvent struct {
 	ReqSig       string      `json:"req_sig"`
 }
 
+// handleWebhook handles incoming webhook requests for ducat events.
+// It accepts only POST requests and validates and processes the JSON webhook payload:
+// - responds 405 if the method is not POST,
+// - responds 400 for body read or JSON parsing errors,
+// - uses an in-memory TTL cache (`processedEvents`) to ensure idempotent processing and returns 200 for duplicates,
+// - parses the payload.Content into a PriceEvent and logs a structured message based on EventType ("create", "check_no_breach", "breach"),
+// - logs a warning for unknown event types and always responds 200 OK for successfully received (or duplicate) events.
 func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -199,6 +208,9 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
+// getTag retrieves the value associated with key from a slice of tag pairs.
+// It returns the second element of the first tag whose first element equals key.
+// If no matching tag is found or a tag has fewer than two elements, it returns an empty string.
 func getTag(tags [][]string, key string) string {
 	for _, tag := range tags {
 		if len(tag) >= 2 && tag[0] == key {
@@ -208,11 +220,15 @@ func getTag(tags [][]string, key string) string {
 	return ""
 }
 
+// handleHealth writes an HTTP 200 response with the plain-text body "OK".
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }
 
+// main starts the HTTP server, registers the webhook and health handlers, logs startup
+// information (including event cache configuration), and listens on port 8080.
+// The function terminates the process if the server fails to start or stops with an error.
 func main() {
 	port := ":8080"
 

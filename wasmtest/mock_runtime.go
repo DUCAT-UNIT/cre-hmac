@@ -27,7 +27,9 @@ type LogMessage struct {
 	Args    []interface{}
 }
 
-// NewMockLogger creates a mock logger
+// NewMockLogger returns a MockLogger that records log messages and wraps a slog.Logger.
+// The returned logger uses a text handler that writes to stdout at debug level and
+// initializes the in-memory Messages slice empty.
 func NewMockLogger() *MockLogger {
 	return &MockLogger{
 		Logger:   slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})),
@@ -72,7 +74,8 @@ type MockRelayClient struct {
 	mu              sync.Mutex
 }
 
-// NewMockRelayClient creates a mock relay client
+// NewMockRelayClient returns a MockRelayClient initialized for testing.
+// PublishedEvents is an empty slice and StoredEvents is an empty map ready to record events.
 func NewMockRelayClient() *MockRelayClient {
 	return &MockRelayClient{
 		PublishedEvents: []*shared.NostrEvent{},
@@ -126,7 +129,8 @@ type MockPriceClient struct {
 	Error error
 }
 
-// NewMockPriceClient creates a mock price client
+// NewMockPriceClient returns a MockPriceClient initialized with the provided price and timestamp for use in tests.
+// The created client will return the configured price and stamp from FetchPrice unless its Error field is set.
 func NewMockPriceClient(price float64, stamp int64) *MockPriceClient {
 	return &MockPriceClient{
 		Price: price,
@@ -159,7 +163,8 @@ type WebhookCallback struct {
 	Payload map[string]interface{}
 }
 
-// NewMockWebhookClient creates a mock webhook client
+// NewMockWebhookClient returns a MockWebhookClient with an initialized empty Callbacks slice.
+// The returned client is ready for use; Error is nil and the internal mutex is in its zero value.
 func NewMockWebhookClient() *MockWebhookClient {
 	return &MockWebhookClient{
 		Callbacks: []WebhookCallback{},
@@ -192,7 +197,8 @@ type WorkflowSimulator struct {
 	Logger        *MockLogger
 }
 
-// NewWorkflowSimulator creates a workflow simulator
+// NewWorkflowSimulator returns a WorkflowSimulator preconfigured with a default test Config and in-memory mock clients for price, relay, webhook, and logging.
+// The provided privateKey is stored in the simulator and used for key derivation during simulated workflows.
 func NewWorkflowSimulator(privateKey string) *WorkflowSimulator {
 	return &WorkflowSimulator{
 		Config: &shared.Config{

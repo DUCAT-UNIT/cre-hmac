@@ -14,7 +14,7 @@ var (
 
 // IsValidDomain checks if domain contains only allowed characters
 // Allows: alphanumeric, dots, hyphens, underscores
-// This prevents injection attacks and ensures domain is safe for use in HMAC
+// IsValidDomain reports whether the provided domain is non-empty and contains only allowed characters: letters, digits, '.', '_', and '-'.
 func IsValidDomain(domain string) bool {
 	if domain == "" {
 		return false
@@ -22,7 +22,7 @@ func IsValidDomain(domain string) bool {
 	return validDomainRegex.MatchString(domain)
 }
 
-// IsValidHex checks if string is valid lowercase hex
+// IsValidHex reports whether s contains only lowercase hexadecimal characters (0-9 and a-f) and is non-empty.
 func IsValidHex(s string) bool {
 	if s == "" {
 		return false
@@ -30,37 +30,39 @@ func IsValidHex(s string) bool {
 	return validHexRegex.MatchString(s)
 }
 
-// IsValidTholdHash checks if a threshold hash is valid (40 lowercase hex chars)
+// IsValidTholdHash reports whether the provided hash is exactly TholdHashLength lowercase hexadecimal characters.
 func IsValidTholdHash(hash string) bool {
 	return len(hash) == TholdHashLength && IsValidHex(hash)
 }
 
-// IsValidCommitHash checks if a commit hash is valid (64 lowercase hex chars)
+// IsValidCommitHash reports whether hash is a valid commit hash consisting of exactly 64 lowercase hexadecimal characters.
 func IsValidCommitHash(hash string) bool {
 	return len(hash) == CommitHashLength && IsValidHex(hash)
 }
 
-// IsValidContractID checks if a contract ID is valid (64 lowercase hex chars)
+// IsValidContractID reports whether id is a valid contract identifier of exactly 64 lowercase hexadecimal characters.
+// It returns `true` if id is exactly 64 characters long and contains only characters `0-9` and `a-f`, `false` otherwise.
 func IsValidContractID(id string) bool {
 	return len(id) == ContractIDLength && IsValidHex(id)
 }
 
-// IsValidTholdKey checks if a threshold key is valid (64 lowercase hex chars)
+// IsValidTholdKey reports whether the provided key is a Thold key: a 64-character lowercase hexadecimal string.
 func IsValidTholdKey(key string) bool {
 	return len(key) == TholdKeyLength && IsValidHex(key)
 }
 
-// IsValidOracleSig checks if an oracle signature is valid (128 lowercase hex chars)
+// IsValidOracleSig reports whether sig is a valid oracle signature consisting of exactly 128 lowercase hexadecimal characters.
 func IsValidOracleSig(sig string) bool {
 	return len(sig) == OracleSigLength && IsValidHex(sig)
 }
 
-// IsValidSchnorrPubkey checks if a Schnorr public key is valid (64 lowercase hex chars)
+// IsValidSchnorrPubkey reports whether pubkey is a valid Schnorr public key of length SchnorrPubkeyLength containing only lowercase hexadecimal characters.
 func IsValidSchnorrPubkey(pubkey string) bool {
 	return len(pubkey) == SchnorrPubkeyLength && IsValidHex(pubkey)
 }
 
-// ValidatePrice validates a price value
+// ValidatePrice checks that a price is a finite, positive value within allowed maximum bounds.
+// It returns an error if the price is NaN, infinite, less than or equal to zero, or greater than MaxPriceValue.
 func ValidatePrice(price float64) error {
 	// Check for NaN
 	if math.IsNaN(price) {
@@ -80,7 +82,8 @@ func ValidatePrice(price float64) error {
 	return nil
 }
 
-// ValidateReasonablePrice validates a price is within reasonable BTC/USD bounds
+// ValidateReasonablePrice checks that price is finite, greater than zero, not above the configured absolute maximum, and within the configured reasonable BTC/USD range.
+// It returns an error describing the specific constraint violated (NaN, infinite, non-positive, above absolute max, below minimum reasonable, or above maximum reasonable).
 func ValidateReasonablePrice(price float64) error {
 	if err := ValidatePrice(price); err != nil {
 		return err
@@ -94,7 +97,9 @@ func ValidateReasonablePrice(price float64) error {
 	return nil
 }
 
-// ValidateDomain validates a domain string
+// ValidateDomain checks that domain is non-empty, does not exceed MaxDomainLength,
+// and contains only allowed characters: letters, digits, '.', '-', and '_'.
+// If validation fails, it returns an error describing the first failure.
 func ValidateDomain(domain string) error {
 	if domain == "" {
 		return fmt.Errorf("domain required")
@@ -108,7 +113,9 @@ func ValidateDomain(domain string) error {
 	return nil
 }
 
-// ValidateDomainWithSuffix validates a domain that will have a suffix appended
+// ValidateDomainWithSuffix checks that domain is non-empty, contains only allowed characters,
+// and fits within MaxDomainLength when a suffix of length suffixLen will be appended.
+// It returns an error describing the first validation failure, or nil if the domain is valid.
 func ValidateDomainWithSuffix(domain string, suffixLen int) error {
 	if domain == "" {
 		return fmt.Errorf("domain required")
@@ -123,7 +130,9 @@ func ValidateDomainWithSuffix(domain string, suffixLen int) error {
 	return nil
 }
 
-// ValidateTimestamp validates a Unix timestamp
+// ValidateTimestamp ensures stamp is a positive Unix timestamp within the range
+// 2000-01-01 (Unix 946684800) to 2100-01-01 (Unix 4102444800); it returns an error
+// when the value is non-positive, earlier than 2000-01-01, or later than 2100-01-01.
 func ValidateTimestamp(stamp int64) error {
 	if stamp <= 0 {
 		return fmt.Errorf("timestamp must be positive, got %d", stamp)
@@ -138,7 +147,8 @@ func ValidateTimestamp(stamp int64) error {
 	return nil
 }
 
-// ValidateQuoteAge validates that a quote is not too old
+// ValidateQuoteAge ensures the quote timestamp is valid, not in the future, and its age does not exceed maxAge.
+// It returns an error if `quoteStamp` or `currentTime` are non-positive, if `quoteStamp` is after `currentTime`, or if the computed age (`currentTime - quoteStamp`) exceeds `maxAge`.
 func ValidateQuoteAge(quoteStamp, currentTime, maxAge int64) error {
 	if quoteStamp <= 0 {
 		return fmt.Errorf("invalid quote timestamp: %d", quoteStamp)

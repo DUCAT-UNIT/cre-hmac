@@ -15,7 +15,8 @@ import (
 // Cryptographic primitives for DUCAT threshold commitments
 // Delegates to non-WASM crypto package for testability
 
-// deriveKeys derives ECDSA and Schnorr public keys from secp256k1 private key
+// deriveKeys derives an ECDSA private key and a BIP-340 Schnorr public key from a secp256k1 private key hex string.
+// It returns a KeyDerivation containing the private key bytes and Schnorr public key, or an error if derivation fails.
 func deriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 	kd, err := crypto.DeriveKeys(privateKeyHex)
 	if err != nil {
@@ -28,7 +29,8 @@ func deriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 }
 
 // getPriceCommitHash computes the commitment hash for a price observation
-// Matches TypeScript: get_price_commit_hash(price_config, thold_price)
+// getPriceCommitHash computes the commitment hash for a price observation defined by the oracle public key, chain network, base price, and base stamp using the provided threshold price.
+// It returns the commitment hash as a hex string or an error.
 func getPriceCommitHash(oraclePubkey, chainNetwork string, basePrice, baseStamp, tholdPrice uint32) (string, error) {
 	obs := crypto.PriceObservation{
 		OraclePubkey: oraclePubkey,
@@ -40,18 +42,22 @@ func getPriceCommitHash(oraclePubkey, chainNetwork string, basePrice, baseStamp,
 }
 
 // getTholdKey generates threshold key from oracle secret key and commit hash
-// Matches TypeScript: thold_key = hmac256(oracle_seckey, commit_hash)
+// getTholdKey computes a threshold key from an oracle secret and a commitment hash.
+// The threshold key is produced as HMAC-SHA256 keyed by the oracle secret over the commit hash and returned as a hex string.
+// It returns the hex-encoded threshold key or an error from the crypto layer.
 func getTholdKey(oracleSeckey, commitHash string) (string, error) {
 	return crypto.GetTholdKey(oracleSeckey, commitHash)
 }
 
 // getPriceContractID computes the contract ID from commit hash and thold hash
-// Matches TypeScript: get_price_contract_id(commit_hash, thold_hash)
+// getPriceContractID computes the price contract identifier from a price commitment hash and a threshold key hash.
+// It returns the contract ID string, or an error if the computation fails.
 func getPriceContractID(commitHash, tholdHash string) (string, error) {
 	return crypto.GetPriceContractID(commitHash, tholdHash)
 }
 
-// createPriceContract creates a complete signed price contract
+// createPriceContract creates a signed price contract using the oracle secret key and the provided observation fields.
+// It returns the constructed *crypto.PriceContract on success, or an error if contract creation fails.
 func createPriceContract(oracleSeckey string, oraclePubkey, chainNetwork string, basePrice, baseStamp, tholdPrice uint32) (*crypto.PriceContract, error) {
 	obs := crypto.PriceObservation{
 		OraclePubkey: oraclePubkey,
@@ -62,7 +68,8 @@ func createPriceContract(oracleSeckey string, oraclePubkey, chainNetwork string,
 	return crypto.CreatePriceContract(oracleSeckey, obs, tholdPrice)
 }
 
-// verifyPriceContract verifies the integrity and authenticity of a price contract
+// verifyPriceContract verifies the integrity and authenticity of a PriceContract.
+// It returns an error if the contract fails verification.
 func verifyPriceContract(contract *crypto.PriceContract) error {
 	return crypto.VerifyPriceContract(contract)
 }
@@ -86,11 +93,13 @@ func bytesToHex(b []byte) string {
 	return crypto.BytesToHex(b)
 }
 
+// getPublicKey derives the public key bytes corresponding to the provided private key.
 func getPublicKey(privateKey []byte) []byte {
 	return crypto.GetPublicKey(privateKey)
 }
 
-// signSchnorr creates BIP-340 Schnorr signature
+// signSchnorr creates a BIP-340 Schnorr signature of the provided message using privKeyBytes.
+// privKeyBytes must be a 32-byte secp256k1 private key; the function returns the signature as a hex-encoded string or an error if signing fails.
 func signSchnorr(privKeyBytes []byte, message string) (string, error) {
 	return crypto.SignSchnorr(privKeyBytes, message)
 }
