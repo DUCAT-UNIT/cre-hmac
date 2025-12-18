@@ -514,10 +514,38 @@ func (w *WorkflowSimulator) SimulateEvaluateQuotes(tholdHashes []string) (*share
 			BaseStamp:    uint32(originalData.QuoteStamp),
 		}
 
-		commitHash, _ := crypto.GetPriceCommitHash(obs, uint32(originalData.TholdPrice))
-		tholdSecret, _ := crypto.GetTholdKey(w.PrivateKey, commitHash)
-		contractID, _ := crypto.GetPriceContractID(commitHash, originalData.TholdHash)
-		oracleSig, _ := crypto.SignSchnorr(kd.PrivateKey, contractID)
+		commitHash, err := crypto.GetPriceCommitHash(obs, uint32(originalData.TholdPrice))
+		if err != nil {
+			errMsg := fmt.Sprintf("commit hash failed: %v", err)
+			result.Error = &errMsg
+			result.Status = "error"
+			results[i] = result
+			continue
+		}
+		tholdSecret, err := crypto.GetTholdKey(w.PrivateKey, commitHash)
+		if err != nil {
+			errMsg := fmt.Sprintf("thold key failed: %v", err)
+			result.Error = &errMsg
+			result.Status = "error"
+			results[i] = result
+			continue
+		}
+		contractID, err := crypto.GetPriceContractID(commitHash, originalData.TholdHash)
+		if err != nil {
+			errMsg := fmt.Sprintf("contract ID failed: %v", err)
+			result.Error = &errMsg
+			result.Status = "error"
+			results[i] = result
+			continue
+		}
+		oracleSig, err := crypto.SignSchnorr(kd.PrivateKey, contractID)
+		if err != nil {
+			errMsg := fmt.Sprintf("signing failed: %v", err)
+			result.Error = &errMsg
+			result.Status = "error"
+			results[i] = result
+			continue
+		}
 
 		// Build and publish breach event
 		breachData := shared.PriceEvent{

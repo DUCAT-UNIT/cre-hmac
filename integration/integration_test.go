@@ -149,6 +149,13 @@ func TestPriceContractDeterminism(t *testing.T) {
 	if contract1.ContractID != contract2.ContractID {
 		t.Error("ContractID should be deterministic")
 	}
+	// Check TholdKey with nil guards
+	if contract1.TholdKey == nil {
+		t.Fatal("contract1.TholdKey is nil, expected non-nil for new contract")
+	}
+	if contract2.TholdKey == nil {
+		t.Fatal("contract2.TholdKey is nil, expected non-nil for new contract")
+	}
 	if *contract1.TholdKey != *contract2.TholdKey {
 		t.Error("TholdKey should be deterministic")
 	}
@@ -165,7 +172,10 @@ func TestPriceContractDeterminism(t *testing.T) {
 func TestPriceContractUniqueness(t *testing.T) {
 	// Verify that different inputs produce different contracts
 
-	kd, _ := crypto.DeriveKeys(testPrivateKey)
+	kd, err := crypto.DeriveKeys(testPrivateKey)
+	if err != nil {
+		t.Fatalf("Failed to derive keys: %v", err)
+	}
 	baseObs := crypto.PriceObservation{
 		OraclePubkey: kd.SchnorrPubkey,
 		ChainNetwork: "mutiny",
@@ -173,10 +183,16 @@ func TestPriceContractUniqueness(t *testing.T) {
 		BaseStamp:    1700000000,
 	}
 
-	baseContract, _ := crypto.CreatePriceContract(testPrivateKey, baseObs, 90000)
+	baseContract, err := crypto.CreatePriceContract(testPrivateKey, baseObs, 90000)
+	if err != nil {
+		t.Fatalf("Failed to create base contract: %v", err)
+	}
 
 	// Different threshold price
-	diffTholdContract, _ := crypto.CreatePriceContract(testPrivateKey, baseObs, 80000)
+	diffTholdContract, err := crypto.CreatePriceContract(testPrivateKey, baseObs, 80000)
+	if err != nil {
+		t.Fatalf("Failed to create diffTholdContract: %v", err)
+	}
 	if baseContract.TholdHash == diffTholdContract.TholdHash {
 		t.Error("Different threshold prices should produce different TholdHash")
 	}
@@ -187,7 +203,10 @@ func TestPriceContractUniqueness(t *testing.T) {
 	// Different base price
 	diffPriceObs := baseObs
 	diffPriceObs.BasePrice = 90000
-	diffPriceContract, _ := crypto.CreatePriceContract(testPrivateKey, diffPriceObs, 90000)
+	diffPriceContract, err := crypto.CreatePriceContract(testPrivateKey, diffPriceObs, 90000)
+	if err != nil {
+		t.Fatalf("Failed to create diffPriceContract: %v", err)
+	}
 	if baseContract.CommitHash == diffPriceContract.CommitHash {
 		t.Error("Different base prices should produce different CommitHash")
 	}
@@ -195,7 +214,10 @@ func TestPriceContractUniqueness(t *testing.T) {
 	// Different timestamp
 	diffStampObs := baseObs
 	diffStampObs.BaseStamp = 1700000001
-	diffStampContract, _ := crypto.CreatePriceContract(testPrivateKey, diffStampObs, 90000)
+	diffStampContract, err := crypto.CreatePriceContract(testPrivateKey, diffStampObs, 90000)
+	if err != nil {
+		t.Fatalf("Failed to create diffStampContract: %v", err)
+	}
 	if baseContract.CommitHash == diffStampContract.CommitHash {
 		t.Error("Different timestamps should produce different CommitHash")
 	}
@@ -203,7 +225,10 @@ func TestPriceContractUniqueness(t *testing.T) {
 	// Different network
 	diffNetObs := baseObs
 	diffNetObs.ChainNetwork = "signet"
-	diffNetContract, _ := crypto.CreatePriceContract(testPrivateKey, diffNetObs, 90000)
+	diffNetContract, err := crypto.CreatePriceContract(testPrivateKey, diffNetObs, 90000)
+	if err != nil {
+		t.Fatalf("Failed to create diffNetContract: %v", err)
+	}
 	if baseContract.CommitHash == diffNetContract.CommitHash {
 		t.Error("Different networks should produce different CommitHash")
 	}

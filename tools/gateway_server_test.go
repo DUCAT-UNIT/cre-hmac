@@ -18,8 +18,9 @@ import (
 )
 
 // Test helpers
-func setupTestEnv(t *testing.T) {
-	t.Helper()
+// setupTestEnv accepts testing.TB to work with both *testing.T and *testing.B
+func setupTestEnv(tb testing.TB) {
+	tb.Helper()
 
 	// Set required environment variables
 	os.Setenv("CRE_WORKFLOW_ID", "test-workflow-id-12345")
@@ -968,7 +969,7 @@ func TestConcurrentWebhooks(t *testing.T) {
 
 // BenchmarkHandleWebhook benchmarks webhook processing performance
 func BenchmarkHandleWebhook(b *testing.B) {
-	setupTestEnv(&testing.T{})
+	setupTestEnv(b)
 	loadConfig()
 	resetGlobals()
 
@@ -2664,7 +2665,7 @@ func TestConcurrentEvaluateRequests(t *testing.T) {
 // =============================================================================
 
 func BenchmarkHandleEvaluateValidation(b *testing.B) {
-	setupTestEnv(&testing.T{})
+	setupTestEnv(b)
 	loadConfig()
 	resetGlobals()
 
