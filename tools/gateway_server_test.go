@@ -900,10 +900,10 @@ func TestSignEthereumMessage(t *testing.T) {
 		t.Errorf("signature length = %d, want 65", len(signature))
 	}
 
-	// Verify recovery ID is valid (0-3)
-	recoveryID := signature[64]
-	if recoveryID > 3 {
-		t.Errorf("recovery ID = %d, want 0-3", recoveryID)
+	// Verify recovery ID is in Ethereum format (27 or 28, with v = recoveryID + 27)
+	v := signature[64]
+	if v < 27 || v > 30 {
+		t.Errorf("v = %d, want 27-30 (Ethereum format)", v)
 	}
 }
 
@@ -1174,10 +1174,10 @@ func TestComputeRecoveryIDEdgeCases(t *testing.T) {
 			t.Errorf("signature length = %d, want 65 for message %q", len(signature), msg)
 		}
 
-		// Verify recovery ID is in valid range
-		recoveryID := signature[64]
-		if recoveryID > 3 {
-			t.Errorf("invalid recovery ID %d for message %q", recoveryID, msg)
+		// Verify v is in Ethereum format (27-30)
+		v := signature[64]
+		if v < 27 || v > 30 {
+			t.Errorf("invalid v value %d for message %q, want 27-30 (Ethereum format)", v, msg)
 		}
 	}
 }

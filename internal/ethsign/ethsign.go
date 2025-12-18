@@ -129,11 +129,11 @@ func SignEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, err
 		return nil, fmt.Errorf("recovery ID computation failed: %w", err)
 	}
 
-	// Format: r || s || v
+	// Format: r || s || v (Ethereum format: v = recoveryID + 27)
 	result := make([]byte, 65)
 	copy(result[0:32], rPadded)
 	copy(result[32:64], sPadded)
-	result[64] = recoveryID
+	result[64] = byte(recoveryID + 27)
 
 	return result, nil
 }
