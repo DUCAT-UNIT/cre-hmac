@@ -887,10 +887,12 @@ func sendWebhookCallback(config *Config, logger *slog.Logger, sendRequester *htt
 	}
 }
 
-// getDomainFromTags extracts domain from Nostr event tags
+// getDomainFromTags extracts identifier from Nostr event tags
+// Looks for "d" tag (NIP-33 replaceable event identifier) which contains commit_hash
+// Falls back to "domain" for backwards compatibility
 func getDomainFromTags(tags [][]string) string {
 	for _, tag := range tags {
-		if len(tag) >= 2 && tag[0] == "domain" {
+		if len(tag) >= 2 && (tag[0] == "d" || tag[0] == "domain") {
 			return tag[1]
 		}
 	}

@@ -255,7 +255,8 @@ func (r *GenerateQuotesRequest) Validate() error {
 	}
 
 	// Calculate number of quotes to prevent excessive generation
-	numQuotes := int((r.RateMax - r.RateMin) / r.StepSize) + 1
+	// Use math.Round to avoid floating-point rounding errors (e.g., 3.65/0.01 = 364.99999...)
+	numQuotes := int(math.Round((r.RateMax-r.RateMin)/r.StepSize)) + 1
 	if numQuotes > 1000 {
 		return fmt.Errorf("too many quotes would be generated (%d), reduce range or increase step_size", numQuotes)
 	}

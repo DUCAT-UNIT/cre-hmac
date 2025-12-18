@@ -25,7 +25,10 @@ type KeyDerivation struct {
 	SchnorrPubkey string
 }
 
-// PriceObservation contains price observation data for commit hash computation
+// PriceObservation contains price observation data for commit hash computation.
+// Uses uint32 for price/timestamp fields to match core-ts binary serialization:
+// Buff.num(base_price, 4) encodes as 4 bytes (uint32) in the commit hash preimage.
+// The JSON response layer (PriceContractResponse in types.go) uses int64 for TypeScript compatibility.
 type PriceObservation struct {
 	OraclePubkey string
 	ChainNetwork string
@@ -33,7 +36,9 @@ type PriceObservation struct {
 	BaseStamp    uint32
 }
 
-// PriceContract represents a complete price contract matching TypeScript schema
+// PriceContract represents a complete price contract for internal crypto operations.
+// Uses uint32 for price/timestamp fields to match core-ts binary serialization (4 bytes each).
+// Convert to/from PriceContractResponse (int64) at the API boundary.
 type PriceContract struct {
 	BasePrice    uint32  `json:"base_price"`
 	BaseStamp    uint32  `json:"base_stamp"`
@@ -265,6 +270,13 @@ func VerifyPriceContract(contract *PriceContract) error {
 	}
 	if commitHash != contract.CommitHash {
 		return fmt.Errorf("commit hash mismatch: expected %s, got %s", contract.CommitHash, commitHash)
+	}
+
+	// If thold_key is revealed (breach case), verify it matches thold_hash
+	if contract.TholdKey != nil && *contract.TholdKey != "" {
+		if err := VerifyThresholdCommitment(*contract.TholdKey, contract.TholdHash); err != nil {
+			return fmt.Errorf("thold_key does not match thold_hash: %w", err)
+		}
 	}
 
 	// Recompute contract ID

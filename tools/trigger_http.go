@@ -147,6 +147,15 @@ func main() {
 			fmt.Println("Error: --thold-hash is required for CHECK operation")
 			os.Exit(1)
 		}
+		// Validate thold_hash is exactly 40 hex characters (20 bytes Hash160)
+		if len(*tholdHash) != 40 {
+			fmt.Printf("Error: --thold-hash must be exactly 40 hex characters, got %d\n", len(*tholdHash))
+			os.Exit(1)
+		}
+		if _, err := hex.DecodeString(*tholdHash); err != nil {
+			fmt.Printf("Error: --thold-hash must be valid hex: %v\n", err)
+			os.Exit(1)
+		}
 		input["thold_hash"] = *tholdHash
 		fmt.Printf("🔍 CHECK operation: domain=%s, thold_hash=%s\n", *domain, *tholdHash)
 	default:
@@ -540,7 +549,8 @@ func sendRequest(url string, body []byte, jwt string) ([]byte, error) {
 		return nil, err
 	}
 
-	if resp.StatusCode != 200 {
+	// Accept 200 (OK) and 202 (Accepted) as success
+	if resp.StatusCode != 200 && resp.StatusCode != 202 {
 		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 

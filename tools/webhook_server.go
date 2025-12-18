@@ -81,7 +81,11 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	// Parse the content to get PriceEvent details
 	var priceEvent PriceEvent
-	json.Unmarshal([]byte(payload.Content), &priceEvent)
+	if err := json.Unmarshal([]byte(payload.Content), &priceEvent); err != nil {
+		log.Printf("❌ Failed to parse event content for event_id=%s: %v", payload.EventID, err)
+		http.Error(w, "Invalid event content", http.StatusBadRequest)
+		return
+	}
 
 	// Handle different event types
 	switch payload.EventType {
