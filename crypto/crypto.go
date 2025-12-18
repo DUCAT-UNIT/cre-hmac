@@ -116,12 +116,16 @@ func Hash340Hex(tag string, data []byte) string {
 	return hex.EncodeToString(Hash340(tag, data))
 }
 
-// GetPriceCommitHash computes the commitment hash for a price observation and threshold price
-// Matches TypeScript: get_price_commit_hash(price_config, thold_price)
 // GetPriceCommitHash computes the tagged commit hash for a price observation and threshold price.
-// The preimage is: oracle_pubkey (32 bytes) || chain_network (UTF-8 string) || base_price (4 bytes big-endian) || base_stamp (4 bytes big-endian) || thold_price (4 bytes big-endian).
+// Matches TypeScript: get_price_commit_hash(price_config, thold_price)
 //
-// GetPriceCommitHash returns the hex-encoded BIP-340-style tagged hash (using TagPriceCommitHash) of that preimage.
+// The preimage is: oracle_pubkey (32 bytes) || chain_network (UTF-8 string) || base_price (4 bytes) || base_stamp (4 bytes) || thold_price (4 bytes).
+//
+// IMPORTANT: All numeric fields are encoded as big-endian (network byte order).
+// This matches TypeScript Buff.num(value, 4) which uses big-endian by default.
+// Endianness mismatch is a common source of cross-platform incompatibilities.
+//
+// Returns the hex-encoded BIP-340-style tagged hash (using TagPriceCommitHash) of that preimage.
 // An error is returned if obs.OraclePubkey is not valid hex or does not decode to 32 bytes.
 func GetPriceCommitHash(obs PriceObservation, tholdPrice uint32) (string, error) {
 	// Decode oracle pubkey

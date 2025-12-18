@@ -481,6 +481,14 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 			zap.Error(err),
 		)
 		workflowTriggers.WithLabelValues("create", "error").Inc()
+
+		// Clean up pending request on failure
+		requestsMutex.Lock()
+		delete(pendingRequests, trackingKey)
+		currentPending = len(pendingRequests)
+		requestsMutex.Unlock()
+		pendingRequestsGauge.Set(float64(currentPending))
+
 		http.Error(w, fmt.Sprintf("Failed to trigger workflow: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -606,9 +614,19 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 			zap.String("domain", req.Domain),
 			zap.Error(err),
 		)
+		workflowTriggers.WithLabelValues("check", "error").Inc()
+
+		// Clean up pending request on failure
+		requestsMutex.Lock()
+		delete(pendingRequests, trackingKey)
+		currentPending = len(pendingRequests)
+		requestsMutex.Unlock()
+		pendingRequestsGauge.Set(float64(currentPending))
+
 		http.Error(w, fmt.Sprintf("Failed to trigger workflow: %v", err), http.StatusInternalServerError)
 		return
 	}
+	workflowTriggers.WithLabelValues("check", "success").Inc()
 
 	// Block waiting for webhook or timeout
 	select {
@@ -1146,7 +1164,10 @@ func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, err
 	rScalar.SetByteSlice(r.Bytes())
 	sScalar.SetByteSlice(s.Bytes())
 
-	recoveryID := computeRecoveryID(btcPrivKey, btcPubKey, messageHash, &rScalar, &sScalar)
+	recoveryID, err := computeRecoveryID(btcPrivKey, btcPubKey, messageHash, &rScalar, &sScalar)
+	if err != nil {
+		return nil, fmt.Errorf("recovery ID computation failed: %w", err)
+	}
 
 	// Format: r || s || v
 	rBytes := r.Bytes()
@@ -1165,18 +1186,19 @@ func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, err
 	return result, nil
 }
 
-func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *btcec.ModNScalar) byte {
+func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *btcec.ModNScalar) (byte, error) {
+	expectedBytes := pubKey.SerializeUncompressed()
 	for recoveryID := byte(0); recoveryID < 4; recoveryID++ {
 		recoveredPubKey := tryRecoverPublicKey(messageHash, r, s, recoveryID)
 		if recoveredPubKey != nil {
 			recoveredBytes := recoveredPubKey.SerializeUncompressed()
-			expectedBytes := pubKey.SerializeUncompressed()
 			if bytes.Equal(recoveredBytes, expectedBytes) {
-				return recoveryID
+				return recoveryID, nil
 			}
 		}
 	}
-	return 0
+	return 0, fmt.Errorf("failed to compute recovery ID: no valid recovery ID (0-3) matched for pubkey=%x",
+		expectedBytes[:8])
 }
 
 func tryRecoverPublicKey(messageHash []byte, r, s *btcec.ModNScalar, recoveryID byte) *btcec.PublicKey {

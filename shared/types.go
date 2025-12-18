@@ -284,6 +284,48 @@ type EvaluateQuotesResponse struct {
 	Results      []QuoteEvaluationResult `json:"results"`
 	CurrentPrice float64                 `json:"current_price"`
 	EvaluatedAt  int64                   `json:"evaluated_at"`
+	Summary      *EvaluationSummary      `json:"summary,omitempty"`
+}
+
+// EvaluationSummary provides aggregated statistics for batch evaluation
+type EvaluationSummary struct {
+	Total    int      `json:"total"`
+	Breached int      `json:"breached"`
+	Active   int      `json:"active"`
+	Errors   int      `json:"errors"`
+	ErrorMsgs []string `json:"error_messages,omitempty"`
+}
+
+// ComputeSummary computes and sets the summary field from results
+func (r *EvaluateQuotesResponse) ComputeSummary() {
+	summary := &EvaluationSummary{
+		Total: len(r.Results),
+	}
+	for _, result := range r.Results {
+		switch result.Status {
+		case "breached":
+			summary.Breached++
+		case "active":
+			summary.Active++
+		case "error":
+			summary.Errors++
+			if result.Error != nil {
+				summary.ErrorMsgs = append(summary.ErrorMsgs, *result.Error)
+			}
+		}
+	}
+	r.Summary = summary
+}
+
+// GetErrors returns all error messages from the results
+func (r *EvaluateQuotesResponse) GetErrors() []string {
+	var errors []string
+	for _, result := range r.Results {
+		if result.IsError() && result.Error != nil {
+			errors = append(errors, *result.Error)
+		}
+	}
+	return errors
 }
 
 // CountBreached returns the number of breached quotes

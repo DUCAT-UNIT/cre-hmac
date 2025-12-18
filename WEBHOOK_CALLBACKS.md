@@ -70,7 +70,14 @@ Sent when `/api/evaluate` completes batch quote evaluation.
       }
     ],
     "current_price": 105000.50,
-    "evaluated_at": 1734567890
+    "evaluated_at": 1734567890,
+    "summary": {
+      "total": 2,
+      "breached": 1,
+      "active": 1,
+      "errors": 0,
+      "error_messages": []
+    }
   }
 }
 ```

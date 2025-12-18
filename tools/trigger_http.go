@@ -411,7 +411,10 @@ func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, err
 	copy(sPadded[32-len(sBytes):], sBytes)
 
 	// Compute recovery ID using proper elliptic curve recovery
-	recoveryID := computeRecoveryID(btcPrivKey, btcPubKey, messageHash, r, s)
+	recoveryID, err := computeRecoveryID(btcPrivKey, btcPubKey, messageHash, r, s)
+	if err != nil {
+		return nil, fmt.Errorf("recovery ID computation failed: %w", err)
+	}
 
 	// Format: r || s || v
 	result := make([]byte, 65)
@@ -422,10 +425,10 @@ func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, err
 	return result, nil
 }
 
-// computeRecoveryID computes the Ethereum recovery ID (0-3)
-// computeRecoveryID computes the Ethereum recovery ID (0–3) that, when used with the provided signature components and message hash, recovers the given public key.
-// It returns the matching recovery ID. It panics if no recovery ID matches, indicating a bug in signature generation.
-func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *big.Int) byte {
+// computeRecoveryID computes the Ethereum recovery ID (0-3) that, when used with the provided
+// signature components and message hash, recovers the given public key.
+// Returns an error if no valid recovery ID is found (indicates a bug in signature generation).
+func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *big.Int) (byte, error) {
 	// Get uncompressed public key bytes
 	pubKeyBytes := pubKey.SerializeUncompressed()
 	targetX := pubKeyBytes[1:33]
@@ -440,15 +443,14 @@ func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messa
 			recoveredY := recoveredBytes[33:65]
 
 			if bytes.Equal(targetX, recoveredX) && bytes.Equal(targetY, recoveredY) {
-				return v
+				return v, nil
 			}
 		}
 	}
 
 	// This should never happen with a valid ECDSA signature
-	// Panic with diagnostic info to help debug if it does occur
-	panic(fmt.Sprintf("failed to compute recovery ID: no valid recovery ID (0-3) matched for pubkey=%x, r=%x, s=%x",
-		pubKeyBytes[:8], r.Bytes()[:8], s.Bytes()[:8]))
+	return 0, fmt.Errorf("failed to compute recovery ID: no valid recovery ID (0-3) matched for pubkey=%x, r=%x, s=%x",
+		pubKeyBytes[:8], r.Bytes()[:8], s.Bytes()[:8])
 }
 
 // success or nil if recovery fails.

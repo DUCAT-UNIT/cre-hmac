@@ -208,9 +208,40 @@ type QuoteEvaluationResult struct {
 
 // EvaluateQuotesResponse represents batch evaluation response
 type EvaluateQuotesResponse struct {
-	Results      []QuoteEvaluationResult `json:"results"`       // Results for each thold_hash
-	CurrentPrice float64                 `json:"current_price"` // Current BTC/USD price used for all evaluations
-	EvaluatedAt  int64                   `json:"evaluated_at"`  // Timestamp of evaluation
+	Results      []QuoteEvaluationResult `json:"results"`         // Results for each thold_hash
+	CurrentPrice float64                 `json:"current_price"`   // Current BTC/USD price used for all evaluations
+	EvaluatedAt  int64                   `json:"evaluated_at"`    // Timestamp of evaluation
+	Summary      *EvaluationSummary      `json:"summary,omitempty"` // Aggregated statistics
+}
+
+// EvaluationSummary provides aggregated statistics for batch evaluation
+type EvaluationSummary struct {
+	Total     int      `json:"total"`
+	Breached  int      `json:"breached"`
+	Active    int      `json:"active"`
+	Errors    int      `json:"errors"`
+	ErrorMsgs []string `json:"error_messages,omitempty"`
+}
+
+// ComputeSummary computes and sets the summary field from results
+func (r *EvaluateQuotesResponse) ComputeSummary() {
+	summary := &EvaluationSummary{
+		Total: len(r.Results),
+	}
+	for _, result := range r.Results {
+		switch result.Status {
+		case "breached":
+			summary.Breached++
+		case "active":
+			summary.Active++
+		case "error":
+			summary.Errors++
+			if result.Error != nil {
+				summary.ErrorMsgs = append(summary.ErrorMsgs, *result.Error)
+			}
+		}
+	}
+	r.Summary = summary
 }
 
 // =============================================================================

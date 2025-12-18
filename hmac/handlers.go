@@ -126,7 +126,7 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		return nil, fmt.Errorf("event signing failed: %w", err)
 	}
 
-	logger.Info("Created quote", "eventId", nostrEvent.ID, "tholdHash", tholdHash)
+	logger.Info("Created quote", "eventId", nostrEvent.ID, "tholdHash", contract.TholdHash)
 
 	// Publish to relay with consensus
 	relayRespPromise := http.SendRequest(wc, runtime, client,
@@ -457,7 +457,15 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 		EvaluatedAt:  currentStamp,
 	}
 
-	logger.Info("Batch evaluation complete (parallel)", "total", len(results), "breached", len(breachesToPublish), "currentPrice", currentPrice)
+	// Compute summary with aggregated error information
+	response.ComputeSummary()
+
+	logger.Info("Batch evaluation complete (parallel)",
+		"total", response.Summary.Total,
+		"breached", response.Summary.Breached,
+		"active", response.Summary.Active,
+		"errors", response.Summary.Errors,
+		"currentPrice", currentPrice)
 
 	// Send webhook callback if URL provided
 	if requestData.CallbackURL != nil && *requestData.CallbackURL != "" {
