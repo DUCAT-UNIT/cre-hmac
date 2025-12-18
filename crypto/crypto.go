@@ -1,3 +1,5 @@
+// Package crypto provides cryptographic primitives for the DUCAT threshold commitment system.
+// It implements BIP-340 Schnorr signatures, tagged hashes, and Bitcoin-compatible Hash160.
 package crypto
 
 import (
@@ -10,6 +12,11 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
+
+	// RIPEMD-160 is required for Bitcoin Hash160 (SHA256 + RIPEMD160) compatibility.
+	// This is a legacy hash but necessary for Bitcoin address derivation and
+	// cross-compatibility with the TypeScript core-ts implementation.
+	//lint:ignore SA1019 RIPEMD-160 required for Bitcoin Hash160 compatibility
 	"golang.org/x/crypto/ripemd160"
 )
 
@@ -101,6 +108,10 @@ func DeriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 // SHA256(SHA256(tag) || SHA256(tag) || data)
 // Hash340 computes the BIP-340-style tagged hash of data using tag.
 // The result is the 32-byte SHA-256 digest of SHA256(tag) || SHA256(tag) || data.
+//
+// Note: Empty data is accepted and produces a valid hash. This is consistent with
+// the BIP-340 specification where the tagged hash of an empty message is well-defined.
+// Callers should validate data appropriateness for their use case before calling.
 func Hash340(tag string, data []byte) []byte {
 	tagHash := sha256.Sum256([]byte(tag))
 	h := sha256.New()
@@ -427,11 +438,18 @@ func SignSchnorr(privKeyBytes []byte, messageHash string) (string, error) {
 	return hex.EncodeToString(sig.Serialize()), nil
 }
 
-// VerifySchnorrSignature verifies BIP-340 Schnorr signature
+// VerifySchnorrSignature verifies BIP-340 Schnorr signature.
+// It validates that the signature, public key, and message hash are valid hex strings
+// with correct lengths (64 bytes for signature, 32 bytes for pubkey and message),
+// then verifies the cryptographic signature.
 func VerifySchnorrSignature(pubKeyHex, messageHash, sigHex string) error {
 	sigBytes, err := hex.DecodeString(sigHex)
 	if err != nil {
 		return fmt.Errorf("invalid signature hex: %w", err)
+	}
+
+	if len(sigBytes) != 64 {
+		return fmt.Errorf("invalid signature length: expected 64 bytes, got %d", len(sigBytes))
 	}
 
 	sig, err := schnorr.ParseSignature(sigBytes)
@@ -444,6 +462,10 @@ func VerifySchnorrSignature(pubKeyHex, messageHash, sigHex string) error {
 		return fmt.Errorf("invalid public key hex: %w", err)
 	}
 
+	if len(pubKeyBytes) != 32 {
+		return fmt.Errorf("invalid public key length: expected 32 bytes, got %d", len(pubKeyBytes))
+	}
+
 	pubKey, err := schnorr.ParsePubKey(pubKeyBytes)
 	if err != nil {
 		return fmt.Errorf("invalid schnorr public key: %w", err)
@@ -454,6 +476,10 @@ func VerifySchnorrSignature(pubKeyHex, messageHash, sigHex string) error {
 		return fmt.Errorf("invalid message hex: %w", err)
 	}
 
+	if len(msgHash) != 32 {
+		return fmt.Errorf("invalid message length: expected 32 bytes, got %d", len(msgHash))
+	}
+
 	if !sig.Verify(msgHash, pubKey) {
 		return fmt.Errorf("schnorr signature verification failed")
 	}
@@ -461,27 +487,6 @@ func VerifySchnorrSignature(pubKeyHex, messageHash, sigHex string) error {
 	return nil
 }
 
-// ValidateQuoteAge validates quote timestamp freshness
-func ValidateQuoteAge(quoteStamp, currentTime, maxAge int64) error {
-	if quoteStamp <= 0 {
-		return fmt.Errorf("invalid quote timestamp: must be positive")
-	}
-	if currentTime <= 0 {
-		return fmt.Errorf("invalid current time: must be positive")
-	}
-
-	age := currentTime - quoteStamp
-
-	if age < 0 {
-		return fmt.Errorf("quote timestamp is in the future")
-	}
-
-	if age > maxAge {
-		return fmt.Errorf("quote expired: age %d seconds exceeds maximum %d seconds", age, maxAge)
-	}
-
-	return nil
-}
 
 // VerifySchnorrEventSignature verifies that sigHex is a valid BIP-340 Schnorr signature
 // over the precomputed 32-byte eventID hash using the provided hex-encoded Schnorr public key.

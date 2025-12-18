@@ -47,7 +47,7 @@ func TestDeriveKeys(t *testing.T) {
 			}
 			if !tt.wantErr {
 				if kd == nil {
-					t.Error("DeriveKeys() returned nil KeyDerivation")
+					t.Fatal("DeriveKeys() returned nil KeyDerivation")
 				}
 				if len(kd.SchnorrPubkey) != 64 {
 					t.Errorf("SchnorrPubkey length = %d, want 64", len(kd.SchnorrPubkey))
@@ -226,63 +226,8 @@ func TestSignSchnorr(t *testing.T) {
 	}
 }
 
-func TestValidateQuoteAge(t *testing.T) {
-	currentTime := int64(1700000000)
-	maxAge := int64(3600)
-
-	tests := []struct {
-		name        string
-		quoteStamp  int64
-		currentTime int64
-		maxAge      int64
-		wantErr     bool
-	}{
-		{
-			name:        "fresh quote",
-			quoteStamp:  currentTime - 1800,
-			currentTime: currentTime,
-			maxAge:      maxAge,
-			wantErr:     false,
-		},
-		{
-			name:        "expired quote",
-			quoteStamp:  currentTime - 7200,
-			currentTime: currentTime,
-			maxAge:      maxAge,
-			wantErr:     true,
-		},
-		{
-			name:        "future timestamp",
-			quoteStamp:  currentTime + 100,
-			currentTime: currentTime,
-			maxAge:      maxAge,
-			wantErr:     true,
-		},
-		{
-			name:        "negative quote stamp",
-			quoteStamp:  -1,
-			currentTime: currentTime,
-			maxAge:      maxAge,
-			wantErr:     true,
-		},
-		{
-			name:        "negative current time",
-			quoteStamp:  currentTime,
-			currentTime: -1,
-			maxAge:      maxAge,
-			wantErr:     true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateQuoteAge(tt.quoteStamp, tt.currentTime, tt.maxAge)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ValidateQuoteAge() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
+// ValidateQuoteAge tests removed - function moved to shared/validation.go
+// See shared/validation_test.go for comprehensive tests
 
 // Tests for new core-ts aligned functions
 
@@ -799,13 +744,30 @@ func TestVerifyPriceContract_ErrorPaths(t *testing.T) {
 //   import { hmac256, hash160, hash340 } from '@vbyte/micro-lib/hash'
 
 func TestCrossImplementationVectors(t *testing.T) {
-	// Fixed test data that matches TypeScript test
+	// Fixed test data that matches TypeScript core-ts implementation
+	// These expected values are derived from TypeScript and serve as golden reference
 	oracleSeckey := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
+
+	// Static expected values from TypeScript core-ts
+	// These MUST match TypeScript output exactly - any mismatch indicates a cross-impl bug
+	const (
+		expectedPubkey     = "d8a918b3bebca63fc03fcd1d3c7c15a08cf44464f27dd3a5bb442653ba470cd5"
+		expectedCommitHash = "a5d5969090854207aa412937aafb1e4d2d08e428669ea7089d71626016fc6eb1"
+		expectedTholdKey   = "ffa2177841c0773548cdfe08d8ad9730a1689dd7344b79c73ebb6b6d297e304c"
+		expectedTholdHash  = "81c787eb88db038d6a1fa7964295dc35e06877da"
+		expectedContractID = "820cccc8f8df4c96c17f3aacae50411272871e17f36d85a8976c81a7897b61ef"
+	)
+
 	kd, err := DeriveKeys(oracleSeckey)
 	if err != nil {
 		t.Fatalf("Failed to derive keys: %v", err)
 	}
 	oraclePubkey := kd.SchnorrPubkey
+
+	// Verify pubkey matches expected
+	if oraclePubkey != expectedPubkey {
+		t.Errorf("Public key mismatch:\n  got:  %s\n  want: %s", oraclePubkey, expectedPubkey)
+	}
 	t.Logf("Oracle pubkey: %s", oraclePubkey)
 
 	chainNetwork := "mutiny"
@@ -824,12 +786,18 @@ func TestCrossImplementationVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPriceCommitHash failed: %v", err)
 	}
+	if commitHash != expectedCommitHash {
+		t.Errorf("CommitHash mismatch:\n  got:  %s\n  want: %s", commitHash, expectedCommitHash)
+	}
 	t.Logf("CommitHash: %s", commitHash)
 
 	// Test GetTholdKey
 	tholdKey, err := GetTholdKey(oracleSeckey, commitHash)
 	if err != nil {
 		t.Fatalf("GetTholdKey failed: %v", err)
+	}
+	if tholdKey != expectedTholdKey {
+		t.Errorf("TholdKey mismatch:\n  got:  %s\n  want: %s", tholdKey, expectedTholdKey)
 	}
 	t.Logf("TholdKey: %s", tholdKey)
 
@@ -839,12 +807,18 @@ func TestCrossImplementationVectors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Hash160 failed: %v", err)
 	}
+	if tholdHash != expectedTholdHash {
+		t.Errorf("TholdHash mismatch:\n  got:  %s\n  want: %s", tholdHash, expectedTholdHash)
+	}
 	t.Logf("TholdHash: %s", tholdHash)
 
 	// Test GetPriceContractID
 	contractID, err := GetPriceContractID(commitHash, tholdHash)
 	if err != nil {
 		t.Fatalf("GetPriceContractID failed: %v", err)
+	}
+	if contractID != expectedContractID {
+		t.Errorf("ContractID mismatch:\n  got:  %s\n  want: %s", contractID, expectedContractID)
 	}
 	t.Logf("ContractID: %s", contractID)
 
@@ -854,17 +828,17 @@ func TestCrossImplementationVectors(t *testing.T) {
 		t.Fatalf("CreatePriceContract failed: %v", err)
 	}
 
-	if contract.CommitHash != commitHash {
-		t.Errorf("CommitHash mismatch: got %s, computed %s", contract.CommitHash, commitHash)
+	if contract.CommitHash != expectedCommitHash {
+		t.Errorf("Contract CommitHash mismatch: got %s, want %s", contract.CommitHash, expectedCommitHash)
 	}
-	if contract.TholdHash != tholdHash {
-		t.Errorf("TholdHash mismatch: got %s, computed %s", contract.TholdHash, tholdHash)
+	if contract.TholdHash != expectedTholdHash {
+		t.Errorf("Contract TholdHash mismatch: got %s, want %s", contract.TholdHash, expectedTholdHash)
 	}
-	if contract.ContractID != contractID {
-		t.Errorf("ContractID mismatch: got %s, computed %s", contract.ContractID, contractID)
+	if contract.ContractID != expectedContractID {
+		t.Errorf("Contract ContractID mismatch: got %s, want %s", contract.ContractID, expectedContractID)
 	}
-	if contract.TholdKey == nil || *contract.TholdKey != tholdKey {
-		t.Errorf("TholdKey mismatch")
+	if contract.TholdKey == nil || *contract.TholdKey != expectedTholdKey {
+		t.Errorf("Contract TholdKey mismatch")
 	}
 
 	// Print all values for cross-implementation verification
@@ -956,4 +930,139 @@ func BenchmarkSignSchnorr(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_, _ = SignSchnorr(kd.PrivateKey, message)
 	}
+}
+
+// TestVerifySchnorrSignatureMalleability tests that the verification function properly
+// rejects malformed or potentially malleable signatures.
+//
+// BIP-340 Schnorr signatures have specific properties that prevent malleability:
+// - The signature is exactly 64 bytes (r, s)
+// - The public key is exactly 32 bytes (x-only)
+// - The message hash is exactly 32 bytes
+func TestVerifySchnorrSignatureMalleability(t *testing.T) {
+	kd, err := DeriveKeys(testPrivateKey)
+	if err != nil {
+		t.Fatalf("DeriveKeys failed: %v", err)
+	}
+
+	// Create a valid signature
+	message := "0000000000000000000000000000000000000000000000000000000000000001"
+	sig, err := SignSchnorr(kd.PrivateKey, message)
+	if err != nil {
+		t.Fatalf("SignSchnorr failed: %v", err)
+	}
+
+	// Verify valid signature works
+	if err := VerifySchnorrSignature(kd.SchnorrPubkey, message, sig); err != nil {
+		t.Errorf("Valid signature should verify: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		pubkey    string
+		message   string
+		signature string
+		wantErr   string
+	}{
+		{
+			name:      "truncated signature (60 bytes instead of 64)",
+			pubkey:    kd.SchnorrPubkey,
+			message:   message,
+			signature: sig[:120], // 60 bytes in hex = 120 chars
+			wantErr:   "invalid signature length",
+		},
+		{
+			name:      "extended signature (68 bytes instead of 64)",
+			pubkey:    kd.SchnorrPubkey,
+			message:   message,
+			signature: sig + "00000000", // 68 bytes in hex
+			wantErr:   "invalid signature length",
+		},
+		{
+			name:      "truncated public key (28 bytes instead of 32)",
+			pubkey:    kd.SchnorrPubkey[:56], // 28 bytes in hex = 56 chars
+			message:   message,
+			signature: sig,
+			wantErr:   "invalid public key length",
+		},
+		{
+			name:      "truncated message (28 bytes instead of 32)",
+			pubkey:    kd.SchnorrPubkey,
+			message:   message[:56], // 28 bytes in hex = 56 chars
+			signature: sig,
+			wantErr:   "invalid message length",
+		},
+		{
+			name:      "bit-flipped signature (r component modified)",
+			pubkey:    kd.SchnorrPubkey,
+			message:   message,
+			signature: flipBit(sig, 0), // Flip first byte
+			wantErr:   "signature verification failed",
+		},
+		{
+			name:      "bit-flipped signature (s component modified)",
+			pubkey:    kd.SchnorrPubkey,
+			message:   message,
+			signature: flipBit(sig, 33), // Flip byte at position 33 (in the s component)
+			wantErr:   "signature verification failed",
+		},
+		{
+			name:      "wrong message hash",
+			pubkey:    kd.SchnorrPubkey,
+			message:   "0000000000000000000000000000000000000000000000000000000000000002",
+			signature: sig,
+			wantErr:   "signature verification failed",
+		},
+		{
+			name:      "all zeros signature",
+			pubkey:    kd.SchnorrPubkey,
+			message:   message,
+			signature: "0000000000000000000000000000000000000000000000000000000000000000" +
+				"0000000000000000000000000000000000000000000000000000000000000000",
+			wantErr: "signature verification failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := VerifySchnorrSignature(tt.pubkey, tt.message, tt.signature)
+			if err == nil {
+				t.Errorf("Expected error containing %q, but got nil", tt.wantErr)
+				return
+			}
+			if !containsSubstring(err.Error(), tt.wantErr) {
+				t.Errorf("Expected error containing %q, got %q", tt.wantErr, err.Error())
+			}
+		})
+	}
+}
+
+// flipBit flips a bit in the hex string at the given byte position (0-indexed)
+func flipBit(hexStr string, bytePos int) string {
+	if bytePos*2+1 >= len(hexStr) {
+		return hexStr
+	}
+	bytes := []byte(hexStr)
+	// Flip the high nibble of the byte
+	if bytes[bytePos*2] >= 'a' && bytes[bytePos*2] <= 'f' {
+		bytes[bytePos*2] = 'a' + (bytes[bytePos*2]-'a'+1)%6
+	} else if bytes[bytePos*2] >= '0' && bytes[bytePos*2] <= '9' {
+		bytes[bytePos*2] = '0' + (bytes[bytePos*2]-'0'+1)%10
+	}
+	return string(bytes)
+}
+
+// containsSubstring checks if s contains substr
+func containsSubstring(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

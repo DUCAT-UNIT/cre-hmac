@@ -12,6 +12,17 @@ const (
 	MinReasonablePrice = 1000.0    // $1k
 	MaxReasonablePrice = 1000000.0 // $1M
 
+	// Batch processing limits
+	// MaxBatchSize limits the number of quotes that can be evaluated or generated in a single request.
+	// This prevents excessive parallel HTTP requests to external services.
+	// Note: The CRE SDK manages actual concurrency; this is a request-level limit.
+	MaxBatchSize = 100
+
+	// MaxParallelRequests is the recommended limit for concurrent HTTP requests within a single
+	// workflow execution. The CRE runtime may enforce its own limits, but handlers should
+	// respect this as a best practice to avoid overwhelming external services.
+	MaxParallelRequests = 50
+
 	// Nostr NIP-33 parameterized replaceable event
 	NostrEventKindThresholdCommitment = 30078
 
@@ -23,10 +34,10 @@ const (
 	EventTypeBreach = "breach"
 
 	// Hash lengths
-	TholdHashLength    = 40  // 20 bytes hex-encoded
-	CommitHashLength   = 64  // 32 bytes hex-encoded
-	ContractIDLength   = 64  // 32 bytes hex-encoded
-	TholdKeyLength     = 64  // 32 bytes hex-encoded
-	OracleSigLength    = 128 // 64 bytes hex-encoded
-	SchnorrPubkeyLength = 64 // 32 bytes hex-encoded
+	TholdHashLength     = 40  // 20 bytes hex-encoded
+	CommitHashLength    = 64  // 32 bytes hex-encoded
+	ContractIDLength    = 64  // 32 bytes hex-encoded
+	TholdKeyLength      = 64  // 32 bytes hex-encoded
+	OracleSigLength     = 128 // 64 bytes hex-encoded
+	SchnorrPubkeyLength = 64  // 32 bytes hex-encoded
 )

@@ -155,7 +155,8 @@ type EvaluateQuotesRequest struct {
 	CallbackURL *string  `json:"callback_url,omitempty"`
 }
 
-// Validate validates the evaluate quotes request
+// Validate validates the evaluate quotes request.
+// It enforces MaxBatchSize to limit the number of concurrent external requests.
 func (r *EvaluateQuotesRequest) Validate() error {
 	if r == nil {
 		return fmt.Errorf("request is nil")
@@ -163,8 +164,8 @@ func (r *EvaluateQuotesRequest) Validate() error {
 	if len(r.TholdHashes) == 0 {
 		return fmt.Errorf("thold_hashes required: at least one thold_hash must be provided")
 	}
-	if len(r.TholdHashes) > 100 {
-		return fmt.Errorf("too many thold_hashes: max 100, got %d", len(r.TholdHashes))
+	if len(r.TholdHashes) > MaxBatchSize {
+		return fmt.Errorf("too many thold_hashes: max %d, got %d", MaxBatchSize, len(r.TholdHashes))
 	}
 	for i, hash := range r.TholdHashes {
 		if len(hash) != TholdHashLength {
@@ -375,7 +376,14 @@ type GenerateQuotesResponse struct {
 }
 
 // PriceEvent represents a price threshold event
-// Aligned with core-ts PriceContract schema for client-sdk compatibility
+// Aligned with core-ts PriceContract schema for client-sdk compatibility.
+//
+// Price Truncation Behavior:
+// Prices are stored as int64 (BasePrice) for consistency with TypeScript's number type
+// and for deterministic hashing. Float64 prices like 100234.56 are truncated to 100234
+// when converted to uint32 for cryptographic operations (hash preimages, signatures).
+// This matches the TypeScript core-ts implementation which uses Buff.num(value, 4) for
+// 4-byte big-endian encoding. Fractional cents are intentionally discarded.
 type PriceEvent struct {
 	// Core price event fields
 	EventOrigin  *string  `json:"event_origin"`
