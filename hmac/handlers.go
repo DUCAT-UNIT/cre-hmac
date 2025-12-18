@@ -83,18 +83,9 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		return nil, fmt.Errorf("price contract creation failed: %w", err)
 	}
 
-	// Extract values from contract (secret is not revealed for active quotes)
-	tholdHash := contract.TholdHash
-	_ = contract.TholdKey // Secret exists but not revealed for active quotes
-
-	// Sign contract ID with Schnorr (this is oracle_sig in core-ts)
-	oracleSig, err := signSchnorr(keys.PrivateKey, contract.ContractID)
-	if err != nil {
-		return nil, fmt.Errorf("request signing failed: %w", err)
-	}
-
 	// Build PriceContractResponse - matches core-ts PriceContract schema exactly
 	// This is what gets stored in Nostr and what client-sdk expects to parse
+	// Note: createPriceContract already computed oracle_sig, so we use it directly
 	priceContract := PriceContractResponse{
 		ChainNetwork: wc.Config.Network,      // Bitcoin network
 		OraclePubkey: keys.SchnorrPubkey,     // Server Schnorr public key
@@ -102,8 +93,8 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		BaseStamp:    quoteStamp,             // Quote timestamp
 		CommitHash:   contract.CommitHash,    // hash340 commitment
 		ContractID:   contract.ContractID,    // Contract identifier
-		OracleSig:    oracleSig,              // Schnorr signature
-		TholdHash:    tholdHash,              // Hash160 commitment
+		OracleSig:    contract.OracleSig,     // Schnorr signature (from createPriceContract)
+		TholdHash:    contract.TholdHash,     // Hash160 commitment
 		TholdKey:     nil,                    // Secret is NOT revealed (null for active)
 		TholdPrice:   int64(tholdPrice),      // Threshold price
 	}

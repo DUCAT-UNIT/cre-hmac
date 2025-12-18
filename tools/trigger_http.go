@@ -399,6 +399,7 @@ func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, err
 }
 
 // computeRecoveryID computes the Ethereum recovery ID (0-3)
+// Panics if no valid recovery ID is found (indicates a bug in signature generation)
 func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *big.Int) byte {
 	// Get uncompressed public key bytes
 	pubKeyBytes := pubKey.SerializeUncompressed()
@@ -419,8 +420,10 @@ func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messa
 		}
 	}
 
-	// Fallback: shouldn't happen, but return 0
-	return 0
+	// This should never happen with a valid ECDSA signature
+	// Panic with diagnostic info to help debug if it does occur
+	panic(fmt.Sprintf("failed to compute recovery ID: no valid recovery ID (0-3) matched for pubkey=%x, r=%x, s=%x",
+		pubKeyBytes[:8], r.Bytes()[:8], s.Bytes()[:8]))
 }
 
 // tryRecoverPublicKey attempts to recover the public key from a signature
