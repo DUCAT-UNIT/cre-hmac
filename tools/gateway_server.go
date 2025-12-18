@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +23,7 @@ import (
 
 	"ducat/internal/ethsign"
 
+	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -152,7 +155,63 @@ var (
 		},
 		[]string{"endpoint"},
 	)
+
+	panicsRecovered = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gateway_panics_recovered_total",
+			Help: "Total number of panics recovered by the server",
+		},
+	)
 )
+
+// validatePrivateKey validates that a hex-encoded private key is exactly 32 bytes
+// and falls within the valid range for secp256k1 (1 < key < curve order).
+func validatePrivateKey(hexKey string) error {
+	if len(hexKey) != 64 {
+		return fmt.Errorf("private key must be 64 hex chars, got %d", len(hexKey))
+	}
+
+	keyBytes, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return fmt.Errorf("invalid hex encoding: %w", err)
+	}
+
+	// Check key is in valid range (0 < key < curve order)
+	keyInt := new(big.Int).SetBytes(keyBytes)
+	curveOrder := btcec.S256().Params().N
+
+	if keyInt.Sign() == 0 {
+		return fmt.Errorf("private key cannot be zero")
+	}
+	if keyInt.Cmp(curveOrder) >= 0 {
+		return fmt.Errorf("private key exceeds curve order")
+	}
+
+	return nil
+}
+
+// panicRecoveryMiddleware catches panics in HTTP handlers and logs them.
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				panicsRecovered.Inc()
+				if logger != nil {
+					logger.Error("panic recovered in HTTP handler",
+						zap.Any("error", err),
+						zap.String("path", r.URL.Path),
+						zap.String("method", r.Method),
+						zap.String("stack", string(debug.Stack())),
+					)
+				} else {
+					log.Printf("PANIC: %v\nStack: %s", err, debug.Stack())
+				}
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
 // Client request types
 type CreateRequest struct {
@@ -236,13 +295,19 @@ func init() {
 	// Load configuration into struct
 	config := loadConfig()
 
-	// Load private key from environment variable
+	// Load and validate private key from environment variable
 	privateKeyHex := os.Getenv("DUCAT_PRIVATE_KEY")
 	if privateKeyHex == "" {
 		logger.Fatal("DUCAT_PRIVATE_KEY environment variable not set")
 	}
 
 	privateKeyHex = strings.TrimPrefix(privateKeyHex, "0x")
+
+	// Validate private key format and range before use
+	if err := validatePrivateKey(privateKeyHex); err != nil {
+		logger.Fatal("Invalid private key", zap.Error(err))
+	}
+
 	privKeyBytes, err := hex.DecodeString(privateKeyHex)
 	if err != nil {
 		logger.Fatal("Failed to decode private key", zap.Error(err))
@@ -379,11 +444,14 @@ func loadConfig() *GatewayConfig {
 func main() {
 	defer logger.Sync()
 
-	// Wrap handlers with metrics middleware
-	http.Handle("/api/quote", metricsMiddleware("create", http.HandlerFunc(server.handleCreate)))
-	http.Handle("/webhook/ducat", metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook))))
-	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/readiness", server.handleReadiness)
+	// Wrap all handlers with panic recovery and metrics middleware
+	// Rate limiting applied to both /api/quote and /webhook/ducat to prevent DoS
+	http.Handle("/api/quote", panicRecoveryMiddleware(
+		metricsMiddleware("create", server.rateLimitMiddleware(http.HandlerFunc(server.handleCreate)))))
+	http.Handle("/webhook/ducat", panicRecoveryMiddleware(
+		metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook)))))
+	http.Handle("/health", panicRecoveryMiddleware(http.HandlerFunc(handleHealth)))
+	http.Handle("/readiness", panicRecoveryMiddleware(http.HandlerFunc(server.handleReadiness)))
 	http.Handle("/metrics", promhttp.Handler())
 
 	port := os.Getenv("PORT")
@@ -849,11 +917,16 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find the pending request by domain
+	// Copy channel reference while holding lock to prevent race with cleanup
 	s.requestsMutex.Lock()
 	pending, exists := s.pendingRequests[domain]
+	var resultChan chan *WebhookPayload
+	if exists && pending != nil {
+		resultChan = pending.ResultChan
+	}
 	s.requestsMutex.Unlock()
 
-	if !exists {
+	if !exists || resultChan == nil {
 		// This is fine - might be a duplicate webhook from another DON node
 		// or a request that already timed out
 		webhooksReceived.WithLabelValues(payload.EventType, "no_match").Inc()
@@ -868,8 +941,9 @@ func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send result to the channel (non-blocking)
+	// Using local copy of channel to avoid race condition
 	select {
-	case pending.ResultChan <- &payload:
+	case resultChan <- &payload:
 		webhooksReceived.WithLabelValues(payload.EventType, "matched").Inc()
 		logger.Info("Webhook received and matched",
 			zap.String("event_type", payload.EventType),

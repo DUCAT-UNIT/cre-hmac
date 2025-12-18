@@ -172,7 +172,7 @@ func TestHttpRequestDataValidate(t *testing.T) {
 		{"negative price", &HttpRequestData{Domain: "test", TholdPrice: func() *float64 { p := -100.0; return &p }()}, true, "must be positive"},
 		{"NaN price", &HttpRequestData{Domain: "test", TholdPrice: func() *float64 { p := math.NaN(); return &p }()}, true, "NaN"},
 		{"infinite price", &HttpRequestData{Domain: "test", TholdPrice: func() *float64 { p := math.Inf(1); return &p }()}, true, "infinite"},
-		{"exceeds max price", &HttpRequestData{Domain: "test", TholdPrice: func() *float64 { p := MaxPriceValue + 1; return &p }()}, true, "exceeds maximum"},
+		{"exceeds max price", &HttpRequestData{Domain: "test", TholdPrice: func() *float64 { p := float64(MaxPriceValue) + 1; return &p }()}, true, "exceeds maximum"},
 
 		// Hash validation
 		{"hash too short", &HttpRequestData{Domain: "test", TholdHash: func() *string { s := "abc"; return &s }()}, true, "invalid thold_hash length"},

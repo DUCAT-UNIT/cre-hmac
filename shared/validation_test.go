@@ -301,13 +301,13 @@ func TestValidatePrice(t *testing.T) {
 		// Valid prices
 		{"positive price", 100000.0, false, ""},
 		{"small positive", 0.01, false, ""},
-		{"large price", 1e11, false, ""},
-		{"max price", MaxPriceValue, false, ""},
+		{"large price", 1e9, false, ""},                        // $1B is valid
+		{"max price", float64(MaxPriceValue), false, ""},       // uint32 max
 
 		// Invalid prices
 		{"zero", 0, true, "must be positive"},
 		{"negative", -100.0, true, "must be positive"},
-		{"exceeds max", MaxPriceValue + 1, true, "exceeds maximum"},
+		{"exceeds max", float64(MaxPriceValue) + 1, true, "exceeds maximum"},
 		{"NaN", math.NaN(), true, "NaN"},
 		{"positive infinity", math.Inf(1), true, "infinite"},
 		{"negative infinity", math.Inf(-1), true, "infinite"},

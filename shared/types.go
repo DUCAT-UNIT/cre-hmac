@@ -120,8 +120,8 @@ func (r *HttpRequestData) Validate() error {
 		if price <= 0 {
 			return fmt.Errorf("threshold price must be positive, got %.2f", price)
 		}
-		if price > MaxPriceValue {
-			return fmt.Errorf("threshold price exceeds maximum %.0f, got %.2f", MaxPriceValue, price)
+		if price > float64(MaxPriceValue) {
+			return fmt.Errorf("threshold price exceeds maximum %d, got %.2f", MaxPriceValue, price)
 		}
 	}
 

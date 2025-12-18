@@ -90,8 +90,8 @@ func ValidatePrice(price float64) error {
 	if price <= 0 {
 		return fmt.Errorf("price must be positive, got %.2f", price)
 	}
-	if price > MaxPriceValue {
-		return fmt.Errorf("price exceeds maximum %.0f, got %.2f", MaxPriceValue, price)
+	if price > float64(MaxPriceValue) {
+		return fmt.Errorf("price exceeds maximum %d, got %.2f", MaxPriceValue, price)
 	}
 	return nil
 }

@@ -26,10 +26,26 @@ const (
 	TagPriceContractID = "ducat/price_contract_id"
 )
 
+// zeroBytes securely zeroes a byte slice to prevent secret leakage in memory.
+// This should be called via defer after any sensitive key material is used.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
 // KeyDerivation contains derived cryptographic keys
 type KeyDerivation struct {
 	PrivateKey    []byte
 	SchnorrPubkey string
+}
+
+// Zero securely zeroes the private key material.
+// Call this via defer after using KeyDerivation.
+func (k *KeyDerivation) Zero() {
+	if k != nil && k.PrivateKey != nil {
+		zeroBytes(k.PrivateKey)
+	}
 }
 
 // PriceObservation contains price observation data for commit hash computation.
@@ -177,6 +193,8 @@ func GetTholdKey(oracleSeckey string, commitHash string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("invalid oracle seckey hex: %w", err)
 	}
+	defer zeroBytes(seckeyBytes) // Zero secret key after use
+
 	if len(seckeyBytes) != 32 {
 		return "", fmt.Errorf("invalid oracle seckey length: expected 32 bytes, got %d", len(seckeyBytes))
 	}
@@ -191,7 +209,10 @@ func GetTholdKey(oracleSeckey string, commitHash string) (string, error) {
 
 	h := hmac.New(sha256.New, seckeyBytes)
 	h.Write(commitBytes)
-	return hex.EncodeToString(h.Sum(nil)), nil
+	result := h.Sum(nil)
+	defer zeroBytes(result) // Zero derived key after encoding
+
+	return hex.EncodeToString(result), nil
 }
 
 // GetPriceContractID computes the contract ID from commit hash and thold hash
@@ -254,6 +275,8 @@ func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice u
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode thold key: %w", err)
 	}
+	defer zeroBytes(tholdKeyBytes) // Zero derived key after use
+
 	tholdHash, err := Hash160(tholdKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute thold hash: %w", err)
@@ -270,6 +293,7 @@ func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice u
 	if err != nil {
 		return nil, fmt.Errorf("invalid oracle seckey hex: %w", err)
 	}
+	defer zeroBytes(seckeyBytes) // Zero secret key after use
 
 	oracleSig, err := SignSchnorr(seckeyBytes, contractID)
 	if err != nil {
