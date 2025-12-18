@@ -36,7 +36,11 @@ type GenericHttpRequest struct {
 
 // onHttpTrigger routes requests based on action parameter
 // action=create OR thold_price -> CREATE new quote
-// action=evaluate -> EVALUATE batch quotes (with breach detection)
+// onHttpTrigger routes incoming HTTP payloads to either quote creation or batch evaluation.
+// It requires a non-empty payload input and fetches runtime secrets before routing.
+// If the top-level `"action"` field equals `"evaluate"`, it parses and validates an EvaluateQuotesRequest and forwards it to evaluateQuotes.
+// Otherwise it parses and validates HttpRequestData and, when a TholdPrice is present, forwards it to createQuote.
+// Returns the handler response on success or an error if input is missing, secrets cannot be obtained, parsing/validation fail, or required fields (for example `thold_price` for creation) are absent.
 func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (interface{}, error) {
 	logger := runtime.Logger()
 	logger.Info("HTTP trigger received")
@@ -97,7 +101,8 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 
 // onCronTrigger handles scheduled quote generation
 // Fires based on cron_schedule in config
-// Generates quotes from rate_min to rate_max at step_size intervals
+// onCronTrigger handles a scheduled cron firing to generate quotes using the workflow configuration.
+// It fetches runtime secrets, constructs a GenerateQuotesRequest from RateMin, RateMax, StepSize and a domain derived from QuoteDomain (or "auto-gen") combined with the scheduled Unix timestamp, validates the request, and invokes quote generation, returning the generated quotes response or an error.
 func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (*GenerateQuotesResponse, error) {
 	logger := runtime.Logger()
 	scheduledTime := trigger.ScheduledExecutionTime.AsTime()
@@ -141,7 +146,10 @@ func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (
 	return generateQuotesParallel(wc, runtime, genReq)
 }
 
-// buildWorkflowConfig fetches secrets and builds WorkflowConfig
+// buildWorkflowConfig constructs a WorkflowConfig by retrieving required runtime secrets.
+// It returns a WorkflowConfig populated with the provided Config and the fetched
+// private_key and client_secret. An error is returned if a secret cannot be fetched,
+// if private_key is not exactly 64 characters, or if client_secret is empty.
 func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, error) {
 	logger := runtime.Logger()
 
@@ -173,7 +181,10 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 	}, nil
 }
 
-// InitWorkflow initializes workflow with config validation
+// InitWorkflow initializes the DUCAT workflow using the provided configuration, logger, and secrets provider.
+// It validates the config and returns an error if validation fails. It configures an HTTP trigger that requires
+// JWT authentication for a predefined ECDSA EVM public key, assembles the workflow handlers, and (if
+// CronSchedule is set) adds a cron trigger to generate quotes on the configured schedule.
 func InitWorkflow(config *Config, logger *slog.Logger, secrets cre.SecretsProvider) (cre.Workflow[*Config], error) {
 	// Validate configuration
 	if err := config.Validate(); err != nil {

@@ -10,7 +10,9 @@ import (
 	"ducat/shared"
 )
 
-// signNostrEvent signs a Nostr event per NIP-01
+// signNostrEvent signs a Nostr event per NIP-01.
+// It sets event.ID to the SHA-256 hex of the NIP-01 serialization and sets event.Sig to the Schnorr signature produced from privKeyBytes.
+// Returns an error if event is nil, if privKeyBytes is not 32 bytes, or if signing fails.
 func signNostrEvent(event *shared.NostrEvent, privKeyBytes []byte) error {
 	if event == nil {
 		return fmt.Errorf("event cannot be nil")
@@ -36,14 +38,16 @@ func signNostrEvent(event *shared.NostrEvent, privKeyBytes []byte) error {
 	return nil
 }
 
-// serializeNostrEvent serializes event per NIP-01
+// serializeNostrEvent produces the NIP-01 serialization of the given event as a JSON-array string containing the event's pubkey, created_at, kind, tags, and content.
+// The event's Tags field is JSON-marshaled and inserted verbatim; any marshal error is ignored.
 func serializeNostrEvent(event *shared.NostrEvent) string {
 	tags, _ := json.Marshal(event.Tags)
 	return fmt.Sprintf("[0,%q,%d,%d,%s,%q]",
 		event.PubKey, event.CreatedAt, event.Kind, string(tags), event.Content)
 }
 
-// verifyNostrEvent verifies a Nostr event per NIP-01
+// verifyNostrEvent verifies a Nostr event according to NIP-01 by checking that the SHA-256 hash of the canonical serialization matches event.ID and by validating the Schnorr signature.
+// It returns an error if event is nil, if the recomputed ID does not match event.ID, or if signature verification fails.
 func verifyNostrEvent(event *shared.NostrEvent) error {
 	if event == nil {
 		return fmt.Errorf("event cannot be nil")

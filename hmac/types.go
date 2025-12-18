@@ -103,7 +103,7 @@ func isValidDomain(domain string) bool {
 	return validDomain.MatchString(domain)
 }
 
-// isValidHex checks if string is valid lowercase hex
+// isValidHex reports whether s contains only lowercase hexadecimal characters (0-9, a-f).
 func isValidHex(s string) bool {
 	validHex := regexp.MustCompile(`^[0-9a-f]+$`)
 	return validHex.MatchString(s)
