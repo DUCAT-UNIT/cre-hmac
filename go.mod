@@ -5,7 +5,6 @@ go 1.25.1
 require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4
 	github.com/ethereum/go-ethereum v1.16.7
-	github.com/google/uuid v1.6.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/shopspring/decimal v1.4.0
 	github.com/smartcontractkit/chainlink-protos/cre/go v0.0.0-20250918131840-564fe2776a35
@@ -14,6 +13,7 @@ require (
 	github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron v0.10.0
 	go.uber.org/zap v1.27.1
 	golang.org/x/crypto v0.43.0
+	golang.org/x/time v0.9.0
 )
 
 require (

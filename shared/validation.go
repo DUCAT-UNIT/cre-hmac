@@ -4,13 +4,27 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strings"
 )
 
 // Compiled regexes for validation (compiled once for performance)
+//
+// IMPORTANT: validHexRegex only accepts lowercase hex (0-9, a-f).
+// Uppercase hex (A-F) is intentionally rejected for consistency with
+// crypto package output (all hashes, signatures, and keys are lowercase).
+// External integrations MUST normalize hex input to lowercase before validation.
+//
+// To normalize hex input: strings.ToLower(hexString)
 var (
 	validDomainRegex = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 	validHexRegex    = regexp.MustCompile(`^[0-9a-f]+$`)
 )
+
+// NormalizeHex converts a hex string to lowercase for consistent validation.
+// Use this before calling any IsValid* hex validation functions on external input.
+func NormalizeHex(hex string) string {
+	return strings.ToLower(hex)
+}
 
 // IsValidDomain checks if domain contains only allowed characters
 // Allows: alphanumeric, dots, hyphens, underscores

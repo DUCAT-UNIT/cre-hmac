@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"ducat/internal/ethsign"
 
 	"github.com/ethereum/go-ethereum/crypto"
 )
@@ -28,19 +31,20 @@ func setupTestEnv(tb testing.TB) {
 	os.Setenv("GATEWAY_CALLBACK_URL", "http://localhost:8080/webhook/ducat")
 	os.Setenv("DUCAT_PRIVATE_KEY", "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c")
 
-	// Reset globals
-	pendingRequests = make(map[string]*PendingRequest)
-
-	// Load private key for tests
-	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
-	privKeyBytes, _ := hex.DecodeString(privateKeyHex)
-	privateKey, _ = crypto.ToECDSA(privKeyBytes)
+	// Reset server state if initialized
+	if server != nil {
+		server.requestsMutex.Lock()
+		server.pendingRequests = make(map[string]*PendingRequest)
+		server.requestsMutex.Unlock()
+	}
 }
 
 func resetGlobals() {
-	requestsMutex.Lock()
-	pendingRequests = make(map[string]*PendingRequest)
-	requestsMutex.Unlock()
+	if server != nil {
+		server.requestsMutex.Lock()
+		server.pendingRequests = make(map[string]*PendingRequest)
+		server.requestsMutex.Unlock()
+	}
 }
 
 // TestLoadConfig tests configuration loading from environment variables
@@ -49,7 +53,7 @@ func TestLoadConfig(t *testing.T) {
 		name        string
 		envVars     map[string]string
 		shouldPanic bool
-		validate    func(t *testing.T)
+		validate    func(t *testing.T, cfg *GatewayConfig)
 	}{
 		{
 			name: "all required vars set",
@@ -59,44 +63,44 @@ func TestLoadConfig(t *testing.T) {
 				"GATEWAY_CALLBACK_URL": "http://example.com/webhook",
 			},
 			shouldPanic: false,
-			validate: func(t *testing.T) {
-				if WORKFLOW_ID != "workflow123" {
-					t.Errorf("WORKFLOW_ID = %s, want workflow123", WORKFLOW_ID)
+			validate: func(t *testing.T, cfg *GatewayConfig) {
+				if cfg.WorkflowID != "workflow123" {
+					t.Errorf("WorkflowID = %s, want workflow123", cfg.WorkflowID)
 				}
-				if AUTHORIZED_KEY != "0xabc123" {
-					t.Errorf("AUTHORIZED_KEY = %s, want 0xabc123", AUTHORIZED_KEY)
+				if cfg.AuthorizedKey != "0xabc123" {
+					t.Errorf("AuthorizedKey = %s, want 0xabc123", cfg.AuthorizedKey)
 				}
-				if CALLBACK_URL != "http://example.com/webhook" {
-					t.Errorf("CALLBACK_URL = %s, want http://example.com/webhook", CALLBACK_URL)
+				if cfg.CallbackURL != "http://example.com/webhook" {
+					t.Errorf("CallbackURL = %s, want http://example.com/webhook", cfg.CallbackURL)
 				}
-				if BLOCK_TIMEOUT != 60*time.Second {
-					t.Errorf("BLOCK_TIMEOUT = %v, want 60s", BLOCK_TIMEOUT)
+				if cfg.BlockTimeout != 60*time.Second {
+					t.Errorf("BlockTimeout = %v, want 60s", cfg.BlockTimeout)
 				}
-				if MAX_PENDING != 1000 {
-					t.Errorf("MAX_PENDING = %d, want 1000", MAX_PENDING)
+				if cfg.MaxPending != 1000 {
+					t.Errorf("MaxPending = %d, want 1000", cfg.MaxPending)
 				}
 			},
 		},
 		{
 			name: "custom timeout and limits",
 			envVars: map[string]string{
-				"CRE_WORKFLOW_ID":         "workflow123",
-				"DUCAT_AUTHORIZED_KEY":    "0xabc123",
-				"GATEWAY_CALLBACK_URL":    "http://example.com/webhook",
-				"BLOCK_TIMEOUT_SECONDS":   "30",
+				"CRE_WORKFLOW_ID":          "workflow123",
+				"DUCAT_AUTHORIZED_KEY":     "0xabc123",
+				"GATEWAY_CALLBACK_URL":     "http://example.com/webhook",
+				"BLOCK_TIMEOUT_SECONDS":    "30",
 				"CLEANUP_INTERVAL_SECONDS": "60",
-				"MAX_PENDING_REQUESTS":    "500",
+				"MAX_PENDING_REQUESTS":     "500",
 			},
 			shouldPanic: false,
-			validate: func(t *testing.T) {
-				if BLOCK_TIMEOUT != 30*time.Second {
-					t.Errorf("BLOCK_TIMEOUT = %v, want 30s", BLOCK_TIMEOUT)
+			validate: func(t *testing.T, cfg *GatewayConfig) {
+				if cfg.BlockTimeout != 30*time.Second {
+					t.Errorf("BlockTimeout = %v, want 30s", cfg.BlockTimeout)
 				}
-				if CLEANUP_INTERVAL != 60*time.Second {
-					t.Errorf("CLEANUP_INTERVAL = %v, want 60s", CLEANUP_INTERVAL)
+				if cfg.CleanupInterval != 60*time.Second {
+					t.Errorf("CleanupInterval = %v, want 60s", cfg.CleanupInterval)
 				}
-				if MAX_PENDING != 500 {
-					t.Errorf("MAX_PENDING = %d, want 500", MAX_PENDING)
+				if cfg.MaxPending != 500 {
+					t.Errorf("MaxPending = %d, want 500", cfg.MaxPending)
 				}
 			},
 		},
@@ -120,10 +124,10 @@ func TestLoadConfig(t *testing.T) {
 				}()
 			}
 
-			loadConfig()
+			cfg := loadConfig()
 
 			if tt.validate != nil {
-				tt.validate(t)
+				tt.validate(t, cfg)
 			}
 		})
 	}
@@ -221,7 +225,7 @@ func TestHandleCreateValidation(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/api/quote"+tt.queryParams, nil)
 			w := httptest.NewRecorder()
 
-			handleCreate(w, req)
+			server.handleCreate(w, req)
 
 			resp := w.Result()
 			body, _ := io.ReadAll(resp.Body)
@@ -244,12 +248,12 @@ func TestHandleCreateMaxPending(t *testing.T) {
 	resetGlobals()
 
 	// Set a low limit for testing
-	MAX_PENDING = 2
+	server.config.MaxPending = 2
 
 	// Fill up pending requests
-	for i := 0; i < MAX_PENDING; i++ {
+	for i := 0; i < server.config.MaxPending; i++ {
 		domain := fmt.Sprintf("test-domain-%d", i)
-		pendingRequests[domain] = &PendingRequest{
+		server.pendingRequests[domain] = &PendingRequest{
 			RequestID:  domain,
 			CreatedAt:  time.Now(),
 			ResultChan: make(chan *WebhookPayload, 1),
@@ -260,7 +264,7 @@ func TestHandleCreateMaxPending(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/quote?th=100", nil)
 	w := httptest.NewRecorder()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -274,7 +278,7 @@ func TestHandleCreateMaxPending(t *testing.T) {
 
 	// Cleanup
 	resetGlobals()
-	MAX_PENDING = 1000
+	server.config.MaxPending = 1000
 }
 
 // TestHandleWebhook tests webhook processing
@@ -310,7 +314,7 @@ func TestHandleWebhook(t *testing.T) {
 				EventType: "create",
 				EventID:   "event123",
 				Tags:      [][]string{{"domain", "test-domain"}},
-				Content:   `{"thold_price": 100.5, "thold_hash": "abc123"}`,
+				Content:   `{"thold_price": 100, "thold_hash": "abc123"}`,
 			},
 			setupPending:   true,
 			domain:         "test-domain",
@@ -323,7 +327,7 @@ func TestHandleWebhook(t *testing.T) {
 				EventType: "create",
 				EventID:   "event456",
 				Tags:      [][]string{{"domain", "unknown-domain"}},
-				Content:   `{"thold_price": 100.5}`,
+				Content:   `{"thold_price": 100}`,
 			},
 			setupPending:   false,
 			expectedStatus: http.StatusOK,
@@ -336,7 +340,7 @@ func TestHandleWebhook(t *testing.T) {
 
 			// Setup pending request if needed
 			if tt.setupPending {
-				pendingRequests[tt.domain] = &PendingRequest{
+				server.pendingRequests[tt.domain] = &PendingRequest{
 					RequestID:  tt.domain,
 					CreatedAt:  time.Now(),
 					ResultChan: make(chan *WebhookPayload, 1),
@@ -355,7 +359,7 @@ func TestHandleWebhook(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/webhook/ducat", body)
 			w := httptest.NewRecorder()
 
-			handleWebhook(w, req)
+			server.handleWebhook(w, req)
 
 			resp := w.Result()
 			if resp.StatusCode != tt.expectedStatus {
@@ -364,7 +368,7 @@ func TestHandleWebhook(t *testing.T) {
 
 			// If we set up a pending request, verify it received the webhook
 			if tt.setupPending {
-				pending := pendingRequests[tt.domain]
+				pending := server.pendingRequests[tt.domain]
 				select {
 				case result := <-pending.ResultChan:
 					if result.EventID != "event123" {
@@ -438,7 +442,7 @@ func TestHandleCheckValidation(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/check", body)
 			w := httptest.NewRecorder()
 
-			handleCheck(w, req)
+			server.handleCheck(w, req)
 
 			resp := w.Result()
 			if resp.StatusCode != tt.expectedStatus {
@@ -492,7 +496,7 @@ func TestHandleStatus(t *testing.T) {
 			method: "GET",
 			path:   "/status/pending-req",
 			setupRequest: func() {
-				pendingRequests["pending-req"] = &PendingRequest{
+				server.pendingRequests["pending-req"] = &PendingRequest{
 					RequestID:  "pending-req",
 					CreatedAt:  time.Now(),
 					ResultChan: make(chan *WebhookPayload, 1),
@@ -518,13 +522,13 @@ func TestHandleStatus(t *testing.T) {
 			method: "GET",
 			path:   "/status/completed-req",
 			setupRequest: func() {
-				pendingRequests["completed-req"] = &PendingRequest{
+				server.pendingRequests["completed-req"] = &PendingRequest{
 					RequestID: "completed-req",
 					CreatedAt: time.Now(),
 					Status:    "completed",
 					Result: &WebhookPayload{
 						// Full CRE format payload with core-ts PriceContract fields
-						Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":100,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":95.0}`,
+						Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":100,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":95}`,
 					},
 				}
 			},
@@ -567,7 +571,7 @@ func TestHandleStatus(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			w := httptest.NewRecorder()
 
-			handleStatus(w, req)
+			server.handleStatus(w, req)
 
 			resp := w.Result()
 			if resp.StatusCode != tt.expectedStatus {
@@ -589,54 +593,54 @@ func TestCleanupOldRequests(t *testing.T) {
 	resetGlobals()
 
 	// Set very short intervals for testing
-	oldCleanupInterval := CLEANUP_INTERVAL
-	oldBlockTimeout := BLOCK_TIMEOUT
-	CLEANUP_INTERVAL = 50 * time.Millisecond
-	BLOCK_TIMEOUT = 50 * time.Millisecond
+	oldCleanupInterval := server.config.CleanupInterval
+	oldBlockTimeout := server.config.BlockTimeout
+	server.config.CleanupInterval = 50 * time.Millisecond
+	server.config.BlockTimeout = 50 * time.Millisecond
 	defer func() {
-		CLEANUP_INTERVAL = oldCleanupInterval
-		BLOCK_TIMEOUT = oldBlockTimeout
+		server.config.CleanupInterval = oldCleanupInterval
+		server.config.BlockTimeout = oldBlockTimeout
 	}()
 
 	now := time.Now()
 
 	// Add various requests
-	pendingRequests["old-completed"] = &PendingRequest{
+	server.pendingRequests["old-completed"] = &PendingRequest{
 		RequestID:  "old-completed",
 		CreatedAt:  now.Add(-10 * time.Minute),
 		Status:     "completed",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["old-timeout"] = &PendingRequest{
+	server.pendingRequests["old-timeout"] = &PendingRequest{
 		RequestID:  "old-timeout",
 		CreatedAt:  now.Add(-10 * time.Minute),
 		Status:     "timeout",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["stale-pending"] = &PendingRequest{
+	server.pendingRequests["stale-pending"] = &PendingRequest{
 		RequestID:  "stale-pending",
 		CreatedAt:  now.Add(-5 * time.Minute),
 		Status:     "pending",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["recent-completed"] = &PendingRequest{
+	server.pendingRequests["recent-completed"] = &PendingRequest{
 		RequestID:  "recent-completed",
 		CreatedAt:  now.Add(-1 * time.Minute),
 		Status:     "completed",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["active-pending"] = &PendingRequest{
+	server.pendingRequests["active-pending"] = &PendingRequest{
 		RequestID:  "active-pending",
 		CreatedAt:  now,
 		Status:     "pending",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	initialCount := len(pendingRequests)
+	initialCount := len(server.pendingRequests)
 	if initialCount != 5 {
 		t.Fatalf("setup failed: got %d requests, want 5", initialCount)
 	}
@@ -646,33 +650,33 @@ func TestCleanupOldRequests(t *testing.T) {
 	doneChan := make(chan bool)
 
 	go func() {
-		ticker := time.NewTicker(CLEANUP_INTERVAL)
+		ticker := time.NewTicker(server.config.CleanupInterval)
 		defer ticker.Stop()
 		defer close(doneChan)
 
 		select {
 		case <-ticker.C:
-			requestsMutex.Lock()
+			server.requestsMutex.Lock()
 			now := time.Now()
 			cleaned := 0
 
-			for id, req := range pendingRequests {
+			for id, req := range server.pendingRequests {
 				shouldDelete := false
 
 				if req.Status == "completed" && now.Sub(req.CreatedAt) > 5*time.Minute {
 					shouldDelete = true
 				} else if req.Status == "timeout" && now.Sub(req.CreatedAt) > 5*time.Minute {
 					shouldDelete = true
-				} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*BLOCK_TIMEOUT {
+				} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*server.config.BlockTimeout {
 					shouldDelete = true
 				}
 
 				if shouldDelete {
-					delete(pendingRequests, id)
+					delete(server.pendingRequests, id)
 					cleaned++
 				}
 			}
-			requestsMutex.Unlock()
+			server.requestsMutex.Unlock()
 		case <-stopChan:
 			return
 		}
@@ -687,16 +691,16 @@ func TestCleanupOldRequests(t *testing.T) {
 	}
 
 	// Verify cleanup
-	requestsMutex.RLock()
-	defer requestsMutex.RUnlock()
+	server.requestsMutex.RLock()
+	defer server.requestsMutex.RUnlock()
 
 	expectedRemaining := []string{"recent-completed", "active-pending"}
-	if len(pendingRequests) != len(expectedRemaining) {
-		t.Errorf("after cleanup: got %d requests, want %d", len(pendingRequests), len(expectedRemaining))
+	if len(server.pendingRequests) != len(expectedRemaining) {
+		t.Errorf("after cleanup: got %d requests, want %d", len(server.pendingRequests), len(expectedRemaining))
 	}
 
 	for _, key := range expectedRemaining {
-		if _, exists := pendingRequests[key]; !exists {
+		if _, exists := server.pendingRequests[key]; !exists {
 			t.Errorf("request %s should not have been cleaned up", key)
 		}
 	}
@@ -786,7 +790,7 @@ func TestGetTholdHash(t *testing.T) {
 	}
 }
 
-// TestEncodeBase64URL tests the base64url encoding function
+// TestEncodeBase64URL tests the base64url encoding function using standard library
 func TestEncodeBase64URL(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -822,34 +826,34 @@ func TestEncodeBase64URL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := encodeBase64URL(tt.input)
+			result := base64.RawURLEncoding.EncodeToString(tt.input)
 			if result != tt.expected {
-				t.Errorf("encodeBase64URL() = %s, want %s", result, tt.expected)
+				t.Errorf("base64.RawURLEncoding.EncodeToString() = %s, want %s", result, tt.expected)
 			}
 		})
 	}
 }
 
-// TestGenerateRequestID tests request ID generation
+// TestGenerateRequestID tests request ID generation using ethsign package
 func TestGenerateRequestID(t *testing.T) {
-	id1 := generateRequestID()
-	id2 := generateRequestID()
+	id1 := ethsign.GenerateRequestID()
+	id2 := ethsign.GenerateRequestID()
 
 	if id1 == id2 {
-		t.Error("generateRequestID() should generate unique IDs")
+		t.Error("GenerateRequestID() should generate unique IDs")
 	}
 
 	if len(id1) != 32 {
-		t.Errorf("generateRequestID() length = %d, want 32", len(id1))
+		t.Errorf("GenerateRequestID() length = %d, want 32", len(id1))
 	}
 
 	// Verify it's valid hex
 	if _, err := hex.DecodeString(id1); err != nil {
-		t.Errorf("generateRequestID() returned invalid hex: %v", err)
+		t.Errorf("GenerateRequestID() returned invalid hex: %v", err)
 	}
 }
 
-// TestGenerateJWT tests JWT generation
+// TestGenerateJWT tests JWT generation using ethsign package
 func TestGenerateJWT(t *testing.T) {
 	// Generate a test private key
 	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
@@ -859,9 +863,9 @@ func TestGenerateJWT(t *testing.T) {
 	address := "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82"
 	digest := "0x1234567890abcdef"
 
-	token, err := generateJWT(privKey, address, digest)
+	token, err := ethsign.GenerateJWT(privKey, address, digest, ethsign.GenerateRequestID())
 	if err != nil {
-		t.Fatalf("generateJWT() error = %v", err)
+		t.Fatalf("GenerateJWT() error = %v", err)
 	}
 
 	// Verify JWT structure (header.payload.signature)
@@ -871,13 +875,13 @@ func TestGenerateJWT(t *testing.T) {
 	}
 
 	// Verify it's different each time (due to jti and timestamps)
-	token2, _ := generateJWT(privKey, address, digest)
+	token2, _ := ethsign.GenerateJWT(privKey, address, digest, ethsign.GenerateRequestID())
 	if token == token2 {
-		t.Error("generateJWT() should generate unique tokens due to jti")
+		t.Error("GenerateJWT() should generate unique tokens due to jti")
 	}
 }
 
-// TestSignEthereumMessage tests Ethereum message signing
+// TestSignEthereumMessage tests Ethereum message signing using ethsign package
 func TestSignEthereumMessage(t *testing.T) {
 	// Generate a test private key
 	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
@@ -886,9 +890,9 @@ func TestSignEthereumMessage(t *testing.T) {
 
 	message := "test message"
 
-	signature, err := signEthereumMessage(privKey, message)
+	signature, err := ethsign.SignEthereumMessage(privKey, message)
 	if err != nil {
-		t.Fatalf("signEthereumMessage() error = %v", err)
+		t.Fatalf("SignEthereumMessage() error = %v", err)
 	}
 
 	// Verify signature length (65 bytes: r + s + v)
@@ -914,7 +918,7 @@ func TestConcurrentWebhooks(t *testing.T) {
 
 	for i := 0; i < numRequests; i++ {
 		domain := fmt.Sprintf("test-domain-%d", i)
-		pendingRequests[domain] = &PendingRequest{
+		server.pendingRequests[domain] = &PendingRequest{
 			RequestID:  domain,
 			CreatedAt:  time.Now(),
 			ResultChan: make(chan *WebhookPayload, 1),
@@ -940,7 +944,7 @@ func TestConcurrentWebhooks(t *testing.T) {
 			req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 			w := httptest.NewRecorder()
 
-			handleWebhook(w, req)
+			server.handleWebhook(w, req)
 
 			if w.Code != http.StatusOK {
 				t.Errorf("webhook %d: status = %d, want %d", idx, w.Code, http.StatusOK)
@@ -953,7 +957,7 @@ func TestConcurrentWebhooks(t *testing.T) {
 	// Verify all requests received their webhooks
 	for i := 0; i < numRequests; i++ {
 		domain := fmt.Sprintf("test-domain-%d", i)
-		pending := pendingRequests[domain]
+		pending := server.pendingRequests[domain]
 
 		select {
 		case result := <-pending.ResultChan:
@@ -985,7 +989,7 @@ func BenchmarkHandleWebhook(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 		w := httptest.NewRecorder()
-		handleWebhook(w, req)
+		server.handleWebhook(w, req)
 	}
 }
 
@@ -995,7 +999,7 @@ func BenchmarkEncodeBase64URL(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = encodeBase64URL(data)
+		_ = base64.RawURLEncoding.EncodeToString(data)
 	}
 }
 
@@ -1054,7 +1058,7 @@ func TestTriggerWorkflow(t *testing.T) {
 	defer mockServer.Close()
 
 	// Override gateway URL to use mock server
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	tests := []struct {
 		name        string
@@ -1085,15 +1089,15 @@ func TestTriggerWorkflow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := triggerWorkflow(tt.op, tt.domain, tt.tholdPrice, tt.tholdHash, tt.callbackURL)
+			err := server.triggerWorkflow(tt.op, tt.domain, tt.tholdPrice, tt.tholdHash, tt.callbackURL)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("triggerWorkflow() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("server.triggerWorkflow() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-// TestTriggerWorkflowErrors tests error cases for triggerWorkflow
+// TestTriggerWorkflowErrors tests error cases for server.triggerWorkflow
 func TestTriggerWorkflowErrors(t *testing.T) {
 	setupTestEnv(t)
 	loadConfig()
@@ -1130,10 +1134,10 @@ func TestTriggerWorkflowErrors(t *testing.T) {
 			mockServer := tt.setupMock()
 			defer mockServer.Close()
 
-			GATEWAY_URL = mockServer.URL
+			server.config.GatewayURL = mockServer.URL
 
 			tholdPrice := 100.0
-			err := triggerWorkflow("create", "test-domain", &tholdPrice, nil, "http://example.com/webhook")
+			err := server.triggerWorkflow("create", "test-domain", &tholdPrice, nil, "http://example.com/webhook")
 			if err == nil {
 				t.Error("expected error but got nil")
 			}
@@ -1144,7 +1148,7 @@ func TestTriggerWorkflowErrors(t *testing.T) {
 	}
 }
 
-// TestComputeRecoveryIDEdgeCases tests edge cases in recovery ID computation
+// TestComputeRecoveryIDEdgeCases tests edge cases in recovery ID computation using ethsign package
 func TestComputeRecoveryIDEdgeCases(t *testing.T) {
 	// Generate test key
 	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
@@ -1159,9 +1163,9 @@ func TestComputeRecoveryIDEdgeCases(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		signature, err := signEthereumMessage(privKey, msg)
+		signature, err := ethsign.SignEthereumMessage(privKey, msg)
 		if err != nil {
-			t.Errorf("signEthereumMessage failed for message %q: %v", msg, err)
+			t.Errorf("SignEthereumMessage failed for message %q: %v", msg, err)
 			continue
 		}
 
@@ -1185,24 +1189,24 @@ func TestHandleCreateTimeout(t *testing.T) {
 	resetGlobals()
 
 	// Set very short timeout for testing
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 100 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+	oldTimeout := server.config.BlockTimeout
+	server.config.BlockTimeout = 100 * time.Millisecond
+	defer func() { server.config.BlockTimeout = oldTimeout }()
 
-	// Mock the triggerWorkflow to avoid actual HTTP calls
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow to avoid actual HTTP calls
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	req := httptest.NewRequest("GET", "/api/quote?th=100", nil)
 	w := httptest.NewRecorder()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 
@@ -1226,12 +1230,12 @@ func TestHandleCheckMaxPending(t *testing.T) {
 	resetGlobals()
 
 	// Set low limit
-	MAX_PENDING = 2
+	server.config.MaxPending = 2
 
 	// Fill pending requests
-	for i := 0; i < MAX_PENDING; i++ {
+	for i := 0; i < server.config.MaxPending; i++ {
 		domain := fmt.Sprintf("test-%d", i)
-		pendingRequests[domain] = &PendingRequest{
+		server.pendingRequests[domain] = &PendingRequest{
 			RequestID:  domain,
 			CreatedAt:  time.Now(),
 			ResultChan: make(chan *WebhookPayload, 1),
@@ -1248,7 +1252,7 @@ func TestHandleCheckMaxPending(t *testing.T) {
 	req := httptest.NewRequest("POST", "/check", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -1257,7 +1261,7 @@ func TestHandleCheckMaxPending(t *testing.T) {
 
 	// Cleanup
 	resetGlobals()
-	MAX_PENDING = 1000
+	server.config.MaxPending = 1000
 }
 
 // TestHandleCheckTimeout tests check endpoint timeout
@@ -1266,19 +1270,19 @@ func TestHandleCheckTimeout(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 100 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+	oldTimeout := server.config.BlockTimeout
+	server.config.BlockTimeout = 100 * time.Millisecond
+	defer func() { server.config.BlockTimeout = oldTimeout }()
 
-	// Mock the triggerWorkflow
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	checkReq := CheckRequest{
 		Domain:    "test-domain",
@@ -1289,7 +1293,7 @@ func TestHandleCheckTimeout(t *testing.T) {
 	req := httptest.NewRequest("POST", "/check", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1304,15 +1308,15 @@ func TestHandleCheckSuccess(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	// Mock the triggerWorkflow
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	checkReq := CheckRequest{
 		Domain:    "test-check-domain",
@@ -1327,16 +1331,16 @@ func TestHandleCheckSuccess(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 
-		requestsMutex.RLock()
-		pending, exists := pendingRequests["test-check-domain"]
-		requestsMutex.RUnlock()
+		server.requestsMutex.RLock()
+		pending, exists := server.pendingRequests["test-check-domain"]
+		server.requestsMutex.RUnlock()
 
 		if exists {
 			payload := &WebhookPayload{
 				EventType: "check_no_breach",
 				EventID:   "check-event-123",
 				// Full CRE format payload with core-ts PriceContract fields
-				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":95,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100.0}`,
+				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":95,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1345,7 +1349,7 @@ func TestHandleCheckSuccess(t *testing.T) {
 		}
 	}()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1381,12 +1385,12 @@ func TestHandleCreateWorkflowError(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	req := httptest.NewRequest("GET", "/api/quote?th=100", nil)
 	w := httptest.NewRecorder()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 
@@ -1403,7 +1407,7 @@ func TestWebhookParseContentError(t *testing.T) {
 	resetGlobals()
 
 	domain := "test-parse-error"
-	pendingRequests[domain] = &PendingRequest{
+	server.pendingRequests[domain] = &PendingRequest{
 		RequestID:  domain,
 		CreatedAt:  time.Now(),
 		ResultChan: make(chan *WebhookPayload, 1),
@@ -1421,7 +1425,7 @@ func TestWebhookParseContentError(t *testing.T) {
 	req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleWebhook(w, req)
+	server.handleWebhook(w, req)
 
 	resp := w.Result()
 	// Webhook handler should still return 200 even with bad content
@@ -1430,7 +1434,7 @@ func TestWebhookParseContentError(t *testing.T) {
 	}
 
 	// Verify the webhook was still delivered to the pending request
-	pending := pendingRequests[domain]
+	pending := server.pendingRequests[domain]
 	select {
 	case result := <-pending.ResultChan:
 		if result.EventID != "test-event" {
@@ -1454,7 +1458,7 @@ func TestHandleWebhookDuplicateDelivery(t *testing.T) {
 		ResultChan: make(chan *WebhookPayload, 1),
 		Status:     "pending",
 	}
-	pendingRequests[domain] = pending
+	server.pendingRequests[domain] = pending
 
 	payload := WebhookPayload{
 		EventType: "create",
@@ -1477,13 +1481,13 @@ func TestHandleWebhookDuplicateDelivery(t *testing.T) {
 		}
 	}()
 
-	handleWebhook(w1, req1)
+	server.handleWebhook(w1, req1)
 	time.Sleep(50 * time.Millisecond)
 
-	// Send duplicate webhook (same event_id should be ignored by default select in handleWebhook)
+	// Send duplicate webhook (same event_id should be ignored by default select in server.handleWebhook)
 	req2 := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 	w2 := httptest.NewRecorder()
-	handleWebhook(w2, req2)
+	server.handleWebhook(w2, req2)
 	time.Sleep(50 * time.Millisecond)
 
 	// Both should return 200
@@ -1519,7 +1523,7 @@ func TestHandleCheckWorkflowError(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	checkReq := CheckRequest{
 		Domain:    "test-domain",
@@ -1530,7 +1534,7 @@ func TestHandleCheckWorkflowError(t *testing.T) {
 	req := httptest.NewRequest("POST", "/check", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1546,13 +1550,13 @@ func TestHandleCheckBreach(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	// Mock the triggerWorkflow
+	// Mock the server.triggerWorkflow
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	checkReq := CheckRequest{
 		Domain:    "test-breach-domain",
@@ -1567,15 +1571,15 @@ func TestHandleCheckBreach(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 
-		requestsMutex.RLock()
-		pending, exists := pendingRequests["test-breach-domain"]
-		requestsMutex.RUnlock()
+		server.requestsMutex.RLock()
+		pending, exists := server.pendingRequests["test-breach-domain"]
+		server.requestsMutex.RUnlock()
 
 		if exists {
 			payload := &WebhookPayload{
 				EventType: "breach",
 				EventID:   "breach-event-123",
-				Content:   `{"latest_price": 90.5, "thold_price": 100.0, "thold_key": "secret123"}`,
+				Content:   `{"event_type":"breach","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":90,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":"secret123","thold_price":100}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1584,7 +1588,7 @@ func TestHandleCheckBreach(t *testing.T) {
 		}
 	}()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1611,15 +1615,15 @@ func TestHandleCreateSuccess(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	// Mock the triggerWorkflow
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	req := httptest.NewRequest("GET", "/api/quote?th=100.5", nil)
 	w := httptest.NewRecorder()
@@ -1628,18 +1632,18 @@ func TestHandleCreateSuccess(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 
-		requestsMutex.RLock()
+		server.requestsMutex.RLock()
 		// Find the pending request (domain is generated, so we need to iterate)
 		var pending *PendingRequest
 		var domain string
-		for d, p := range pendingRequests {
+		for d, p := range server.pendingRequests {
 			if p.Status == "pending" {
 				pending = p
 				domain = d
 				break
 			}
 		}
-		requestsMutex.RUnlock()
+		server.requestsMutex.RUnlock()
 
 		if pending != nil {
 			payload := &WebhookPayload{
@@ -1647,7 +1651,7 @@ func TestHandleCreateSuccess(t *testing.T) {
 				EventID:   "create-event-123",
 				Tags:      [][]string{{"domain", domain}},
 				// Full CRE format payload with core-ts PriceContract fields
-				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":99,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100.5}`,
+				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":99,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1656,7 +1660,7 @@ func TestHandleCreateSuccess(t *testing.T) {
 		}
 	}()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 
@@ -1685,1035 +1689,5 @@ func TestHandleCreateSuccess(t *testing.T) {
 
 	if _, ok := result["contract_id"]; !ok {
 		t.Error("contract_id not found in response")
-	}
-}
-
-// =============================================================================
-// Tests for /api/evaluate endpoint (NEW)
-// =============================================================================
-
-// TestHandleEvaluateValidation tests input validation for /api/evaluate
-func TestHandleEvaluateValidation(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	tests := []struct {
-		name           string
-		method         string
-		payload        interface{}
-		expectedStatus int
-		expectedBody   string
-	}{
-		{
-			name:           "wrong method GET",
-			method:         "GET",
-			payload:        nil,
-			expectedStatus: http.StatusMethodNotAllowed,
-			expectedBody:   "Method not allowed",
-		},
-		{
-			name:           "wrong method PUT",
-			method:         "PUT",
-			payload:        nil,
-			expectedStatus: http.StatusMethodNotAllowed,
-			expectedBody:   "Method not allowed",
-		},
-		{
-			name:           "OPTIONS preflight",
-			method:         "OPTIONS",
-			payload:        nil,
-			expectedStatus: http.StatusOK,
-			expectedBody:   "",
-		},
-		{
-			name:           "invalid JSON",
-			method:         "POST",
-			payload:        "not json",
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "Invalid JSON",
-		},
-		{
-			name:           "empty thold_hashes array",
-			method:         "POST",
-			payload:        EvaluateRequest{TholdHashes: []string{}},
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "thold_hashes required",
-		},
-		{
-			name:           "nil thold_hashes",
-			method:         "POST",
-			payload:        map[string]interface{}{},
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "thold_hashes required",
-		},
-		{
-			name:   "too many thold_hashes",
-			method: "POST",
-			payload: EvaluateRequest{
-				TholdHashes: make([]string, 101), // 101 > max 100
-			},
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "Maximum 100 thold_hashes",
-		},
-		{
-			name:   "invalid thold_hash length - too short",
-			method: "POST",
-			payload: EvaluateRequest{
-				TholdHashes: []string{"abc123"},
-			},
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "Invalid thold_hash at index 0",
-		},
-		{
-			name:   "invalid thold_hash length - too long",
-			method: "POST",
-			payload: EvaluateRequest{
-				TholdHashes: []string{"1234567890123456789012345678901234567890extra"},
-			},
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "Invalid thold_hash at index 0",
-		},
-		{
-			name:   "mixed valid and invalid hashes",
-			method: "POST",
-			payload: EvaluateRequest{
-				TholdHashes: []string{
-					"1234567890123456789012345678901234567890", // valid
-					"short",                                    // invalid
-				},
-			},
-			expectedStatus: http.StatusBadRequest,
-			expectedBody:   "Invalid thold_hash at index 1",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var body io.Reader
-			if str, ok := tt.payload.(string); ok {
-				body = strings.NewReader(str)
-			} else if tt.payload != nil {
-				jsonData, _ := json.Marshal(tt.payload)
-				body = bytes.NewReader(jsonData)
-			}
-
-			req := httptest.NewRequest(tt.method, "/api/evaluate", body)
-			w := httptest.NewRecorder()
-
-			handleEvaluate(w, req)
-
-			resp := w.Result()
-			if resp.StatusCode != tt.expectedStatus {
-				t.Errorf("status = %d, want %d", resp.StatusCode, tt.expectedStatus)
-			}
-
-			if tt.expectedBody != "" {
-				respBody, _ := io.ReadAll(resp.Body)
-				if !strings.Contains(string(respBody), tt.expectedBody) {
-					t.Errorf("body = %s, want to contain %s", respBody, tt.expectedBody)
-				}
-			}
-		})
-	}
-}
-
-// TestHandleEvaluateMaxPending tests max pending request limit for evaluate endpoint
-func TestHandleEvaluateMaxPending(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	// Set low limit for testing
-	MAX_PENDING = 2
-
-	// Fill pending requests
-	for i := 0; i < MAX_PENDING; i++ {
-		domain := fmt.Sprintf("test-%d", i)
-		pendingRequests[domain] = &PendingRequest{
-			RequestID:  domain,
-			CreatedAt:  time.Now(),
-			ResultChan: make(chan *WebhookPayload, 1),
-			Status:     "pending",
-		}
-	}
-
-	evalReq := EvaluateRequest{
-		TholdHashes: []string{"1234567890123456789012345678901234567890"},
-	}
-	jsonData, _ := json.Marshal(evalReq)
-
-	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-	w := httptest.NewRecorder()
-
-	handleEvaluate(w, req)
-
-	resp := w.Result()
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "Server at capacity") {
-		t.Errorf("body = %s, want 'Server at capacity'", body)
-	}
-
-	// Cleanup
-	resetGlobals()
-	MAX_PENDING = 1000
-}
-
-// TestHandleEvaluateTimeout tests timeout behavior for evaluate endpoint
-func TestHandleEvaluateTimeout(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	// Set very short timeout for testing
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 100 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
-
-	// Mock the triggerEvaluateWorkflow
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"result": "ok"}`))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	evalReq := EvaluateRequest{
-		TholdHashes: []string{
-			"1234567890123456789012345678901234567890",
-			"abcdef1234567890123456789012345678901234",
-		},
-	}
-	jsonData, _ := json.Marshal(evalReq)
-
-	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-	w := httptest.NewRecorder()
-
-	handleEvaluate(w, req)
-
-	resp := w.Result()
-
-	// Should timeout and return 202
-	if resp.StatusCode != http.StatusAccepted {
-		t.Errorf("status = %d, want %d (timeout)", resp.StatusCode, http.StatusAccepted)
-	}
-
-	var syncResp SyncResponse
-	json.NewDecoder(resp.Body).Decode(&syncResp)
-
-	if syncResp.Status != "timeout" {
-		t.Errorf("status = %s, want timeout", syncResp.Status)
-	}
-
-	if syncResp.RequestID == "" {
-		t.Error("request_id should not be empty")
-	}
-
-	if !strings.Contains(syncResp.Message, "/status/") {
-		t.Errorf("message should contain status URL, got: %s", syncResp.Message)
-	}
-}
-
-// TestHandleEvaluateSuccess tests successful evaluate with webhook response
-func TestHandleEvaluateSuccess(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	// Mock the triggerEvaluateWorkflow
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"result": "ok"}`))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	evalReq := EvaluateRequest{
-		TholdHashes: []string{
-			"1234567890123456789012345678901234567890",
-			"abcdef1234567890123456789012345678901234",
-		},
-	}
-	jsonData, _ := json.Marshal(evalReq)
-
-	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-	w := httptest.NewRecorder()
-
-	// Simulate webhook arriving
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-
-		requestsMutex.RLock()
-		var pending *PendingRequest
-		var domain string
-		for d, p := range pendingRequests {
-			if strings.HasPrefix(d, "eval-") && p.Status == "pending" {
-				pending = p
-				domain = d
-				break
-			}
-		}
-		requestsMutex.RUnlock()
-
-		if pending != nil {
-			// Simulate evaluate response from CRE
-			tholdKey := "secret123abc456def789012345678901234567890123456789012345678901234"
-			evalResp := EvaluateQuotesResponse{
-				Results: []QuoteEvaluationResult{
-					{
-						TholdHash:    "1234567890123456789012345678901234567890",
-						Status:       "breached",
-						TholdKey:     &tholdKey,
-						CurrentPrice: 95000.0,
-						TholdPrice:   100000.0,
-					},
-					{
-						TholdHash:    "abcdef1234567890123456789012345678901234",
-						Status:       "active",
-						TholdKey:     nil,
-						CurrentPrice: 95000.0,
-						TholdPrice:   90000.0,
-					},
-				},
-				CurrentPrice: 95000.0,
-				EvaluatedAt:  1700000000,
-			}
-			contentJSON, _ := json.Marshal(evalResp)
-
-			payload := &WebhookPayload{
-				EventType: "evaluate",
-				EventID:   "eval-event-123",
-				Tags:      [][]string{{"domain", domain}},
-				Content:   string(contentJSON),
-			}
-			select {
-			case pending.ResultChan <- payload:
-			default:
-			}
-		}
-	}()
-
-	handleEvaluate(w, req)
-
-	resp := w.Result()
-
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var result EvaluateQuotesResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-
-	// Verify response structure
-	if len(result.Results) != 2 {
-		t.Errorf("results count = %d, want 2", len(result.Results))
-	}
-
-	if result.CurrentPrice != 95000.0 {
-		t.Errorf("current_price = %f, want 95000.0", result.CurrentPrice)
-	}
-
-	if result.EvaluatedAt != 1700000000 {
-		t.Errorf("evaluated_at = %d, want 1700000000", result.EvaluatedAt)
-	}
-
-	// Verify first result (breached)
-	if result.Results[0].Status != "breached" {
-		t.Errorf("results[0].status = %s, want breached", result.Results[0].Status)
-	}
-	if result.Results[0].TholdKey == nil {
-		t.Error("results[0].thold_key should not be nil for breached quote")
-	}
-
-	// Verify second result (active)
-	if result.Results[1].Status != "active" {
-		t.Errorf("results[1].status = %s, want active", result.Results[1].Status)
-	}
-	if result.Results[1].TholdKey != nil {
-		t.Error("results[1].thold_key should be nil for active quote")
-	}
-}
-
-// TestHandleEvaluateWorkflowError tests workflow trigger error for evaluate
-func TestHandleEvaluateWorkflowError(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	// Mock server that returns error
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("internal error"))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	evalReq := EvaluateRequest{
-		TholdHashes: []string{"1234567890123456789012345678901234567890"},
-	}
-	jsonData, _ := json.Marshal(evalReq)
-
-	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-	w := httptest.NewRecorder()
-
-	handleEvaluate(w, req)
-
-	resp := w.Result()
-
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
-	}
-}
-
-// TestHandleEvaluateCORSHeaders tests CORS headers for evaluate endpoint
-func TestHandleEvaluateCORSHeaders(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	// Test OPTIONS preflight
-	req := httptest.NewRequest("OPTIONS", "/api/evaluate", nil)
-	w := httptest.NewRecorder()
-
-	handleEvaluate(w, req)
-
-	resp := w.Result()
-
-	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
-		t.Errorf("Access-Control-Allow-Origin = %s, want *", resp.Header.Get("Access-Control-Allow-Origin"))
-	}
-
-	if !strings.Contains(resp.Header.Get("Access-Control-Allow-Methods"), "POST") {
-		t.Errorf("Access-Control-Allow-Methods should contain POST, got: %s", resp.Header.Get("Access-Control-Allow-Methods"))
-	}
-
-	if !strings.Contains(resp.Header.Get("Access-Control-Allow-Headers"), "Content-Type") {
-		t.Errorf("Access-Control-Allow-Headers should contain Content-Type, got: %s", resp.Header.Get("Access-Control-Allow-Headers"))
-	}
-}
-
-// TestHandleEvaluateWithCallbackURL tests evaluate with optional callback URL
-func TestHandleEvaluateWithCallbackURL(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	// Track what was sent to the mock server
-	var receivedPayload map[string]interface{}
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var rpcReq map[string]interface{}
-		json.Unmarshal(body, &rpcReq)
-		if params, ok := rpcReq["params"].(map[string]interface{}); ok {
-			if input, ok := params["input"].(map[string]interface{}); ok {
-				receivedPayload = input
-			}
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"result": "ok"}`))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	// Set short timeout
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 50 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
-
-	callbackURL := "http://example.com/my-callback"
-	evalReq := EvaluateRequest{
-		TholdHashes: []string{"1234567890123456789012345678901234567890"},
-		CallbackURL: &callbackURL,
-	}
-	jsonData, _ := json.Marshal(evalReq)
-
-	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-	w := httptest.NewRecorder()
-
-	handleEvaluate(w, req)
-
-	// Verify action was set to "evaluate" in the request
-	if receivedPayload != nil {
-		if action, ok := receivedPayload["action"].(string); !ok || action != "evaluate" {
-			t.Errorf("action = %v, want 'evaluate'", receivedPayload["action"])
-		}
-		if hashes, ok := receivedPayload["thold_hashes"].([]interface{}); !ok || len(hashes) != 1 {
-			t.Errorf("thold_hashes not properly sent")
-		}
-	}
-}
-
-// TestHandleEvaluateMalformedWebhookResponse tests handling of malformed webhook response
-func TestHandleEvaluateMalformedWebhookResponse(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"result": "ok"}`))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	evalReq := EvaluateRequest{
-		TholdHashes: []string{"1234567890123456789012345678901234567890"},
-	}
-	jsonData, _ := json.Marshal(evalReq)
-
-	req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-	w := httptest.NewRecorder()
-
-	// Simulate webhook with malformed content
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-
-		requestsMutex.RLock()
-		var pending *PendingRequest
-		var domain string
-		for d, p := range pendingRequests {
-			if strings.HasPrefix(d, "eval-") && p.Status == "pending" {
-				pending = p
-				domain = d
-				break
-			}
-		}
-		requestsMutex.RUnlock()
-
-		if pending != nil {
-			payload := &WebhookPayload{
-				EventType: "evaluate",
-				EventID:   "eval-event-123",
-				Tags:      [][]string{{"domain", domain}},
-				Content:   `{invalid json content}`,
-			}
-			select {
-			case pending.ResultChan <- payload:
-			default:
-			}
-		}
-	}()
-
-	handleEvaluate(w, req)
-
-	resp := w.Result()
-
-	// Should still return 200 with raw content fallback
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
-
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-
-	// Should have "raw" field with original content
-	if _, ok := result["raw"]; !ok {
-		t.Error("response should contain 'raw' field for malformed content")
-	}
-}
-
-// =============================================================================
-// Tests for triggerEvaluateWorkflow
-// =============================================================================
-
-func TestTriggerEvaluateWorkflow(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-
-	var receivedBody map[string]interface{}
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		json.Unmarshal(body, &receivedBody)
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"jsonrpc": "2.0",
-			"id":      receivedBody["id"],
-			"result":  "success",
-		})
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	err := triggerEvaluateWorkflow("test-domain", []string{"hash1", "hash2"}, "http://callback.example.com")
-	if err != nil {
-		t.Fatalf("triggerEvaluateWorkflow() error = %v", err)
-	}
-
-	// Verify request structure
-	if receivedBody["jsonrpc"] != "2.0" {
-		t.Errorf("jsonrpc = %v, want 2.0", receivedBody["jsonrpc"])
-	}
-	if receivedBody["method"] != "workflows.execute" {
-		t.Errorf("method = %v, want workflows.execute", receivedBody["method"])
-	}
-
-	params, ok := receivedBody["params"].(map[string]interface{})
-	if !ok {
-		t.Fatal("params not found in request")
-	}
-
-	input, ok := params["input"].(map[string]interface{})
-	if !ok {
-		t.Fatal("input not found in params")
-	}
-
-	if input["action"] != "evaluate" {
-		t.Errorf("action = %v, want evaluate", input["action"])
-	}
-	if input["domain"] != "test-domain" {
-		t.Errorf("domain = %v, want test-domain", input["domain"])
-	}
-	if input["callback_url"] != "http://callback.example.com" {
-		t.Errorf("callback_url = %v, want http://callback.example.com", input["callback_url"])
-	}
-
-	hashes, ok := input["thold_hashes"].([]interface{})
-	if !ok || len(hashes) != 2 {
-		t.Errorf("thold_hashes = %v, want [hash1, hash2]", input["thold_hashes"])
-	}
-}
-
-func TestTriggerEvaluateWorkflowError(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("server error"))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	err := triggerEvaluateWorkflow("test-domain", []string{"hash1"}, "http://callback.example.com")
-	if err == nil {
-		t.Error("expected error but got nil")
-	}
-	if !strings.Contains(err.Error(), "non-success status") {
-		t.Errorf("error = %v, want to contain 'non-success status'", err)
-	}
-}
-
-// =============================================================================
-// Tests for QuoteEvaluationResult and EvaluateQuotesResponse types
-// =============================================================================
-
-func TestQuoteEvaluationResultJSON(t *testing.T) {
-	tholdKey := "secretkey123"
-	errMsg := "some error"
-
-	tests := []struct {
-		name   string
-		result QuoteEvaluationResult
-		check  func(t *testing.T, data map[string]interface{})
-	}{
-		{
-			name: "breached with key",
-			result: QuoteEvaluationResult{
-				TholdHash:    "1234567890123456789012345678901234567890",
-				Status:       "breached",
-				TholdKey:     &tholdKey,
-				CurrentPrice: 95000.0,
-				TholdPrice:   100000.0,
-			},
-			check: func(t *testing.T, data map[string]interface{}) {
-				if data["status"] != "breached" {
-					t.Errorf("status = %v, want breached", data["status"])
-				}
-				if data["thold_key"] != tholdKey {
-					t.Errorf("thold_key = %v, want %s", data["thold_key"], tholdKey)
-				}
-				if data["current_price"].(float64) != 95000.0 {
-					t.Errorf("current_price = %v, want 95000.0", data["current_price"])
-				}
-			},
-		},
-		{
-			name: "active without key",
-			result: QuoteEvaluationResult{
-				TholdHash:    "1234567890123456789012345678901234567890",
-				Status:       "active",
-				TholdKey:     nil,
-				CurrentPrice: 95000.0,
-				TholdPrice:   90000.0,
-			},
-			check: func(t *testing.T, data map[string]interface{}) {
-				if data["status"] != "active" {
-					t.Errorf("status = %v, want active", data["status"])
-				}
-				if data["thold_key"] != nil {
-					t.Errorf("thold_key = %v, want nil", data["thold_key"])
-				}
-			},
-		},
-		{
-			name: "error result",
-			result: QuoteEvaluationResult{
-				TholdHash:    "1234567890123456789012345678901234567890",
-				Status:       "error",
-				CurrentPrice: 95000.0,
-				Error:        &errMsg,
-			},
-			check: func(t *testing.T, data map[string]interface{}) {
-				if data["status"] != "error" {
-					t.Errorf("status = %v, want error", data["status"])
-				}
-				if data["error"] != errMsg {
-					t.Errorf("error = %v, want %s", data["error"], errMsg)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			jsonData, err := json.Marshal(tt.result)
-			if err != nil {
-				t.Fatalf("failed to marshal: %v", err)
-			}
-
-			var decoded map[string]interface{}
-			if err := json.Unmarshal(jsonData, &decoded); err != nil {
-				t.Fatalf("failed to unmarshal: %v", err)
-			}
-
-			tt.check(t, decoded)
-		})
-	}
-}
-
-func TestEvaluateQuotesResponseJSON(t *testing.T) {
-	tholdKey := "secret123"
-	resp := EvaluateQuotesResponse{
-		Results: []QuoteEvaluationResult{
-			{
-				TholdHash:    "hash1",
-				Status:       "breached",
-				TholdKey:     &tholdKey,
-				CurrentPrice: 95000.0,
-				TholdPrice:   100000.0,
-			},
-			{
-				TholdHash:    "hash2",
-				Status:       "active",
-				CurrentPrice: 95000.0,
-				TholdPrice:   90000.0,
-			},
-		},
-		CurrentPrice: 95000.0,
-		EvaluatedAt:  1700000000,
-	}
-
-	jsonData, err := json.Marshal(resp)
-	if err != nil {
-		t.Fatalf("failed to marshal: %v", err)
-	}
-
-	var decoded EvaluateQuotesResponse
-	if err := json.Unmarshal(jsonData, &decoded); err != nil {
-		t.Fatalf("failed to unmarshal: %v", err)
-	}
-
-	if len(decoded.Results) != 2 {
-		t.Errorf("results count = %d, want 2", len(decoded.Results))
-	}
-	if decoded.CurrentPrice != 95000.0 {
-		t.Errorf("current_price = %f, want 95000.0", decoded.CurrentPrice)
-	}
-	if decoded.EvaluatedAt != 1700000000 {
-		t.Errorf("evaluated_at = %d, want 1700000000", decoded.EvaluatedAt)
-	}
-}
-
-// =============================================================================
-// Tests for EvaluateRequest validation
-// =============================================================================
-
-func TestEvaluateRequestValidation(t *testing.T) {
-	tests := []struct {
-		name    string
-		request EvaluateRequest
-		wantErr bool
-		errMsg  string
-	}{
-		{
-			name: "valid single hash",
-			request: EvaluateRequest{
-				TholdHashes: []string{"1234567890123456789012345678901234567890"},
-			},
-			wantErr: false,
-		},
-		{
-			name: "valid multiple hashes",
-			request: EvaluateRequest{
-				TholdHashes: []string{
-					"1234567890123456789012345678901234567890",
-					"abcdef1234567890123456789012345678901234",
-					"fedcba0987654321fedcba0987654321fedcba09",
-				},
-			},
-			wantErr: false,
-		},
-		{
-			name: "valid with callback URL",
-			request: EvaluateRequest{
-				TholdHashes: []string{"1234567890123456789012345678901234567890"},
-				CallbackURL: func() *string { s := "http://example.com/callback"; return &s }(),
-			},
-			wantErr: false,
-		},
-		{
-			name: "empty hashes",
-			request: EvaluateRequest{
-				TholdHashes: []string{},
-			},
-			wantErr: true,
-			errMsg:  "thold_hashes required",
-		},
-		{
-			name: "nil hashes",
-			request: EvaluateRequest{
-				TholdHashes: nil,
-			},
-			wantErr: true,
-			errMsg:  "thold_hashes required",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Validate by checking length
-			hasErr := len(tt.request.TholdHashes) == 0
-			if hasErr != tt.wantErr {
-				t.Errorf("validation error = %v, wantErr %v", hasErr, tt.wantErr)
-			}
-		})
-	}
-}
-
-// =============================================================================
-// Tests for transformToPriceContract
-// =============================================================================
-
-func TestTransformToPriceContract(t *testing.T) {
-	tholdKey := "secret123"
-
-	tests := []struct {
-		name     string
-		input    CREPriceEvent
-		expected PriceContractResponse
-	}{
-		{
-			name: "full transformation",
-			input: CREPriceEvent{
-				ChainNetwork: "mutiny",
-				OraclePubkey: "abc123pubkey",
-				BasePrice:    100000,
-				BaseStamp:    1700000000,
-				CommitHash:   "commit123",
-				ContractID:   "contract456",
-				OracleSig:    "sig789",
-				TholdHash:    "thold123",
-				TholdKey:     &tholdKey,
-				TholdPrice:   95000.0,
-			},
-			expected: PriceContractResponse{
-				ChainNetwork: "mutiny",
-				OraclePubkey: "abc123pubkey",
-				BasePrice:    100000,
-				BaseStamp:    1700000000,
-				CommitHash:   "commit123",
-				ContractID:   "contract456",
-				OracleSig:    "sig789",
-				TholdHash:    "thold123",
-				TholdKey:     &tholdKey,
-				TholdPrice:   95000,
-			},
-		},
-		{
-			name: "nil thold_key",
-			input: CREPriceEvent{
-				ChainNetwork: "signet",
-				OraclePubkey: "pubkey456",
-				BasePrice:    50000,
-				BaseStamp:    1699999999,
-				CommitHash:   "commit456",
-				ContractID:   "contract789",
-				OracleSig:    "sig123",
-				TholdHash:    "thold456",
-				TholdKey:     nil,
-				TholdPrice:   60000.0,
-			},
-			expected: PriceContractResponse{
-				ChainNetwork: "signet",
-				OraclePubkey: "pubkey456",
-				BasePrice:    50000,
-				BaseStamp:    1699999999,
-				CommitHash:   "commit456",
-				ContractID:   "contract789",
-				OracleSig:    "sig123",
-				TholdHash:    "thold456",
-				TholdKey:     nil,
-				TholdPrice:   60000,
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := transformToPriceContract(&tt.input)
-
-			if result.ChainNetwork != tt.expected.ChainNetwork {
-				t.Errorf("ChainNetwork = %s, want %s", result.ChainNetwork, tt.expected.ChainNetwork)
-			}
-			if result.OraclePubkey != tt.expected.OraclePubkey {
-				t.Errorf("OraclePubkey = %s, want %s", result.OraclePubkey, tt.expected.OraclePubkey)
-			}
-			if result.BasePrice != tt.expected.BasePrice {
-				t.Errorf("BasePrice = %d, want %d", result.BasePrice, tt.expected.BasePrice)
-			}
-			if result.BaseStamp != tt.expected.BaseStamp {
-				t.Errorf("BaseStamp = %d, want %d", result.BaseStamp, tt.expected.BaseStamp)
-			}
-			if result.CommitHash != tt.expected.CommitHash {
-				t.Errorf("CommitHash = %s, want %s", result.CommitHash, tt.expected.CommitHash)
-			}
-			if result.ContractID != tt.expected.ContractID {
-				t.Errorf("ContractID = %s, want %s", result.ContractID, tt.expected.ContractID)
-			}
-			if result.OracleSig != tt.expected.OracleSig {
-				t.Errorf("OracleSig = %s, want %s", result.OracleSig, tt.expected.OracleSig)
-			}
-			if result.TholdHash != tt.expected.TholdHash {
-				t.Errorf("TholdHash = %s, want %s", result.TholdHash, tt.expected.TholdHash)
-			}
-			if result.TholdPrice != tt.expected.TholdPrice {
-				t.Errorf("TholdPrice = %d, want %d", result.TholdPrice, tt.expected.TholdPrice)
-			}
-
-			// Check TholdKey pointer
-			if (result.TholdKey == nil) != (tt.expected.TholdKey == nil) {
-				t.Errorf("TholdKey nil mismatch")
-			}
-			if result.TholdKey != nil && tt.expected.TholdKey != nil {
-				if *result.TholdKey != *tt.expected.TholdKey {
-					t.Errorf("TholdKey = %s, want %s", *result.TholdKey, *tt.expected.TholdKey)
-				}
-			}
-		})
-	}
-}
-
-// =============================================================================
-// Concurrent tests for evaluate endpoint
-// =============================================================================
-
-func TestConcurrentEvaluateRequests(t *testing.T) {
-	setupTestEnv(t)
-	loadConfig()
-	resetGlobals()
-
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"result": "ok"}`))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	// Set short timeout
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 100 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
-
-	numRequests := 5
-	var wg sync.WaitGroup
-
-	for i := 0; i < numRequests; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-
-			evalReq := EvaluateRequest{
-				TholdHashes: []string{
-					fmt.Sprintf("%040d", idx), // Unique 40-char hash
-				},
-			}
-			jsonData, _ := json.Marshal(evalReq)
-
-			req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-			w := httptest.NewRecorder()
-
-			handleEvaluate(w, req)
-
-			// All should get timeout response (202) since no webhook arrives
-			if w.Code != http.StatusAccepted {
-				t.Errorf("request %d: status = %d, want %d", idx, w.Code, http.StatusAccepted)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-// =============================================================================
-// Benchmark tests for evaluate endpoint
-// =============================================================================
-
-func BenchmarkHandleEvaluateValidation(b *testing.B) {
-	setupTestEnv(b)
-	loadConfig()
-	resetGlobals()
-
-	evalReq := EvaluateRequest{
-		TholdHashes: []string{
-			"1234567890123456789012345678901234567890",
-			"abcdef1234567890123456789012345678901234",
-			"fedcba0987654321fedcba0987654321fedcba09",
-		},
-	}
-	jsonData, _ := json.Marshal(evalReq)
-
-	// Mock server that always returns OK
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"result": "ok"}`))
-	}))
-	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-
-	// Very short timeout to minimize benchmark time
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 1 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		resetGlobals()
-		req := httptest.NewRequest("POST", "/api/evaluate", bytes.NewReader(jsonData))
-		w := httptest.NewRecorder()
-		handleEvaluate(w, req)
-	}
-}
-
-func BenchmarkEvaluateQuotesResponseSerialization(b *testing.B) {
-	tholdKey := "secret123"
-	resp := EvaluateQuotesResponse{
-		Results: []QuoteEvaluationResult{
-			{TholdHash: "hash1", Status: "breached", TholdKey: &tholdKey, CurrentPrice: 95000.0, TholdPrice: 100000.0},
-			{TholdHash: "hash2", Status: "active", CurrentPrice: 95000.0, TholdPrice: 90000.0},
-			{TholdHash: "hash3", Status: "breached", TholdKey: &tholdKey, CurrentPrice: 95000.0, TholdPrice: 85000.0},
-		},
-		CurrentPrice: 95000.0,
-		EvaluatedAt:  1700000000,
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = json.Marshal(resp)
 	}
 }

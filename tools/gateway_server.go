@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,36 +27,49 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/time/rate"
 )
 
-// Configuration - loaded from environment variables
-var (
-	WORKFLOW_ID      string
-	GATEWAY_URL      string
-	AUTHORIZED_KEY   string
-	CALLBACK_URL     string
-	BLOCK_TIMEOUT    time.Duration
-	CLEANUP_INTERVAL time.Duration
-	MAX_PENDING      int // Maximum number of pending requests to prevent memory exhaustion
-)
+// GatewayConfig holds all gateway server configuration
+type GatewayConfig struct {
+	WorkflowID      string
+	GatewayURL      string
+	AuthorizedKey   string
+	CallbackURL     string
+	BlockTimeout    time.Duration
+	CleanupInterval time.Duration
+	MaxPending      int
+
+	// Rate limiting configuration
+	WebhookRateLimit  rate.Limit // requests per second
+	WebhookBurstLimit int        // burst capacity
+}
+
+// GatewayServer encapsulates all server state
+type GatewayServer struct {
+	config          *GatewayConfig
+	privateKey      *ecdsa.PrivateKey
+	logger          *zap.Logger
+	pendingRequests map[string]*PendingRequest
+	requestsMutex   sync.RWMutex
+	shutdownChan    chan struct{}
+	webhookLimiter  *rate.Limiter
+}
 
 // Request tracking
 type PendingRequest struct {
-	RequestID   string
-	CreatedAt   time.Time
-	ResultChan  chan *WebhookPayload
-	Status      string // "pending", "completed", "timeout"
-	Result      *WebhookPayload
-	TimedOut    bool
+	RequestID  string
+	CreatedAt  time.Time
+	ResultChan chan *WebhookPayload
+	Status     string // "pending", "completed", "timeout"
+	Result     *WebhookPayload
+	TimedOut   bool
 }
 
+// Global server instance (initialized in init)
 var (
-	pendingRequests = make(map[string]*PendingRequest)
-	requestsMutex   sync.RWMutex
-	privateKey      *ecdsa.PrivateKey
-	logger          *zap.Logger
-	// shutdownChan signals background goroutines to terminate during graceful shutdown
-	shutdownChan = make(chan struct{})
+	server *GatewayServer
+	logger *zap.Logger
 )
 
 // Prometheus metrics
@@ -129,6 +143,14 @@ var (
 			Help: "Status of dependencies (1=up, 0.5=degraded, 0=down)",
 		},
 		[]string{"dependency"},
+	)
+
+	rateLimitRejected = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_rate_limit_rejected_total",
+			Help: "Total number of requests rejected due to rate limiting",
+		},
+		[]string{"endpoint"},
 	)
 )
 
@@ -211,7 +233,8 @@ func init() {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	loadConfig()
+	// Load configuration into struct
+	config := loadConfig()
 
 	// Load private key from environment variable
 	privateKeyHex := os.Getenv("DUCAT_PRIVATE_KEY")
@@ -225,24 +248,36 @@ func init() {
 		logger.Fatal("Failed to decode private key", zap.Error(err))
 	}
 
-	privateKey, err = crypto.ToECDSA(privKeyBytes)
+	privateKey, err := crypto.ToECDSA(privKeyBytes)
 	if err != nil {
 		logger.Fatal("Failed to parse private key", zap.Error(err))
 	}
 
+	// Initialize server with config
+	server = &GatewayServer{
+		config:          config,
+		privateKey:      privateKey,
+		logger:          logger,
+		pendingRequests: make(map[string]*PendingRequest),
+		shutdownChan:    make(chan struct{}),
+		webhookLimiter:  rate.NewLimiter(config.WebhookRateLimit, config.WebhookBurstLimit),
+	}
+
 	logger.Info("Gateway server initialized",
-		zap.String("authorized_key", AUTHORIZED_KEY),
-		zap.String("callback_url", CALLBACK_URL),
-		zap.Int("max_pending", MAX_PENDING),
-		zap.Duration("block_timeout", BLOCK_TIMEOUT),
-		zap.String("workflow_id", WORKFLOW_ID),
+		zap.String("authorized_key", config.AuthorizedKey),
+		zap.String("callback_url", config.CallbackURL),
+		zap.Int("max_pending", config.MaxPending),
+		zap.Duration("block_timeout", config.BlockTimeout),
+		zap.String("workflow_id", config.WorkflowID),
+		zap.Float64("webhook_rate_limit", float64(config.WebhookRateLimit)),
+		zap.Int("webhook_burst_limit", config.WebhookBurstLimit),
 	)
 
 	// Start cleanup goroutine
-	go cleanupOldRequests()
+	go server.cleanupOldRequests()
 }
 
-func loadConfig() {
+func loadConfig() *GatewayConfig {
 	// Use basic log for config errors since logger might not be initialized yet
 	logFatal := func(msg string, args ...interface{}) {
 		if logger != nil {
@@ -260,69 +295,95 @@ func loadConfig() {
 		}
 	}
 
+	config := &GatewayConfig{}
+
 	// Required configuration
-	WORKFLOW_ID = os.Getenv("CRE_WORKFLOW_ID")
-	if WORKFLOW_ID == "" {
+	config.WorkflowID = os.Getenv("CRE_WORKFLOW_ID")
+	if config.WorkflowID == "" {
 		logFatal("CRE_WORKFLOW_ID environment variable not set")
 	}
 
-	GATEWAY_URL = os.Getenv("CRE_GATEWAY_URL")
-	if GATEWAY_URL == "" {
-		GATEWAY_URL = "https://01.gateway.zone-a.cre.chain.link" // Default
-		logWarn("CRE_GATEWAY_URL not set, using default: " + GATEWAY_URL)
+	config.GatewayURL = os.Getenv("CRE_GATEWAY_URL")
+	if config.GatewayURL == "" {
+		config.GatewayURL = "https://01.gateway.zone-a.cre.chain.link" // Default
+		logWarn("CRE_GATEWAY_URL not set, using default: " + config.GatewayURL)
 	}
 
-	AUTHORIZED_KEY = os.Getenv("DUCAT_AUTHORIZED_KEY")
-	if AUTHORIZED_KEY == "" {
+	config.AuthorizedKey = os.Getenv("DUCAT_AUTHORIZED_KEY")
+	if config.AuthorizedKey == "" {
 		logFatal("DUCAT_AUTHORIZED_KEY environment variable not set")
 	}
 
-	CALLBACK_URL = os.Getenv("GATEWAY_CALLBACK_URL")
-	if CALLBACK_URL == "" {
+	config.CallbackURL = os.Getenv("GATEWAY_CALLBACK_URL")
+	if config.CallbackURL == "" {
 		logFatal("GATEWAY_CALLBACK_URL environment variable not set")
 	}
 
 	// Optional configuration with defaults
 	blockTimeoutStr := os.Getenv("BLOCK_TIMEOUT_SECONDS")
 	if blockTimeoutStr == "" {
-		BLOCK_TIMEOUT = 60 * time.Second
+		config.BlockTimeout = 60 * time.Second
 	} else {
 		var seconds int
 		if _, err := fmt.Sscanf(blockTimeoutStr, "%d", &seconds); err != nil {
 			logFatal("Invalid BLOCK_TIMEOUT_SECONDS: %v", err)
 		}
-		BLOCK_TIMEOUT = time.Duration(seconds) * time.Second
+		config.BlockTimeout = time.Duration(seconds) * time.Second
 	}
 
 	cleanupIntervalStr := os.Getenv("CLEANUP_INTERVAL_SECONDS")
 	if cleanupIntervalStr == "" {
-		CLEANUP_INTERVAL = 2 * time.Minute // More aggressive cleanup (was 5 minutes)
+		config.CleanupInterval = 2 * time.Minute
 	} else {
 		var seconds int
 		if _, err := fmt.Sscanf(cleanupIntervalStr, "%d", &seconds); err != nil {
 			logFatal("Invalid CLEANUP_INTERVAL_SECONDS: %v", err)
 		}
-		CLEANUP_INTERVAL = time.Duration(seconds) * time.Second
+		config.CleanupInterval = time.Duration(seconds) * time.Second
 	}
 
 	maxPendingStr := os.Getenv("MAX_PENDING_REQUESTS")
 	if maxPendingStr == "" {
-		MAX_PENDING = 1000 // Default: allow up to 1000 concurrent pending requests
+		config.MaxPending = 1000
 	} else {
-		if _, err := fmt.Sscanf(maxPendingStr, "%d", &MAX_PENDING); err != nil {
+		if _, err := fmt.Sscanf(maxPendingStr, "%d", &config.MaxPending); err != nil {
 			logFatal("Invalid MAX_PENDING_REQUESTS: %v", err)
 		}
 	}
+
+	// Rate limiting configuration
+	// Default: 100 requests/second with burst of 200
+	webhookRateLimitStr := os.Getenv("WEBHOOK_RATE_LIMIT")
+	if webhookRateLimitStr == "" {
+		config.WebhookRateLimit = 100
+	} else {
+		var rateLimit float64
+		if _, err := fmt.Sscanf(webhookRateLimitStr, "%f", &rateLimit); err != nil {
+			logFatal("Invalid WEBHOOK_RATE_LIMIT: %v", err)
+		}
+		config.WebhookRateLimit = rate.Limit(rateLimit)
+	}
+
+	webhookBurstStr := os.Getenv("WEBHOOK_BURST_LIMIT")
+	if webhookBurstStr == "" {
+		config.WebhookBurstLimit = 200
+	} else {
+		if _, err := fmt.Sscanf(webhookBurstStr, "%d", &config.WebhookBurstLimit); err != nil {
+			logFatal("Invalid WEBHOOK_BURST_LIMIT: %v", err)
+		}
+	}
+
+	return config
 }
 
 func main() {
 	defer logger.Sync()
 
 	// Wrap handlers with metrics middleware
-	http.Handle("/api/quote", metricsMiddleware("create", http.HandlerFunc(handleCreate)))
-	http.Handle("/webhook/ducat", metricsMiddleware("webhook", http.HandlerFunc(handleWebhook)))
+	http.Handle("/api/quote", metricsMiddleware("create", http.HandlerFunc(server.handleCreate)))
+	http.Handle("/webhook/ducat", metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook))))
 	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/readiness", handleReadiness)
+	http.HandleFunc("/readiness", server.handleReadiness)
 	http.Handle("/metrics", promhttp.Handler())
 
 	port := os.Getenv("PORT")
@@ -333,8 +394,8 @@ func main() {
 
 	logger.Info("DUCAT Blocking Gateway Server starting",
 		zap.String("port", port),
-		zap.Duration("block_timeout", BLOCK_TIMEOUT),
-		zap.Int("max_pending", MAX_PENDING),
+		zap.Duration("block_timeout", server.config.BlockTimeout),
+		zap.Int("max_pending", server.config.MaxPending),
 	)
 
 	logger.Info("Endpoints registered",
@@ -348,10 +409,10 @@ func main() {
 	)
 
 	// Create HTTP server for graceful shutdown
-	server := &http.Server{
+	httpServer := &http.Server{
 		Addr:         port,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: BLOCK_TIMEOUT + 10*time.Second, // Allow for blocking requests
+		WriteTimeout: server.config.BlockTimeout + 10*time.Second, // Allow for blocking requests
 		IdleTimeout:  120 * time.Second,
 	}
 
@@ -360,7 +421,7 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Fatal("Server failed", zap.Error(err))
 		}
 		close(serverDone)
@@ -374,14 +435,14 @@ func main() {
 	logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
 
 	// Signal cleanup goroutine to stop
-	close(shutdownChan)
+	close(server.shutdownChan)
 
 	// Create shutdown context with timeout
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// Gracefully shutdown HTTP server
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Server shutdown error", zap.Error(err))
 	}
 
@@ -406,6 +467,23 @@ func metricsMiddleware(endpoint string, next http.Handler) http.Handler {
 
 		httpRequestsTotal.WithLabelValues(endpoint, r.Method, status).Inc()
 		httpRequestDuration.WithLabelValues(endpoint, r.Method).Observe(duration)
+	})
+}
+
+// rateLimitMiddleware applies token bucket rate limiting to protect against DoS attacks.
+// Returns 429 Too Many Requests if the rate limit is exceeded.
+func (s *GatewayServer) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.webhookLimiter.Allow() {
+			rateLimitRejected.WithLabelValues("webhook").Inc()
+			s.logger.Warn("Rate limit exceeded",
+				zap.String("remote_addr", r.RemoteAddr),
+				zap.String("endpoint", r.URL.Path),
+			)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -436,7 +514,7 @@ func (rw *responseWriter) WriteHeader(code int) {
 //  - 405: method not allowed (only GET and OPTIONS supported).
 //  - 500: failure to trigger the CRE workflow.
 //  - 503: server at capacity (too many pending requests).
-func handleCreate(w http.ResponseWriter, r *http.Request) {
+func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Set CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -489,45 +567,45 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we've hit the max pending requests limit
-	requestsMutex.Lock()
-	currentPending := len(pendingRequests)
-	if currentPending >= MAX_PENDING {
-		requestsMutex.Unlock()
-		logger.Warn("Max pending requests reached, rejecting CREATE request",
+	s.requestsMutex.Lock()
+	currentPending := len(s.pendingRequests)
+	if currentPending >= s.config.MaxPending {
+		s.requestsMutex.Unlock()
+		s.logger.Warn("Max pending requests reached, rejecting CREATE request",
 			zap.Int("current_pending", currentPending),
-			zap.Int("max_pending", MAX_PENDING),
+			zap.Int("max_pending", s.config.MaxPending),
 		)
 		http.Error(w, "Server at capacity, please retry later", http.StatusServiceUnavailable)
 		return
 	}
-	pendingRequests[trackingKey] = pending
-	currentPending = len(pendingRequests)
-	requestsMutex.Unlock()
+	s.pendingRequests[trackingKey] = pending
+	currentPending = len(s.pendingRequests)
+	s.requestsMutex.Unlock()
 
 	// Update pending requests gauge
 	pendingRequestsGauge.Set(float64(currentPending))
 
-	logger.Info("CREATE request initiated",
+	s.logger.Info("CREATE request initiated",
 		zap.String("domain", domain),
 		zap.Float64("threshold_price", th),
 		zap.String("tracking_key", trackingKey),
 		zap.Int("pending_count", currentPending),
-		zap.Int("max_pending", MAX_PENDING),
+		zap.Int("max_pending", s.config.MaxPending),
 	)
 
 	// Trigger CRE workflow with configured callback URL
-	if err := triggerWorkflow("create", domain, &th, nil, CALLBACK_URL); err != nil {
-		logger.Error("Failed to trigger workflow",
+	if err := s.triggerWorkflow("create", domain, &th, nil, s.config.CallbackURL); err != nil {
+		s.logger.Error("Failed to trigger workflow",
 			zap.String("domain", domain),
 			zap.Error(err),
 		)
 		workflowTriggers.WithLabelValues("create", "error").Inc()
 
 		// Clean up pending request on failure
-		requestsMutex.Lock()
-		delete(pendingRequests, trackingKey)
-		currentPending = len(pendingRequests)
-		requestsMutex.Unlock()
+		s.requestsMutex.Lock()
+		delete(s.pendingRequests, trackingKey)
+		currentPending = len(s.pendingRequests)
+		s.requestsMutex.Unlock()
 		pendingRequestsGauge.Set(float64(currentPending))
 
 		http.Error(w, fmt.Sprintf("Failed to trigger workflow: %v", err), http.StatusInternalServerError)
@@ -540,21 +618,21 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	case result := <-pending.ResultChan:
 		// Webhook arrived! Return result immediately
 		tholdHash := getTholdHash(result)
-		logger.Info("CREATE request completed",
+		s.logger.Info("CREATE request completed",
 			zap.String("domain", domain),
 			zap.String("thold_hash", tholdHash),
 			zap.String("event_id", result.EventID),
 		)
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "completed"
 		pending.Result = result
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
 		// Parse CRE response - already in core-ts PriceContract format
 		var priceContract PriceContractResponse
 		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
-			logger.Warn("Failed to parse webhook content JSON",
+			s.logger.Warn("Failed to parse webhook content JSON",
 				zap.String("domain", domain),
 				zap.Error(err),
 			)
@@ -567,19 +645,19 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(priceContract)
 
-	case <-time.After(BLOCK_TIMEOUT):
+	case <-time.After(s.config.BlockTimeout):
 		// Timeout - return 202 with request_id for polling
 		requestTimeouts.WithLabelValues("create").Inc()
-		logger.Warn("CREATE request timeout",
+		s.logger.Warn("CREATE request timeout",
 			zap.String("domain", domain),
 			zap.String("request_id", trackingKey),
-			zap.Duration("timeout", BLOCK_TIMEOUT),
+			zap.Duration("timeout", s.config.BlockTimeout),
 		)
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "timeout"
 		pending.TimedOut = true
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
 		response := SyncResponse{
 			Status:    "timeout",
@@ -592,11 +670,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleCheck handles POST /check requests by triggering a CRE "check" workflow and blocking until the corresponding webhook arrives or BLOCK_TIMEOUT elapses.
-// It validates the JSON body (domain and 40-char thold_hash), registers a PendingRequest keyed by domain (enforcing MAX_PENDING), and invokes the workflow.
+// handleCheck handles POST /check requests by triggering a CRE "check" workflow and blocking until the corresponding webhook arrives or s.config.BlockTimeout elapses.
+// It validates the JSON body (domain and 40-char thold_hash), registers a PendingRequest keyed by domain (enforcing s.config.MaxPending), and invokes the workflow.
 // If a matching webhook is received before timeout, the pending request is marked completed and the parsed PriceContractResponse is returned (falls back to raw content on JSON parse failure).
-// If BLOCK_TIMEOUT elapses, the pending request is marked timed out and a 202 Accepted SyncResponse containing the request ID is returned for polling.
-func handleCheck(w http.ResponseWriter, r *http.Request) {
+// If s.config.BlockTimeout elapses, the pending request is marked timed out and a 202 Accepted SyncResponse containing the request ID is returned for polling.
+func (s *GatewayServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -626,31 +704,31 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we've hit the max pending requests limit
-	requestsMutex.Lock()
-	currentPending := len(pendingRequests)
-	if currentPending >= MAX_PENDING {
-		requestsMutex.Unlock()
+	s.requestsMutex.Lock()
+	currentPending := len(s.pendingRequests)
+	if currentPending >= s.config.MaxPending {
+		s.requestsMutex.Unlock()
 		logger.Warn("Max pending requests reached, rejecting CHECK request",
 			zap.Int("current_pending", currentPending),
-			zap.Int("max_pending", MAX_PENDING),
+			zap.Int("max_pending", s.config.MaxPending),
 		)
 		http.Error(w, "Server at capacity, please retry later", http.StatusServiceUnavailable)
 		return
 	}
-	pendingRequests[trackingKey] = pending
-	currentPending = len(pendingRequests)
-	requestsMutex.Unlock()
+	s.pendingRequests[trackingKey] = pending
+	currentPending = len(s.pendingRequests)
+	s.requestsMutex.Unlock()
 
 	logger.Info("CHECK request initiated",
 		zap.String("domain", req.Domain),
 		zap.String("thold_hash", req.TholdHash),
 		zap.String("tracking_key", trackingKey),
 		zap.Int("pending_count", currentPending),
-		zap.Int("max_pending", MAX_PENDING),
+		zap.Int("max_pending", s.config.MaxPending),
 	)
 
 	// Trigger CRE workflow with configured callback URL
-	if err := triggerWorkflow("check", req.Domain, nil, &req.TholdHash, CALLBACK_URL); err != nil {
+	if err := s.triggerWorkflow("check", req.Domain, nil, &req.TholdHash, s.config.CallbackURL); err != nil {
 		logger.Error("Failed to trigger workflow",
 			zap.String("domain", req.Domain),
 			zap.Error(err),
@@ -658,10 +736,10 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		workflowTriggers.WithLabelValues("check", "error").Inc()
 
 		// Clean up pending request on failure
-		requestsMutex.Lock()
-		delete(pendingRequests, trackingKey)
-		currentPending = len(pendingRequests)
-		requestsMutex.Unlock()
+		s.requestsMutex.Lock()
+		delete(s.pendingRequests, trackingKey)
+		currentPending = len(s.pendingRequests)
+		s.requestsMutex.Unlock()
 		pendingRequestsGauge.Set(float64(currentPending))
 
 		http.Error(w, fmt.Sprintf("Failed to trigger workflow: %v", err), http.StatusInternalServerError)
@@ -685,10 +763,10 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "completed"
 		pending.Result = result
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
 		// Parse CRE response - already in core-ts PriceContract format
 		var priceContract PriceContractResponse
@@ -705,19 +783,19 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(priceContract)
 
-	case <-time.After(BLOCK_TIMEOUT):
+	case <-time.After(s.config.BlockTimeout):
 		// Timeout - return 202 with request_id for polling
 		requestTimeouts.WithLabelValues("check").Inc()
 		logger.Warn("CHECK request timeout",
 			zap.String("domain", req.Domain),
 			zap.String("request_id", trackingKey),
-			zap.Duration("timeout", BLOCK_TIMEOUT),
+			zap.Duration("timeout", s.config.BlockTimeout),
 		)
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "timeout"
 		pending.TimedOut = true
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
 		response := SyncResponse{
 			Status:    "timeout",
@@ -741,7 +819,7 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 // CRE workflows should include a "domain" tag in their Nostr event to ensure proper request
 // matching. The domain should match the request_id generated by handleCreate/handleCheck.
 // Example: Tags: [["d", commit_hash], ["domain", request_id]]
-func handleWebhook(w http.ResponseWriter, r *http.Request) {
+func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -771,9 +849,9 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find the pending request by domain
-	requestsMutex.Lock()
-	pending, exists := pendingRequests[domain]
-	requestsMutex.Unlock()
+	s.requestsMutex.Lock()
+	pending, exists := s.pendingRequests[domain]
+	s.requestsMutex.Unlock()
 
 	if !exists {
 		// This is fine - might be a duplicate webhook from another DON node
@@ -821,7 +899,7 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 // 
 // The handler returns HTTP 405 for non-GET methods, 400 when request_id is missing, and 404 when
 // the request_id is not found.
-func handleStatus(w http.ResponseWriter, r *http.Request) {
+func (s *GatewayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -833,9 +911,9 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestsMutex.RLock()
-	pending, exists := pendingRequests[requestID]
-	requestsMutex.RUnlock()
+	s.requestsMutex.RLock()
+	pending, exists := s.pendingRequests[requestID]
+	s.requestsMutex.RUnlock()
 
 	if !exists {
 		http.Error(w, "Request not found", http.StatusNotFound)
@@ -914,7 +992,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /readiness - Readiness probe (is the server ready to accept traffic?)
-func handleReadiness(w http.ResponseWriter, r *http.Request) {
+func (s *GatewayServer) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 
@@ -925,18 +1003,18 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 	overallStatus := "healthy"
 
 	// 1. Check CRE Gateway reachability
-	creHealth := checkCREGateway(ctx)
+	creHealth := s.checkCREGateway(ctx)
 	deps["cre_gateway"] = creHealth
 	if creHealth.Status != "up" {
 		overallStatus = "degraded"
 	}
 
 	// 2. Check capacity
-	requestsMutex.RLock()
-	currentPending := len(pendingRequests)
-	requestsMutex.RUnlock()
+	s.requestsMutex.RLock()
+	currentPending := len(s.pendingRequests)
+	s.requestsMutex.RUnlock()
 
-	capacityPercent := float64(currentPending) / float64(MAX_PENDING) * 100
+	capacityPercent := float64(currentPending) / float64(s.config.MaxPending) * 100
 	capacityStatus := "up"
 	capacityMessage := "Capacity available"
 
@@ -957,7 +1035,7 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Check if private key is loaded
-	if privateKey == nil {
+	if s.privateKey == nil {
 		deps["authentication"] = Health{
 			Status:      "down",
 			Message:     "Private key not loaded",
@@ -981,7 +1059,7 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 		Dependencies: deps,
 		Metrics: HealthMetrics{
 			PendingRequests: currentPending,
-			MaxPending:      MAX_PENDING,
+			MaxPending:      s.config.MaxPending,
 			CapacityUsed:    capacityPercent,
 		},
 	}
@@ -1024,14 +1102,14 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkCREGateway verifies connectivity to the CRE gateway
-func checkCREGateway(ctx context.Context) Health {
+func (s *GatewayServer) checkCREGateway(ctx context.Context) Health {
 	start := time.Now()
 
 	// Create a HEAD request with timeout
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(checkCtx, "HEAD", GATEWAY_URL, nil)
+	req, err := http.NewRequestWithContext(checkCtx, "HEAD", s.config.GatewayURL, nil)
 	if err != nil {
 		return Health{
 			Status:      "down",
@@ -1051,7 +1129,7 @@ func checkCREGateway(ctx context.Context) Health {
 	if err != nil {
 		logger.Warn("CRE gateway health check failed",
 			zap.Error(err),
-			zap.String("gateway_url", GATEWAY_URL),
+			zap.String("gateway_url", s.config.GatewayURL),
 		)
 		return Health{
 			Status:      "down",
@@ -1079,7 +1157,7 @@ func checkCREGateway(ctx context.Context) Health {
 }
 
 // triggerWorkflow sends HTTP trigger to CRE gateway using proper JWT format
-func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, callbackURL string) error {
+func (s *GatewayServer) triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, callbackURL string) error {
 	// Build input
 	input := map[string]interface{}{
 		"domain":       domain,
@@ -1102,12 +1180,14 @@ func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, 
 		"params": map[string]interface{}{
 			"input": input,
 			"workflow": map[string]interface{}{
-				"workflowID": WORKFLOW_ID,
+				"workflowID": s.config.WorkflowID,
 			},
 		},
 	}
 
-	rpcJSON, err := json.Marshal(rpcRequest)
+	// Use deterministic JSON marshaling for consistent digest computation
+	// This ensures the same request always produces the same signature
+	rpcJSON, err := marshalSorted(rpcRequest)
 	if err != nil {
 		return fmt.Errorf("failed to marshal RPC request: %w", err)
 	}
@@ -1117,13 +1197,13 @@ func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, 
 	digestHex := "0x" + hex.EncodeToString(digest[:])
 
 	// Generate JWT token using shared ethsign package
-	token, err := ethsign.GenerateJWT(privateKey, AUTHORIZED_KEY, digestHex, ethsign.GenerateRequestID())
+	token, err := ethsign.GenerateJWT(s.privateKey, s.config.AuthorizedKey, digestHex, ethsign.GenerateRequestID())
 	if err != nil {
 		return fmt.Errorf("failed to generate JWT: %w", err)
 	}
 
 	// Send request
-	req, err := http.NewRequest("POST", GATEWAY_URL, bytes.NewReader(rpcJSON))
+	req, err := http.NewRequest("POST", s.config.GatewayURL, bytes.NewReader(rpcJSON))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -1166,35 +1246,103 @@ func getTholdHash(payload *WebhookPayload) string {
 	return priceContract.TholdHash
 }
 
+// marshalSorted marshals v to JSON with all map keys sorted lexicographically at every level.
+// This ensures deterministic output for consistent digest computation across requests.
+func marshalSorted(v interface{}) ([]byte, error) {
+	// Convert to map structure first via standard JSON round-trip
+	temp, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	var data interface{}
+	if err := json.Unmarshal(temp, &data); err != nil {
+		return nil, err
+	}
+
+	// Custom marshal with sorted keys
+	var buf bytes.Buffer
+	if err := marshalSortedRecursive(&buf, data); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+// marshalSortedRecursive writes the JSON encoding of v to buf with all map keys
+// sorted lexicographically at every level.
+func marshalSortedRecursive(buf *bytes.Buffer, v interface{}) error {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		buf.WriteString("{")
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteString(",")
+			}
+			keyBytes, _ := json.Marshal(k)
+			buf.Write(keyBytes)
+			buf.WriteString(":")
+			if err := marshalSortedRecursive(buf, val[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteString("}")
+	case []interface{}:
+		buf.WriteString("[")
+		for i, item := range val {
+			if i > 0 {
+				buf.WriteString(",")
+			}
+			if err := marshalSortedRecursive(buf, item); err != nil {
+				return err
+			}
+		}
+		buf.WriteString("]")
+	default:
+		b, err := json.Marshal(val)
+		if err != nil {
+			return err
+		}
+		buf.Write(b)
+	}
+	return nil
+}
+
 // cleanupOldRequests periodically removes stale requests to prevent memory leaks.
 // It respects the shutdownChan for graceful termination during server shutdown.
 //
 // Cleanup strategy:
 //   - Remove completed requests older than 5 minutes
 //   - Remove timed-out requests older than 5 minutes (clients should poll /status)
-//   - Remove stale pending requests older than 2x BLOCK_TIMEOUT (edge case handling)
-func cleanupOldRequests() {
-	ticker := time.NewTicker(CLEANUP_INTERVAL)
+//   - Remove stale pending requests older than 2x s.config.BlockTimeout (edge case handling)
+func (s *GatewayServer) cleanupOldRequests() {
+	ticker := time.NewTicker(s.config.CleanupInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-shutdownChan:
+		case <-s.shutdownChan:
 			logger.Info("Cleanup goroutine received shutdown signal")
 			return
 		case <-ticker.C:
-			requestsMutex.Lock()
+			s.requestsMutex.Lock()
 			now := time.Now()
 			cleaned := 0
 
-			for id, req := range pendingRequests {
+			for id, req := range s.pendingRequests {
 				shouldDelete := false
 
 				if req.Status == "completed" && now.Sub(req.CreatedAt) > 5*time.Minute {
 					shouldDelete = true
 				} else if req.Status == "timeout" && now.Sub(req.CreatedAt) > 5*time.Minute {
 					shouldDelete = true
-				} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*BLOCK_TIMEOUT {
+				} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*s.config.BlockTimeout {
 					// Stale pending request that never completed or timed out (shouldn't happen)
 					age := now.Sub(req.CreatedAt)
 					logger.Warn("Cleaning up stale pending request",
@@ -1206,20 +1354,20 @@ func cleanupOldRequests() {
 				}
 
 				if shouldDelete {
-					delete(pendingRequests, id)
+					delete(s.pendingRequests, id)
 					cleaned++
 				}
 			}
 
-			currentPending := len(pendingRequests)
-			requestsMutex.Unlock()
+			currentPending := len(s.pendingRequests)
+			s.requestsMutex.Unlock()
 
 			if cleaned > 0 {
 				requestsCleanedUp.Add(float64(cleaned))
 				logger.Info("Cleanup completed",
 					zap.Int("removed", cleaned),
 					zap.Int("pending", currentPending),
-					zap.Int("max_pending", MAX_PENDING),
+					zap.Int("max_pending", s.config.MaxPending),
 				)
 			}
 
