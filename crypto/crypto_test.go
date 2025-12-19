@@ -57,6 +57,152 @@ func TestDeriveKeys(t *testing.T) {
 	}
 }
 
+// TestDeriveKeysCurveOrderValidation tests that private keys are validated
+// against secp256k1 curve order bounds. Valid range is [1, n-1] where n is
+// the curve order: 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+func TestDeriveKeysCurveOrderValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		privKey string
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "zero key (all zeros)",
+			privKey: "0000000000000000000000000000000000000000000000000000000000000000",
+			wantErr: true,
+			errMsg:  "key cannot be zero",
+		},
+		{
+			name:    "key equal to 1 (minimum valid)",
+			privKey: "0000000000000000000000000000000000000000000000000000000000000001",
+			wantErr: false,
+		},
+		{
+			name:    "key equal to curve order (invalid - too large)",
+			privKey: "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+			wantErr: true,
+			errMsg:  "must be less than secp256k1 curve order",
+		},
+		{
+			name:    "key equal to curve order minus 1 (maximum valid)",
+			privKey: "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140",
+			wantErr: false,
+		},
+		{
+			name:    "key greater than curve order (invalid)",
+			privKey: "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364142",
+			wantErr: true,
+			errMsg:  "must be less than secp256k1 curve order",
+		},
+		{
+			name:    "key much greater than curve order (all F's)",
+			privKey: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+			wantErr: true,
+			errMsg:  "must be less than secp256k1 curve order",
+		},
+		{
+			name:    "valid key in middle range",
+			privKey: "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0",
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kd, err := DeriveKeys(tt.privKey)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("DeriveKeys() expected error containing %q, got nil", tt.errMsg)
+					return
+				}
+				if !containsSubstring(err.Error(), tt.errMsg) {
+					t.Errorf("DeriveKeys() error = %v, want error containing %q", err, tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("DeriveKeys() unexpected error = %v", err)
+					return
+				}
+				if kd == nil {
+					t.Fatal("DeriveKeys() returned nil KeyDerivation for valid key")
+				}
+				if len(kd.SchnorrPubkey) != 64 {
+					t.Errorf("SchnorrPubkey length = %d, want 64", len(kd.SchnorrPubkey))
+				}
+				// Verify key material is populated
+				if len(kd.PrivateKey) != 32 {
+					t.Errorf("PrivateKey length = %d, want 32", len(kd.PrivateKey))
+				}
+			}
+		})
+	}
+}
+
+// TestDeriveKeysMalformedInputs tests various malformed input edge cases
+func TestDeriveKeysMalformedInputs(t *testing.T) {
+	tests := []struct {
+		name    string
+		privKey string
+		wantErr bool
+	}{
+		{
+			name:    "uppercase hex (should work - hex.DecodeString accepts it)",
+			privKey: "8CE73A2DB5CBAF4B0AB3CABECE9408E3B898C64474C0DBE27826C65D1180370E",
+			wantErr: false,
+		},
+		{
+			name:    "mixed case hex",
+			privKey: "8Ce73a2Db5cBaF4b0Ab3cAbEcE9408e3B898c64474c0DbE27826c65D1180370e",
+			wantErr: false,
+		},
+		{
+			name:    "contains spaces",
+			privKey: "8ce7 3a2d b5cb af4b 0ab3 cabe ce94 08e3 b898 c644 74c0 dbe2 7826 c65d 1180 370e",
+			wantErr: true,
+		},
+		{
+			name:    "contains newline",
+			privKey: "8ce73a2db5cbaf4b0ab3cabece9408e3b898c64474c0dbe27826c65d1180370e\n",
+			wantErr: true,
+		},
+		{
+			name:    "has 0x prefix",
+			privKey: "0x8ce73a2db5cbaf4b0ab3cabece9408e3b898c64474c0dbe27826c65d1180370e",
+			wantErr: true, // hex.DecodeString doesn't handle 0x prefix
+		},
+		{
+			name:    "63 chars (too short)",
+			privKey: "8ce73a2db5cbaf4b0ab3cabece9408e3b898c64474c0dbe27826c65d1180370",
+			wantErr: true,
+		},
+		{
+			name:    "65 chars (too long)",
+			privKey: "8ce73a2db5cbaf4b0ab3cabece9408e3b898c64474c0dbe27826c65d1180370e0",
+			wantErr: true,
+		},
+		{
+			name:    "contains non-hex char g",
+			privKey: "8ce73a2db5cbaf4b0ab3cabece9408e3b898c64474c0dbe27826c65d1180370g",
+			wantErr: true,
+		},
+		{
+			name:    "null bytes in middle",
+			privKey: "8ce73a2db5cbaf4b\x000ab3cabece9408e3b898c64474c0dbe27826c65d1180370e",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DeriveKeys(tt.privKey)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("DeriveKeys() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 
 func TestHash160(t *testing.T) {
 	tests := []struct {

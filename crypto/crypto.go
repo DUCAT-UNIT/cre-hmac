@@ -104,13 +104,21 @@ func GetPublicKey(privateKey []byte) []byte {
 //
 // SECURITY: Private keys must be in the valid range for secp256k1: [1, n-1] where n is the
 // curve order. Keys equal to 0 or >= n would produce weak/invalid cryptographic operations.
+// Includes panic recovery to gracefully handle unexpected btcec library panics.
 //
 // Returns an error if:
 //   - Hex decoding fails
 //   - Decoded key is not exactly 32 bytes
 //   - Key is zero (invalid)
 //   - Key is >= curve order (invalid for secp256k1)
-func DeriveKeys(privateKeyHex string) (*KeyDerivation, error) {
+func DeriveKeys(privateKeyHex string) (result *KeyDerivation, err error) {
+	// Panic recovery for external library calls
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in key derivation: %v", r)
+		}
+	}()
+
 	privKeyBytes, err := hex.DecodeString(privateKeyHex)
 	if err != nil {
 		return nil, fmt.Errorf("invalid private key hex encoding: %w", err)
@@ -460,7 +468,15 @@ func VerifyThresholdCommitment(secret, expectedHash string) error {
 // SignSchnorr signs a 32-byte message hash with a 32-byte private key using BIP-340 Schnorr
 // and returns the serialized signature as a hex-encoded string.
 // Errors are returned for invalid key or message lengths, invalid message hex, or if signing fails.
-func SignSchnorr(privKeyBytes []byte, messageHash string) (string, error) {
+// SECURITY: Includes panic recovery to gracefully handle unexpected btcec library panics.
+func SignSchnorr(privKeyBytes []byte, messageHash string) (result string, err error) {
+	// Panic recovery for external library calls
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in schnorr signing: %v", r)
+		}
+	}()
+
 	if len(privKeyBytes) != 32 {
 		return "", fmt.Errorf("invalid private key length: expected 32 bytes, got %d", len(privKeyBytes))
 	}
@@ -488,7 +504,15 @@ func SignSchnorr(privKeyBytes []byte, messageHash string) (string, error) {
 // It validates that the signature, public key, and message hash are valid hex strings
 // with correct lengths (64 bytes for signature, 32 bytes for pubkey and message),
 // then verifies the cryptographic signature.
-func VerifySchnorrSignature(pubKeyHex, messageHash, sigHex string) error {
+// SECURITY: Includes panic recovery to gracefully handle unexpected btcec library panics.
+func VerifySchnorrSignature(pubKeyHex, messageHash, sigHex string) (err error) {
+	// Panic recovery for external library calls
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in schnorr verification: %v", r)
+		}
+	}()
+
 	sigBytes, err := hex.DecodeString(sigHex)
 	if err != nil {
 		return fmt.Errorf("invalid signature hex: %w", err)
