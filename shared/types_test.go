@@ -12,12 +12,16 @@ import (
 // =============================================================================
 
 func TestConfigValidate(t *testing.T) {
+	// Valid Ethereum address for testing (42 chars: 0x + 40 hex)
+	validAuthKey := "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82"
+
 	validConfig := Config{
 		ClientID:      "test-client",
 		DataStreamURL: "https://data.example.com",
 		FeedID:        "feed-123",
 		RelayURL:      "wss://relay.example.com",
 		Network:       "mutiny",
+		AuthorizedKey: validAuthKey,
 	}
 
 	tests := []struct {
@@ -28,11 +32,22 @@ func TestConfigValidate(t *testing.T) {
 	}{
 		{"valid config", &validConfig, false, ""},
 		{"nil config", nil, true, "config is nil"},
-		{"missing client_id", &Config{DataStreamURL: "url", FeedID: "feed", RelayURL: "relay", Network: "net"}, true, "client_id required"},
-		{"missing data_stream_url", &Config{ClientID: "id", FeedID: "feed", RelayURL: "relay", Network: "net"}, true, "data_stream_url required"},
-		{"missing relay_url", &Config{ClientID: "id", DataStreamURL: "url", FeedID: "feed", Network: "net"}, true, "relay_url required"},
-		{"missing feed_id", &Config{ClientID: "id", DataStreamURL: "url", RelayURL: "relay", Network: "net"}, true, "feed_id required"},
-		{"missing network", &Config{ClientID: "id", DataStreamURL: "url", FeedID: "feed", RelayURL: "relay"}, true, "network required"},
+		{"missing client_id", &Config{DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "client_id required"},
+		{"missing data_stream_url", &Config{ClientID: "id", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "data_stream_url required"},
+		{"missing relay_url", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", Network: "net", AuthorizedKey: validAuthKey}, true, "relay_url required"},
+		{"missing feed_id", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "feed_id required"},
+		{"missing network", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", AuthorizedKey: validAuthKey}, true, "network required"},
+		// TLS validation
+		{"data_stream_url no TLS", &Config{ClientID: "id", DataStreamURL: "http://external.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "must use https://"},
+		{"data_stream_url localhost allowed", &Config{ClientID: "id", DataStreamURL: "http://localhost:8080", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, false, ""},
+		{"relay_url no TLS", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "ws://external.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "must use TLS"},
+		{"relay_url localhost allowed", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "ws://localhost:7000", Network: "net", AuthorizedKey: validAuthKey}, false, ""},
+		// AuthorizedKey validation
+		{"missing authorized_key", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net"}, true, "authorized_key required"},
+		{"authorized_key too short", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: "0x123"}, true, "must be 42 characters"},
+		{"authorized_key too long", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82a"}, true, "must be 42 characters"},
+		{"authorized_key missing 0x", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: "5b3ebc3622dd75f0a680c2b7e4613ad813c72f8200"}, true, "must start with '0x'"},
+		{"authorized_key invalid hex", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72fGG"}, true, "invalid hex character"},
 	}
 
 	for _, tt := range tests {
@@ -61,6 +76,7 @@ func TestConfigValidateCronConfig(t *testing.T) {
 		FeedID:        "feed-123",
 		RelayURL:      "wss://relay.example.com",
 		Network:       "mutiny",
+		AuthorizedKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82",
 	}
 
 	tests := []struct {
@@ -109,6 +125,7 @@ func TestConfigJSON(t *testing.T) {
 		FeedID:        "feed-123",
 		RelayURL:      "wss://relay.example.com",
 		Network:       "mutiny",
+		AuthorizedKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82",
 		CronSchedule:  "0 */5 * * * *",
 		RateMin:       1.35,
 		RateMax:       5.0,
@@ -665,6 +682,7 @@ func BenchmarkConfigValidate(b *testing.B) {
 		FeedID:        "feed-123",
 		RelayURL:      "wss://relay.example.com",
 		Network:       "mutiny",
+		AuthorizedKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82",
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

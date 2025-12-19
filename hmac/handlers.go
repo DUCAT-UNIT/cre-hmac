@@ -38,6 +38,8 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
+	// SECURITY: Zero private key bytes after handler completes
+	defer keys.Zero()
 
 	// Fetch current BTC/USD price with consensus
 	client := &http.Client{}
@@ -187,6 +189,8 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
+	// SECURITY: Zero private key bytes after handler completes
+	defer keys.Zero()
 
 	// Fetch current BTC/USD price with consensus (ONCE for all quotes)
 	client := &http.Client{}
@@ -272,6 +276,17 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 		}
 
 		result.TholdPrice = float64(originalData.TholdPrice)
+
+		// SECURITY: Validate quote age before evaluating
+		// Prevents replay attacks with stale price data
+		if err := validateQuoteAge(int64(originalData.BaseStamp), currentStamp); err != nil {
+			errMsg := fmt.Sprintf("quote age validation failed: %v", err)
+			result.Error = &errMsg
+			result.Status = "error"
+			results[fp.Index] = result
+			logger.Warn("Quote too old for evaluation", "tholdHash", fp.TholdHash, "baseStamp", originalData.BaseStamp, "error", err)
+			continue
+		}
 
 		// Check if already breached (thold_key is revealed when breached)
 		if originalData.TholdKey != nil {
@@ -512,6 +527,8 @@ func generateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Genera
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
+	// SECURITY: Zero private key bytes after handler completes
+	defer keys.Zero()
 
 	// Fetch current BTC/USD price with consensus
 	client := &http.Client{}
@@ -539,6 +556,17 @@ func generateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Genera
 	// Generate quotes from rate_min to rate_max
 	for rate := requestData.RateMin; rate <= requestData.RateMax+0.0001; rate += requestData.StepSize {
 		tholdPrice := currentPrice * rate
+
+		// SECURITY: Check for uint32 overflow before casting
+		// MaxPriceValue is uint32 max (4,294,967,295)
+		if tholdPrice > float64(MaxPriceValue) {
+			logger.Warn("Skipping threshold price exceeding uint32 max", "rate", rate, "tholdPrice", tholdPrice)
+			continue
+		}
+		if currentPrice > float64(MaxPriceValue) {
+			logger.Warn("Current price exceeds uint32 max", "currentPrice", currentPrice)
+			continue
+		}
 
 		// Track min/max thresholds
 		if minThold == 0 || tholdPrice < minThold {
@@ -682,6 +710,8 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
+	// SECURITY: Zero private key bytes after handler completes
+	defer keys.Zero()
 
 	// Fetch current BTC/USD price with consensus
 	client := &http.Client{}
@@ -705,8 +735,19 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 	var jobs []QuoteJob
 	var minThold, maxThold float64
 
+	// SECURITY: Validate current price doesn't exceed uint32 max
+	if currentPrice > float64(MaxPriceValue) {
+		return nil, fmt.Errorf("current price %.2f exceeds uint32 max (%d)", currentPrice, MaxPriceValue)
+	}
+
 	for rate := requestData.RateMin; rate <= requestData.RateMax+0.0001; rate += requestData.StepSize {
 		tholdPrice := currentPrice * rate
+
+		// SECURITY: Skip threshold prices that would overflow uint32
+		if tholdPrice > float64(MaxPriceValue) {
+			logger.Warn("Skipping threshold price exceeding uint32 max", "rate", rate, "tholdPrice", tholdPrice)
+			continue
+		}
 
 		// Track min/max thresholds
 		if minThold == 0 || tholdPrice < minThold {

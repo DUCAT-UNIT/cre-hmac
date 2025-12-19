@@ -46,6 +46,15 @@ type NostrEvent = shared.NostrEvent
 type RelayResponse = shared.RelayResponse
 
 // =============================================================================
+// Validation Function Aliases
+// =============================================================================
+
+// IsValidTholdHash checks if a string is a valid threshold hash (40 lowercase hex chars)
+func IsValidTholdHash(hash string) bool {
+	return shared.IsValidTholdHash(hash)
+}
+
+// =============================================================================
 // WASM-Specific Types (not shared with other packages)
 // =============================================================================
 
@@ -62,6 +71,16 @@ type PriceData struct {
 type KeyDerivation struct {
 	PrivateKey    []byte
 	SchnorrPubkey string
+}
+
+// Zero securely zeroes the private key bytes to prevent memory leakage.
+// SECURITY: Call this via defer immediately after deriveKeys() returns successfully.
+func (k *KeyDerivation) Zero() {
+	if k != nil && k.PrivateKey != nil {
+		for i := range k.PrivateKey {
+			k.PrivateKey[i] = 0
+		}
+	}
 }
 
 // BatchGeneratedInfo is sent to gateway after batch quote generation

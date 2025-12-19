@@ -4,7 +4,7 @@ package shared
 const (
 	// Threshold validation
 	MinThresholdDistance = 0.01       // 1% min distance from current price
-	MaxQuoteAge          = 86400      // 24 hours
+	MaxQuoteAge          = 60         // 60 seconds - BTC can move 5%+ in minutes, keep quotes fresh
 	MaxPriceValue        = 4294967295 // uint32 max (~$4.3B) - must fit in 4-byte binary encoding
 	MaxDomainLength      = 253        // DNS spec limit
 

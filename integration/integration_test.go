@@ -294,6 +294,7 @@ func TestEndToEndValidation(t *testing.T) {
 			FeedID:        "feed-123",
 			RelayURL:      "wss://relay.example.com",
 			Network:       "mutiny",
+			AuthorizedKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82", // Required for HTTP trigger auth
 		}
 		if err := validConfig.Validate(); err != nil {
 			t.Errorf("Valid config should pass: %v", err)

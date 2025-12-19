@@ -179,3 +179,49 @@ func ValidateQuoteAge(quoteStamp, currentTime, maxAge int64) error {
 	}
 	return nil
 }
+
+// TruncatePriceToUint32 converts a float64 price to uint32 using floor truncation.
+// This matches the TypeScript core-ts implementation which uses Buff.num(value, 4)
+// for 4-byte big-endian encoding, discarding fractional values.
+//
+// SECURITY: Prices MUST be truncated consistently across oracle and client.
+// Using math.Floor ensures deterministic behavior - a price of 100234.99 becomes
+// 100234, never 100235. This prevents hash mismatches and potential arbitrage.
+//
+// Returns an error if the price:
+//   - Is negative (would underflow)
+//   - Is NaN or infinite
+//   - Exceeds MaxPriceValue (uint32 max = 4,294,967,295)
+func TruncatePriceToUint32(price float64) (uint32, error) {
+	// Reject NaN
+	if math.IsNaN(price) {
+		return 0, fmt.Errorf("cannot truncate NaN price")
+	}
+	// Reject infinity
+	if math.IsInf(price, 0) {
+		return 0, fmt.Errorf("cannot truncate infinite price")
+	}
+	// Reject negative prices
+	if price < 0 {
+		return 0, fmt.Errorf("cannot truncate negative price: %.2f", price)
+	}
+	// Reject prices exceeding uint32 max
+	if price > float64(MaxPriceValue) {
+		return 0, fmt.Errorf("price %.2f exceeds uint32 max (%d)", price, MaxPriceValue)
+	}
+
+	// Use math.Floor for explicit truncation toward zero
+	// This ensures deterministic behavior matching TypeScript
+	truncated := math.Floor(price)
+	return uint32(truncated), nil
+}
+
+// MustTruncatePriceToUint32 is like TruncatePriceToUint32 but panics on error.
+// Only use this when the price has already been validated.
+func MustTruncatePriceToUint32(price float64) uint32 {
+	result, err := TruncatePriceToUint32(price)
+	if err != nil {
+		panic(fmt.Sprintf("MustTruncatePriceToUint32: %v", err))
+	}
+	return result
+}

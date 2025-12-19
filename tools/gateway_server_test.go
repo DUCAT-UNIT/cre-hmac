@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -17,8 +18,11 @@ import (
 
 	"ducat/internal/ethsign"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/ethereum/go-ethereum/crypto"
 )
+
 
 // Test helpers
 // setupTestEnv accepts testing.TB to work with both *testing.T and *testing.B
@@ -45,6 +49,53 @@ func resetGlobals() {
 		server.pendingRequests = make(map[string]*PendingRequest)
 		server.requestsMutex.Unlock()
 	}
+}
+
+// Test private key for signing webhooks (different from server key)
+var testWebhookPrivKey, _ = hex.DecodeString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+// createSignedWebhook creates a properly signed WebhookPayload for testing.
+// This simulates a valid Nostr event from the CRE.
+func createSignedWebhook(eventType, domain, content string, tags [][]string) WebhookPayload {
+	// Get the Schnorr public key from the test private key
+	_, pubKey := btcec.PrivKeyFromBytes(testWebhookPrivKey)
+	pubKeyHex := hex.EncodeToString(schnorr.SerializePubKey(pubKey))
+
+	// Add domain tag if not present
+	hasDomainTag := false
+	for _, tag := range tags {
+		if len(tag) >= 1 && tag[0] == "domain" {
+			hasDomainTag = true
+			break
+		}
+	}
+	if !hasDomainTag && domain != "" {
+		tags = append(tags, []string{"domain", domain})
+	}
+
+	payload := WebhookPayload{
+		EventType: eventType,
+		PubKey:    pubKeyHex,
+		CreatedAt: time.Now().Unix(),
+		Kind:      30078, // Custom kind for DUCAT
+		Tags:      tags,
+		Content:   content,
+	}
+
+	// Compute event ID (NIP-01 format)
+	tagsJSON, _ := json.Marshal(payload.Tags)
+	serialized := fmt.Sprintf("[0,%q,%d,%d,%s,%q]",
+		payload.PubKey, payload.CreatedAt, payload.Kind, string(tagsJSON), payload.Content)
+	hash := sha256.Sum256([]byte(serialized))
+	payload.EventID = hex.EncodeToString(hash[:])
+
+	// Sign the event ID with Schnorr
+	privKey, _ := btcec.PrivKeyFromBytes(testWebhookPrivKey)
+	eventIDBytes, _ := hex.DecodeString(payload.EventID)
+	sig, _ := schnorr.Sign(privKey, eventIDBytes)
+	payload.Sig = hex.EncodeToString(sig.Serialize())
+
+	return payload
 }
 
 // TestLoadConfig tests configuration loading from environment variables
@@ -287,99 +338,131 @@ func TestHandleWebhook(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	tests := []struct {
-		name           string
-		method         string
-		payload        interface{}
-		setupPending   bool
-		domain         string
-		expectedStatus int
-	}{
-		{
-			name:           "wrong method",
-			method:         "GET",
-			payload:        nil,
-			expectedStatus: http.StatusMethodNotAllowed,
-		},
-		{
-			name:           "invalid JSON",
-			method:         "POST",
-			payload:        "invalid json",
-			expectedStatus: http.StatusBadRequest,
-		},
-		{
-			name:   "valid webhook with pending request",
-			method: "POST",
-			payload: WebhookPayload{
-				EventType: "create",
-				EventID:   "event123",
-				Tags:      [][]string{{"domain", "test-domain"}},
-				Content:   `{"thold_price": 100, "thold_hash": "abc123"}`,
-			},
-			setupPending:   true,
-			domain:         "test-domain",
-			expectedStatus: http.StatusOK,
-		},
-		{
-			name:   "webhook without pending request",
-			method: "POST",
-			payload: WebhookPayload{
-				EventType: "create",
-				EventID:   "event456",
-				Tags:      [][]string{{"domain", "unknown-domain"}},
-				Content:   `{"thold_price": 100}`,
-			},
-			setupPending:   false,
-			expectedStatus: http.StatusOK,
-		},
-	}
+	t.Run("wrong method", func(t *testing.T) {
+		resetGlobals()
+		req := httptest.NewRequest("GET", "/webhook/ducat", nil)
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+		if w.Result().StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusMethodNotAllowed)
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			resetGlobals()
+	t.Run("invalid JSON", func(t *testing.T) {
+		resetGlobals()
+		req := httptest.NewRequest("POST", "/webhook/ducat", strings.NewReader("invalid json"))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+		if w.Result().StatusCode != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusBadRequest)
+		}
+	})
 
-			// Setup pending request if needed
-			if tt.setupPending {
-				server.pendingRequests[tt.domain] = &PendingRequest{
-					RequestID:  tt.domain,
-					CreatedAt:  time.Now(),
-					ResultChan: make(chan *WebhookPayload, 1),
-					Status:     "pending",
-				}
+	t.Run("valid webhook with pending request", func(t *testing.T) {
+		resetGlobals()
+		domain := "test-domain"
+
+		// Setup pending request
+		server.pendingRequests[domain] = &PendingRequest{
+			RequestID:  domain,
+			CreatedAt:  time.Now(),
+			ResultChan: make(chan *WebhookPayload, 1),
+			Status:     "pending",
+		}
+
+		// Create properly signed webhook
+		payload := createSignedWebhook("create", domain, `{"thold_price": 100, "thold_hash": "abc123"}`, nil)
+		jsonData, _ := json.Marshal(payload)
+
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+
+		if w.Result().StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusOK)
+		}
+
+		// Verify pending request received the webhook
+		pending := server.pendingRequests[domain]
+		select {
+		case result := <-pending.ResultChan:
+			if result.EventID != payload.EventID {
+				t.Errorf("received event_id = %s, want %s", result.EventID, payload.EventID)
 			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("webhook did not unblock pending request")
+		}
+	})
 
-			var body io.Reader
-			if str, ok := tt.payload.(string); ok {
-				body = strings.NewReader(str)
-			} else if tt.payload != nil {
-				jsonData, _ := json.Marshal(tt.payload)
-				body = bytes.NewReader(jsonData)
-			}
+	t.Run("webhook without pending request", func(t *testing.T) {
+		resetGlobals()
 
-			req := httptest.NewRequest(tt.method, "/webhook/ducat", body)
-			w := httptest.NewRecorder()
+		// Create properly signed webhook for unknown domain
+		payload := createSignedWebhook("create", "unknown-domain", `{"thold_price": 100}`, nil)
+		jsonData, _ := json.Marshal(payload)
 
-			server.handleWebhook(w, req)
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
 
-			resp := w.Result()
-			if resp.StatusCode != tt.expectedStatus {
-				t.Errorf("status = %d, want %d", resp.StatusCode, tt.expectedStatus)
-			}
+		if w.Result().StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusOK)
+		}
+	})
 
-			// If we set up a pending request, verify it received the webhook
-			if tt.setupPending {
-				pending := server.pendingRequests[tt.domain]
-				select {
-				case result := <-pending.ResultChan:
-					if result.EventID != "event123" {
-						t.Errorf("received event_id = %s, want event123", result.EventID)
-					}
-				case <-time.After(100 * time.Millisecond):
-					t.Error("webhook did not unblock pending request")
-				}
-			}
-		})
-	}
+	t.Run("unsigned webhook rejected", func(t *testing.T) {
+		resetGlobals()
+
+		// Create unsigned webhook (missing signature)
+		payload := WebhookPayload{
+			EventType: "create",
+			EventID:   "event123",
+			PubKey:    strings.Repeat("a", 64),
+			Tags:      [][]string{{"domain", "test-domain"}},
+			Content:   `{"thold_price": 100}`,
+			CreatedAt: time.Now().Unix(),
+		}
+		jsonData, _ := json.Marshal(payload)
+
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d (unauthorized for unsigned webhook)", w.Result().StatusCode, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("expired webhook rejected", func(t *testing.T) {
+		resetGlobals()
+
+		// Create a signed webhook with an old timestamp
+		payload := createSignedWebhook("create", "test-domain", `{"thold_price": 100}`, nil)
+		// Manually override to make it expired (6 minutes old)
+		payload.CreatedAt = time.Now().Unix() - 360
+
+		// Re-sign with old timestamp
+		tagsJSON, _ := json.Marshal(payload.Tags)
+		serialized := fmt.Sprintf("[0,%q,%d,%d,%s,%q]",
+			payload.PubKey, payload.CreatedAt, payload.Kind, string(tagsJSON), payload.Content)
+		hash := sha256.Sum256([]byte(serialized))
+		payload.EventID = hex.EncodeToString(hash[:])
+
+		privKey, _ := btcec.PrivKeyFromBytes(testWebhookPrivKey)
+		eventIDBytes, _ := hex.DecodeString(payload.EventID)
+		sig, _ := schnorr.Sign(privKey, eventIDBytes)
+		payload.Sig = hex.EncodeToString(sig.Serialize())
+
+		jsonData, _ := json.Marshal(payload)
+
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d (unauthorized for expired webhook)", w.Result().StatusCode, http.StatusUnauthorized)
+		}
+	})
 }
 
 // TestHandleCheckValidation tests /check endpoint validation
@@ -753,38 +836,62 @@ func TestGetTag(t *testing.T) {
 // TestGetTholdHash tests the helper function
 func TestGetTholdHash(t *testing.T) {
 	tests := []struct {
-		name     string
-		payload  *WebhookPayload
-		expected string
+		name        string
+		payload     *WebhookPayload
+		expected    string
+		expectError bool
 	}{
 		{
 			name: "valid payload",
 			payload: &WebhookPayload{
 				Content: `{"thold_hash": "abc123def456"}`,
 			},
-			expected: "abc123def456",
+			expected:    "abc123def456",
+			expectError: false,
 		},
 		{
 			name: "invalid JSON",
 			payload: &WebhookPayload{
 				Content: `invalid json`,
 			},
-			expected: "",
+			expected:    "",
+			expectError: true,
 		},
 		{
 			name: "missing thold_hash",
 			payload: &WebhookPayload{
 				Content: `{"other_field": "value"}`,
 			},
-			expected: "",
+			expected:    "",
+			expectError: false, // Valid JSON, just missing field
+		},
+		{
+			name:        "nil payload",
+			payload:     nil,
+			expected:    "",
+			expectError: true,
+		},
+		{
+			name: "empty content",
+			payload: &WebhookPayload{
+				Content: "",
+			},
+			expected:    "",
+			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getTholdHash(tt.payload)
+			result, err := getTholdHash(tt.payload)
 			if result != tt.expected {
 				t.Errorf("getTholdHash() = %s, want %s", result, tt.expected)
+			}
+			if tt.expectError && err == nil {
+				t.Errorf("getTholdHash() expected error but got nil")
+			}
+			if !tt.expectError && err != nil {
+				t.Errorf("getTholdHash() unexpected error: %v", err)
 			}
 		})
 	}
@@ -836,8 +943,15 @@ func TestEncodeBase64URL(t *testing.T) {
 
 // TestGenerateRequestID tests request ID generation using ethsign package
 func TestGenerateRequestID(t *testing.T) {
-	id1 := ethsign.GenerateRequestID()
-	id2 := ethsign.GenerateRequestID()
+	id1, err := ethsign.GenerateRequestID()
+	if err != nil {
+		t.Fatalf("GenerateRequestID() error = %v", err)
+	}
+
+	id2, err := ethsign.GenerateRequestID()
+	if err != nil {
+		t.Fatalf("GenerateRequestID() error = %v", err)
+	}
 
 	if id1 == id2 {
 		t.Error("GenerateRequestID() should generate unique IDs")
@@ -863,7 +977,8 @@ func TestGenerateJWT(t *testing.T) {
 	address := "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82"
 	digest := "0x1234567890abcdef"
 
-	token, err := ethsign.GenerateJWT(privKey, address, digest, ethsign.GenerateRequestID())
+	reqID, _ := ethsign.GenerateRequestID()
+	token, err := ethsign.GenerateJWT(privKey, address, digest, reqID)
 	if err != nil {
 		t.Fatalf("GenerateJWT() error = %v", err)
 	}
@@ -875,7 +990,8 @@ func TestGenerateJWT(t *testing.T) {
 	}
 
 	// Verify it's different each time (due to jti and timestamps)
-	token2, _ := ethsign.GenerateJWT(privKey, address, digest, ethsign.GenerateRequestID())
+	reqID2, _ := ethsign.GenerateRequestID()
+	token2, _ := ethsign.GenerateJWT(privKey, address, digest, reqID2)
 	if token == token2 {
 		t.Error("GenerateJWT() should generate unique tokens due to jti")
 	}
@@ -916,6 +1032,8 @@ func TestConcurrentWebhooks(t *testing.T) {
 	numRequests := 10
 	var wg sync.WaitGroup
 
+	// Pre-create signed payloads (must be done before concurrent send to get consistent event IDs)
+	payloads := make([]WebhookPayload, numRequests)
 	for i := 0; i < numRequests; i++ {
 		domain := fmt.Sprintf("test-domain-%d", i)
 		server.pendingRequests[domain] = &PendingRequest{
@@ -924,6 +1042,7 @@ func TestConcurrentWebhooks(t *testing.T) {
 			ResultChan: make(chan *WebhookPayload, 1),
 			Status:     "pending",
 		}
+		payloads[i] = createSignedWebhook("create", domain, fmt.Sprintf(`{"thold_price": %d}`, i*100), nil)
 	}
 
 	// Send webhooks concurrently
@@ -932,15 +1051,7 @@ func TestConcurrentWebhooks(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			domain := fmt.Sprintf("test-domain-%d", idx)
-			payload := WebhookPayload{
-				EventType: "create",
-				EventID:   fmt.Sprintf("event-%d", idx),
-				Tags:      [][]string{{"domain", domain}},
-				Content:   fmt.Sprintf(`{"thold_price": %d}`, idx*100),
-			}
-
-			jsonData, _ := json.Marshal(payload)
+			jsonData, _ := json.Marshal(payloads[idx])
 			req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 			w := httptest.NewRecorder()
 
@@ -961,9 +1072,8 @@ func TestConcurrentWebhooks(t *testing.T) {
 
 		select {
 		case result := <-pending.ResultChan:
-			expectedEventID := fmt.Sprintf("event-%d", i)
-			if result.EventID != expectedEventID {
-				t.Errorf("domain %s: event_id = %s, want %s", domain, result.EventID, expectedEventID)
+			if result.EventID != payloads[i].EventID {
+				t.Errorf("domain %s: event_id = %s, want %s", domain, result.EventID, payloads[i].EventID)
 			}
 		case <-time.After(1 * time.Second):
 			t.Errorf("domain %s: did not receive webhook", domain)
@@ -977,12 +1087,8 @@ func BenchmarkHandleWebhook(b *testing.B) {
 	loadConfig()
 	resetGlobals()
 
-	payload := WebhookPayload{
-		EventType: "create",
-		EventID:   "bench-event",
-		Tags:      [][]string{{"domain", "bench-domain"}},
-		Content:   `{"thold_price": 100}`,
-	}
+	// Create a properly signed webhook for benchmarking
+	payload := createSignedWebhook("create", "bench-domain", `{"thold_price": 100}`, nil)
 	jsonData, _ := json.Marshal(payload)
 
 	b.ResetTimer()
@@ -1414,13 +1520,9 @@ func TestWebhookParseContentError(t *testing.T) {
 		Status:     "pending",
 	}
 
-	payload := WebhookPayload{
-		EventType: "create",
-		EventID:   "test-event",
-		Tags:      [][]string{{"domain", domain}},
-		Content:   `{invalid json}`,
-	}
-
+	// Create a properly signed webhook with invalid JSON content
+	// The content being invalid JSON is fine - we're testing that the webhook is still delivered
+	payload := createSignedWebhook("create", domain, `{invalid json}`, nil)
 	jsonData, _ := json.Marshal(payload)
 	req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
@@ -1437,8 +1539,8 @@ func TestWebhookParseContentError(t *testing.T) {
 	pending := server.pendingRequests[domain]
 	select {
 	case result := <-pending.ResultChan:
-		if result.EventID != "test-event" {
-			t.Errorf("event_id = %s, want test-event", result.EventID)
+		if result.EventID != payload.EventID {
+			t.Errorf("event_id = %s, want %s", result.EventID, payload.EventID)
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("webhook not delivered to pending request")
@@ -1460,13 +1562,8 @@ func TestHandleWebhookDuplicateDelivery(t *testing.T) {
 	}
 	server.pendingRequests[domain] = pending
 
-	payload := WebhookPayload{
-		EventType: "create",
-		EventID:   "dup-event",
-		Tags:      [][]string{{"domain", domain}},
-		Content:   `{"test": "data"}`,
-	}
-
+	// Create a properly signed webhook
+	payload := createSignedWebhook("create", domain, `{"test": "data"}`, nil)
 	jsonData, _ := json.Marshal(payload)
 
 	// Send first webhook

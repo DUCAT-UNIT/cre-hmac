@@ -13,6 +13,11 @@ type Config struct {
 	RelayURL      string `json:"relay_url"`
 	Network       string `json:"network"`
 
+	// SECURITY: Authorized Ethereum address for HTTP trigger authentication
+	// This MUST be set in production - requests will only be accepted from this address
+	// Format: "0x" + 40 hex chars (e.g., "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82")
+	AuthorizedKey string `json:"authorized_key"`
+
 	// Cron-based quote generation settings
 	CronSchedule       string  `json:"cron_schedule,omitempty"`        // Cron expression (e.g., "0 */5 * * * *" for every 5 minutes)
 	RateMin            float64 `json:"rate_min,omitempty"`             // Minimum rate (e.g., 1.35 for 135%)
@@ -33,14 +38,64 @@ func (c *Config) Validate() error {
 	if c.DataStreamURL == "" {
 		return fmt.Errorf("data_stream_url required")
 	}
+	// SECURITY: Require TLS for data stream (Chainlink) connections
+	if len(c.DataStreamURL) < 8 || c.DataStreamURL[:8] != "https://" {
+		// Allow http:// only for localhost development
+		if len(c.DataStreamURL) >= 7 && c.DataStreamURL[:7] == "http://" {
+			isLocalhost := len(c.DataStreamURL) > 16 && (c.DataStreamURL[7:16] == "localhost" || c.DataStreamURL[7:16] == "127.0.0.1")
+			if !isLocalhost {
+				return fmt.Errorf("data_stream_url must use https:// for non-localhost connections")
+			}
+		} else {
+			return fmt.Errorf("data_stream_url must start with https://")
+		}
+	}
 	if c.RelayURL == "" {
 		return fmt.Errorf("relay_url required")
+	}
+	// SECURITY: Require TLS for relay connections in production
+	// wss:// ensures encrypted WebSocket, https:// for HTTP API fallback
+	if c.RelayURL[:6] != "wss://" && c.RelayURL[:8] != "https://" {
+		// Allow ws:// and http:// only for localhost development
+		if c.RelayURL[:5] == "ws://" || c.RelayURL[:7] == "http://" {
+			// Check if it's localhost
+			isLocalhost := false
+			if len(c.RelayURL) > 12 && (c.RelayURL[5:14] == "localhost" || c.RelayURL[7:16] == "localhost") {
+				isLocalhost = true
+			}
+			if len(c.RelayURL) > 14 && (c.RelayURL[5:14] == "127.0.0.1" || c.RelayURL[7:16] == "127.0.0.1") {
+				isLocalhost = true
+			}
+			if !isLocalhost {
+				return fmt.Errorf("relay_url must use TLS (wss:// or https://) for non-localhost connections")
+			}
+		} else {
+			return fmt.Errorf("relay_url must start with wss://, https://, ws://, or http://")
+		}
 	}
 	if c.FeedID == "" {
 		return fmt.Errorf("feed_id required")
 	}
 	if c.Network == "" {
 		return fmt.Errorf("network required")
+	}
+
+	// SECURITY: Validate authorized_key format
+	// Must be a valid Ethereum address: "0x" + 40 hex chars
+	if c.AuthorizedKey == "" {
+		return fmt.Errorf("authorized_key required for HTTP trigger authentication")
+	}
+	if len(c.AuthorizedKey) != 42 {
+		return fmt.Errorf("authorized_key must be 42 characters (0x + 40 hex), got %d", len(c.AuthorizedKey))
+	}
+	if c.AuthorizedKey[:2] != "0x" {
+		return fmt.Errorf("authorized_key must start with '0x'")
+	}
+	// Validate hex characters
+	for i, char := range c.AuthorizedKey[2:] {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return fmt.Errorf("authorized_key contains invalid hex character at position %d", i+2)
+		}
 	}
 
 	// Validate cron-related fields if any are set

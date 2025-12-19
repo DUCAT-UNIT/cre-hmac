@@ -131,10 +131,30 @@ func fetchPrice(wc *WorkflowConfig, logger *slog.Logger, requester *http.SendReq
 	}
 
 	// Decode price from hex-encoded report
-	price, err := decodePrice(report.Report.FullReport)
+	priceResult, err := decodePrice(report.Report.FullReport)
 	if err != nil {
 		return nil, fmt.Errorf("price decode failed: %w", err)
 	}
+
+	// SECURITY: Log price offset selection for detecting feed format changes
+	// If the offset changes unexpectedly, it may indicate a Chainlink feed update
+	// that requires investigation. Normal offset is 448 for most BTC/USD feeds.
+	if priceResult.Offset != 448 {
+		logger.Warn("Price extracted from non-standard offset - verify feed format",
+			"offset", priceResult.Offset,
+			"expectedOffset", 448,
+			"reportLen", priceResult.ReportLen,
+			"validPricesFound", priceResult.ValidPrices,
+		)
+	} else {
+		logger.Debug("Price extracted from report",
+			"offset", priceResult.Offset,
+			"reportLen", priceResult.ReportLen,
+			"validPricesFound", priceResult.ValidPrices,
+		)
+	}
+
+	price := priceResult.Price
 
 	// Validate decoded price is within reasonable bounds
 	if err := validatePriceForEncoding(price); err != nil {
@@ -143,6 +163,36 @@ func fetchPrice(wc *WorkflowConfig, logger *slog.Logger, requester *http.SendReq
 
 	// Convert milliseconds to seconds for consistency with Unix timestamps
 	priceStamp := serverTime / 1000
+
+	// SECURITY: Validate timestamp precision and bounds after conversion
+	// Ensures the Unix timestamp is within reasonable range (2000-2100)
+	// and hasn't been truncated incorrectly from milliseconds
+	if priceStamp < 946684800 { // 2000-01-01
+		return nil, fmt.Errorf("price timestamp too old: %d (before year 2000)", priceStamp)
+	}
+	if priceStamp > 4102444800 { // 2100-01-01
+		return nil, fmt.Errorf("price timestamp too far in future: %d (after year 2100)", priceStamp)
+	}
+
+	// Additional validation: ensure millisecond precision hasn't caused issues
+	// Server time should be within 5 minutes of the observations timestamp
+	// (report.Report.ObservationsTimestamp is also available for cross-validation)
+	observationsTimestamp := report.Report.ObservationsTimestamp
+	if observationsTimestamp > 0 {
+		// ObservationsTimestamp is in seconds (Unix), compare with priceStamp
+		timeDiff := priceStamp - observationsTimestamp
+		if timeDiff < 0 {
+			timeDiff = -timeDiff
+		}
+		if timeDiff > 300 { // 5 minutes tolerance between server and observation time
+			logger.Warn("Significant time skew between server and observation timestamp",
+				"serverTimeSec", priceStamp,
+				"observationTimeSec", observationsTimestamp,
+				"diffSec", timeDiff,
+			)
+		}
+	}
+
 	logger.Info("Price fetched successfully", "price", price, "stamp", priceStamp)
 
 	return &PriceData{
@@ -152,30 +202,44 @@ func fetchPrice(wc *WorkflowConfig, logger *slog.Logger, requester *http.SendReq
 	}, nil
 }
 
+// PriceDecodeResult contains the decoded price and metadata about how it was extracted
+type PriceDecodeResult struct {
+	Price       float64 // Decoded price value
+	Offset      int     // Byte offset where price was found
+	ReportLen   int     // Total report length in bytes
+	ValidPrices int     // Number of valid prices found across all offsets
+}
+
 // decodePrice extracts BTC/USD from Chainlink report
 // Tries multiple offsets, returns first valid price (18 decimals)
-func decodePrice(reportHex string) (float64, error) {
+// Returns PriceDecodeResult with metadata for logging/debugging feed format changes
+func decodePrice(reportHex string) (*PriceDecodeResult, error) {
 	// Validate input
 	if reportHex == "" {
-		return 0, fmt.Errorf("report hex cannot be empty")
+		return nil, fmt.Errorf("report hex cannot be empty")
 	}
 
 	// Decode hex to bytes (handle optional 0x prefix)
 	reportBytes, err := hex.DecodeString(strings.TrimPrefix(reportHex, "0x"))
 	if err != nil {
-		return 0, fmt.Errorf("hex decode failed: %w", err)
+		return nil, fmt.Errorf("hex decode failed: %w", err)
 	}
 
 	// Validate minimum report length
 	// Report contains multiple 32-byte fields, minimum 544 bytes total
 	if len(reportBytes) < 544 {
-		return 0, fmt.Errorf("report too short: expected at least 544 bytes, got %d", len(reportBytes))
+		return nil, fmt.Errorf("report too short: expected at least 544 bytes, got %d", len(reportBytes))
 	}
 
 	// Try multiple known price field offsets in Chainlink report structure
 	// Different feed versions may store price at different offsets
 	offsets := []int{448, 480, 512}
-	var validPrices []float64
+
+	type priceResult struct {
+		price  float64
+		offset int
+	}
+	var validResults []priceResult
 
 	for _, offset := range offsets {
 		// Safety check for buffer overflow
@@ -198,17 +262,22 @@ func decodePrice(reportHex string) (float64, error) {
 
 		// Validate price is within reasonable bounds for BTC/USD
 		if price >= MinReasonablePrice && price <= MaxReasonablePrice {
-			validPrices = append(validPrices, price)
+			validResults = append(validResults, priceResult{price: price, offset: offset})
 		}
 	}
 
 	// Ensure at least one valid price was found
-	if len(validPrices) == 0 {
-		return 0, fmt.Errorf("no valid price found in report at offsets %v", offsets)
+	if len(validResults) == 0 {
+		return nil, fmt.Errorf("no valid price found in report at offsets %v", offsets)
 	}
 
-	// Return first valid price found
-	return validPrices[0], nil
+	// Return first valid price found with metadata
+	return &PriceDecodeResult{
+		Price:       validResults[0].price,
+		Offset:      validResults[0].offset,
+		ReportLen:   len(reportBytes),
+		ValidPrices: len(validResults),
+	}, nil
 }
 
 // validatePriceForEncoding validates price bounds

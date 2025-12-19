@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math/big"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -97,10 +98,18 @@ func GetPublicKey(privateKey []byte) []byte {
 }
 
 // DeriveKeys derives ECDSA and Schnorr public keys from a secp256k1 private key hex string.
-// 
+//
 // privateKeyHex is a hex-encoded 32-byte private key. On success it returns a KeyDerivation
 // containing the raw private key bytes and the serialized Schnorr public key as a hex string.
-// Returns an error if the hex decoding fails or the decoded key is not exactly 32 bytes.
+//
+// SECURITY: Private keys must be in the valid range for secp256k1: [1, n-1] where n is the
+// curve order. Keys equal to 0 or >= n would produce weak/invalid cryptographic operations.
+//
+// Returns an error if:
+//   - Hex decoding fails
+//   - Decoded key is not exactly 32 bytes
+//   - Key is zero (invalid)
+//   - Key is >= curve order (invalid for secp256k1)
 func DeriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 	privKeyBytes, err := hex.DecodeString(privateKeyHex)
 	if err != nil {
@@ -109,6 +118,19 @@ func DeriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 
 	if len(privKeyBytes) != 32 {
 		return nil, fmt.Errorf("invalid private key length: expected 32 bytes, got %d", len(privKeyBytes))
+	}
+
+	// SECURITY: Validate private key is within secp256k1 curve order bounds
+	// Valid range: 0 < key < n (curve order)
+	// secp256k1 order n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+	privKeyInt := new(big.Int).SetBytes(privKeyBytes)
+	curveOrder := btcec.S256().Params().N
+
+	if privKeyInt.Sign() == 0 {
+		return nil, fmt.Errorf("invalid private key: key cannot be zero")
+	}
+	if privKeyInt.Cmp(curveOrder) >= 0 {
+		return nil, fmt.Errorf("invalid private key: key must be less than secp256k1 curve order")
 	}
 
 	_, pubKey := btcec.PrivKeyFromBytes(privKeyBytes)

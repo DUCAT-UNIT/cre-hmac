@@ -268,12 +268,11 @@ func PubKeyToAddress(pubKey *ecdsa.PublicKey) string {
 }
 
 // GenerateRequestID generates a cryptographically random 32-character hex request ID.
-// It panics if the system's random number generator fails, as this indicates
-// a critical security issue that should not be silently ignored.
-func GenerateRequestID() string {
+// Returns an error if the system's random number generator fails.
+func GenerateRequestID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Sprintf("crypto/rand.Read failed: %v", err))
+		return "", fmt.Errorf("crypto/rand.Read failed: %w", err)
 	}
-	return hex.EncodeToString(b)
+	return hex.EncodeToString(b), nil
 }

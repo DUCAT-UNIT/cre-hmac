@@ -410,9 +410,9 @@ func TestValidateQuoteAge(t *testing.T) {
 		errMsg      string
 	}{
 		// Valid ages
-		{"fresh quote", currentTime - 1800, currentTime, maxAge, false, ""},
-		{"at max age", currentTime - maxAge, currentTime, maxAge, false, ""},
-		{"just created", currentTime, currentTime, maxAge, false, ""},
+		{"fresh quote", currentTime - 30, currentTime, maxAge, false, ""},      // 30 seconds old
+		{"at max age", currentTime - maxAge, currentTime, maxAge, false, ""},   // exactly at max (60 sec)
+		{"just created", currentTime, currentTime, maxAge, false, ""},          // brand new
 
 		// Invalid ages
 		{"too old", currentTime - maxAge - 1, currentTime, maxAge, true, "too old"},
@@ -435,6 +435,69 @@ func TestValidateQuoteAge(t *testing.T) {
 			}
 		})
 	}
+}
+
+// =============================================================================
+// Price Truncation Tests
+// =============================================================================
+
+func TestTruncatePriceToUint32(t *testing.T) {
+	tests := []struct {
+		name    string
+		price   float64
+		want    uint32
+		wantErr bool
+		errMsg  string
+	}{
+		// Valid prices - floor truncation behavior
+		{"whole number", 100000.0, 100000, false, ""},
+		{"with fraction (floor)", 100000.99, 100000, false, ""},
+		{"with small fraction", 100000.01, 100000, false, ""},
+		{"exactly 0.5", 100000.5, 100000, false, ""},
+		{"zero", 0.0, 0, false, ""},
+		{"small positive", 1.0, 1, false, ""},
+		{"max uint32", float64(MaxPriceValue), MaxPriceValue, false, ""},
+
+		// Invalid prices
+		{"negative", -100.0, 0, true, "negative"},
+		{"NaN", math.NaN(), 0, true, "NaN"},
+		{"positive infinity", math.Inf(1), 0, true, "infinite"},
+		{"negative infinity", math.Inf(-1), 0, true, "infinite"},
+		{"exceeds uint32 max", float64(MaxPriceValue) + 1, 0, true, "exceeds uint32"},
+		{"large overflow", 1e15, 0, true, "exceeds uint32"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := TruncatePriceToUint32(tt.price)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("TruncatePriceToUint32(%v) error = %v, wantErr %v", tt.price, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("TruncatePriceToUint32(%v) = %d, want %d", tt.price, got, tt.want)
+			}
+			if tt.wantErr && tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("TruncatePriceToUint32(%v) error = %v, want error containing %q", tt.price, err, tt.errMsg)
+			}
+		})
+	}
+}
+
+func TestMustTruncatePriceToUint32(t *testing.T) {
+	// Valid case - should not panic
+	result := MustTruncatePriceToUint32(100000.99)
+	if result != 100000 {
+		t.Errorf("MustTruncatePriceToUint32(100000.99) = %d, want 100000", result)
+	}
+
+	// Invalid case - should panic
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("MustTruncatePriceToUint32(-1) should panic")
+		}
+	}()
+	MustTruncatePriceToUint32(-1)
 }
 
 // =============================================================================

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -18,15 +19,33 @@ import (
 // Routes HTTP triggers to CREATE or EVALUATE handlers
 
 const (
-	SecretPrivateKey  = "private_key"
+	SecretPrivateKey   = "private_key"
 	SecretClientSecret = "client_secret"
 )
 
 // WorkflowConfig holds both config and secrets (fetched at runtime)
+// SECURITY: Secrets are stored as []byte to enable proper zeroing after use
 type WorkflowConfig struct {
-	Config       *Config
-	PrivateKey   string
-	ClientSecret string
+	Config           *Config
+	PrivateKey       string // Hex-encoded private key (for compatibility with existing code)
+	PrivateKeyBytes  []byte // Raw private key bytes - ZERO AFTER USE
+	ClientSecret     string // Client secret for API auth
+	ClientSecretBytes []byte // Raw client secret bytes - ZERO AFTER USE
+}
+
+// ZeroSecrets zeros all secret byte arrays in the WorkflowConfig
+// SECURITY: Call this after cryptographic operations to minimize secret exposure window
+func (wc *WorkflowConfig) ZeroSecrets() {
+	if wc.PrivateKeyBytes != nil {
+		for i := range wc.PrivateKeyBytes {
+			wc.PrivateKeyBytes[i] = 0
+		}
+	}
+	if wc.ClientSecretBytes != nil {
+		for i := range wc.ClientSecretBytes {
+			wc.ClientSecretBytes[i] = 0
+		}
+	}
 }
 
 // GenericHttpRequest is a wrapper to parse action field first
@@ -54,6 +73,8 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 	if err != nil {
 		return nil, err
 	}
+	// SECURITY: Zero secrets after handler completes
+	defer wc.ZeroSecrets()
 
 	// First, check if there's an explicit action field
 	var genericReq GenericHttpRequest
@@ -113,6 +134,8 @@ func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (
 	if err != nil {
 		return nil, err
 	}
+	// SECURITY: Zero secrets after handler completes
+	defer wc.ZeroSecrets()
 
 	// Use generation parameters from config
 	// Use QuoteDomain from config, or default to "auto-gen"
@@ -150,6 +173,8 @@ func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (
 // It returns a WorkflowConfig populated with the provided Config and the fetched
 // private_key and client_secret. An error is returned if a secret cannot be fetched,
 // if private_key is not exactly 64 characters, or if client_secret is empty.
+// SECURITY: The returned WorkflowConfig contains raw secret bytes - caller MUST call
+// ZeroSecrets() when done with cryptographic operations.
 func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, error) {
 	logger := runtime.Logger()
 
@@ -164,20 +189,36 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 		return nil, fmt.Errorf("private_key must be 64 hex characters, got %d", len(privateKeySecret.Value))
 	}
 
+	// Decode private key to bytes immediately
+	privateKeyBytes, err := hex.DecodeString(privateKeySecret.Value)
+	if err != nil {
+		return nil, fmt.Errorf("private_key is not valid hex: %w", err)
+	}
+
 	clientSecretReq := &pb.SecretRequest{Id: SecretClientSecret}
 	clientSecretSecret, err := runtime.GetSecret(clientSecretReq).Await()
 	if err != nil {
+		// Zero private key bytes before returning error
+		for i := range privateKeyBytes {
+			privateKeyBytes[i] = 0
+		}
 		logger.Error("Failed to fetch client_secret secret", "error", err)
 		return nil, fmt.Errorf("failed to fetch client_secret: %w", err)
 	}
 	if clientSecretSecret.Value == "" {
+		// Zero private key bytes before returning error
+		for i := range privateKeyBytes {
+			privateKeyBytes[i] = 0
+		}
 		return nil, fmt.Errorf("client_secret cannot be empty")
 	}
 
 	return &WorkflowConfig{
-		Config:       config,
-		PrivateKey:   privateKeySecret.Value,
-		ClientSecret: clientSecretSecret.Value,
+		Config:            config,
+		PrivateKey:        privateKeySecret.Value,
+		PrivateKeyBytes:   privateKeyBytes,
+		ClientSecret:      clientSecretSecret.Value,
+		ClientSecretBytes: []byte(clientSecretSecret.Value),
 	}, nil
 }
 
@@ -194,13 +235,15 @@ func InitWorkflow(config *Config, logger *slog.Logger, secrets cre.SecretsProvid
 
 	logger.Info("DUCAT workflow initialized", "network", config.Network, "relayUrl", config.RelayURL)
 
-	// Configure HTTP trigger with authorized Ethereum address
-	// This allows JWT authentication from the specified address
+	// Configure HTTP trigger with authorized Ethereum address from config
+	// SECURITY: AuthorizedKey is validated during config.Validate() to ensure it's a valid
+	// Ethereum address format (0x + 40 hex chars). JWT authentication is enforced by the CRE
+	// runtime - only requests signed by this address will be accepted.
 	httpConfig := &http.Config{
 		AuthorizedKeys: []*http.AuthorizedKey{
 			{
 				Type:      http.KeyType_KEY_TYPE_ECDSA_EVM,
-				PublicKey: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82",
+				PublicKey: config.AuthorizedKey,
 			},
 		},
 	}
