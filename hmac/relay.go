@@ -147,9 +147,10 @@ func fetchEventByDTag(config *Config, logger *slog.Logger, sendRequester *http.S
 		return nil, fmt.Errorf("d tag cannot be empty")
 	}
 
-	// Validate d tag format (should be 40 hex characters for hash160)
-	if len(dTag) != 40 {
-		return nil, fmt.Errorf("invalid d tag length: expected 40 hex chars, got %d", len(dTag))
+	// SECURITY: Validate d tag format (should be 40 lowercase hex characters for hash160)
+	// This prevents injection attacks and ensures the tag can be used safely in URLs
+	if !IsValidTholdHash(dTag) {
+		return nil, fmt.Errorf("invalid d tag format: must be exactly 40 lowercase hex chars, got %q", dTag)
 	}
 
 	// Convert WebSocket URL to HTTP API URL

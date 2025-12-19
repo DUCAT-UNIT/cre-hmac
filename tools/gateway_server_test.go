@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -14,12 +16,18 @@ import (
 	"testing"
 	"time"
 
+	"ducat/internal/ethsign"
+
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/ethereum/go-ethereum/crypto"
 )
 
+
 // Test helpers
-func setupTestEnv(t *testing.T) {
-	t.Helper()
+// setupTestEnv accepts testing.TB to work with both *testing.T and *testing.B
+func setupTestEnv(tb testing.TB) {
+	tb.Helper()
 
 	// Set required environment variables
 	os.Setenv("CRE_WORKFLOW_ID", "test-workflow-id-12345")
@@ -27,19 +35,67 @@ func setupTestEnv(t *testing.T) {
 	os.Setenv("GATEWAY_CALLBACK_URL", "http://localhost:8080/webhook/ducat")
 	os.Setenv("DUCAT_PRIVATE_KEY", "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c")
 
-	// Reset globals
-	pendingRequests = make(map[string]*PendingRequest)
-
-	// Load private key for tests
-	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
-	privKeyBytes, _ := hex.DecodeString(privateKeyHex)
-	privateKey, _ = crypto.ToECDSA(privKeyBytes)
+	// Reset server state if initialized
+	if server != nil {
+		server.requestsMutex.Lock()
+		server.pendingRequests = make(map[string]*PendingRequest)
+		server.requestsMutex.Unlock()
+	}
 }
 
 func resetGlobals() {
-	requestsMutex.Lock()
-	pendingRequests = make(map[string]*PendingRequest)
-	requestsMutex.Unlock()
+	if server != nil {
+		server.requestsMutex.Lock()
+		server.pendingRequests = make(map[string]*PendingRequest)
+		server.requestsMutex.Unlock()
+	}
+}
+
+// Test private key for signing webhooks (different from server key)
+var testWebhookPrivKey, _ = hex.DecodeString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+
+// createSignedWebhook creates a properly signed WebhookPayload for testing.
+// This simulates a valid Nostr event from the CRE.
+func createSignedWebhook(eventType, domain, content string, tags [][]string) WebhookPayload {
+	// Get the Schnorr public key from the test private key
+	_, pubKey := btcec.PrivKeyFromBytes(testWebhookPrivKey)
+	pubKeyHex := hex.EncodeToString(schnorr.SerializePubKey(pubKey))
+
+	// Add domain tag if not present
+	hasDomainTag := false
+	for _, tag := range tags {
+		if len(tag) >= 1 && tag[0] == "domain" {
+			hasDomainTag = true
+			break
+		}
+	}
+	if !hasDomainTag && domain != "" {
+		tags = append(tags, []string{"domain", domain})
+	}
+
+	payload := WebhookPayload{
+		EventType: eventType,
+		PubKey:    pubKeyHex,
+		CreatedAt: time.Now().Unix(),
+		Kind:      30078, // Custom kind for DUCAT
+		Tags:      tags,
+		Content:   content,
+	}
+
+	// Compute event ID (NIP-01 format)
+	tagsJSON, _ := json.Marshal(payload.Tags)
+	serialized := fmt.Sprintf("[0,%q,%d,%d,%s,%q]",
+		payload.PubKey, payload.CreatedAt, payload.Kind, string(tagsJSON), payload.Content)
+	hash := sha256.Sum256([]byte(serialized))
+	payload.EventID = hex.EncodeToString(hash[:])
+
+	// Sign the event ID with Schnorr
+	privKey, _ := btcec.PrivKeyFromBytes(testWebhookPrivKey)
+	eventIDBytes, _ := hex.DecodeString(payload.EventID)
+	sig, _ := schnorr.Sign(privKey, eventIDBytes)
+	payload.Sig = hex.EncodeToString(sig.Serialize())
+
+	return payload
 }
 
 // TestLoadConfig tests configuration loading from environment variables
@@ -48,7 +104,7 @@ func TestLoadConfig(t *testing.T) {
 		name        string
 		envVars     map[string]string
 		shouldPanic bool
-		validate    func(t *testing.T)
+		validate    func(t *testing.T, cfg *GatewayConfig)
 	}{
 		{
 			name: "all required vars set",
@@ -58,44 +114,44 @@ func TestLoadConfig(t *testing.T) {
 				"GATEWAY_CALLBACK_URL": "http://example.com/webhook",
 			},
 			shouldPanic: false,
-			validate: func(t *testing.T) {
-				if WORKFLOW_ID != "workflow123" {
-					t.Errorf("WORKFLOW_ID = %s, want workflow123", WORKFLOW_ID)
+			validate: func(t *testing.T, cfg *GatewayConfig) {
+				if cfg.WorkflowID != "workflow123" {
+					t.Errorf("WorkflowID = %s, want workflow123", cfg.WorkflowID)
 				}
-				if AUTHORIZED_KEY != "0xabc123" {
-					t.Errorf("AUTHORIZED_KEY = %s, want 0xabc123", AUTHORIZED_KEY)
+				if cfg.AuthorizedKey != "0xabc123" {
+					t.Errorf("AuthorizedKey = %s, want 0xabc123", cfg.AuthorizedKey)
 				}
-				if CALLBACK_URL != "http://example.com/webhook" {
-					t.Errorf("CALLBACK_URL = %s, want http://example.com/webhook", CALLBACK_URL)
+				if cfg.CallbackURL != "http://example.com/webhook" {
+					t.Errorf("CallbackURL = %s, want http://example.com/webhook", cfg.CallbackURL)
 				}
-				if BLOCK_TIMEOUT != 60*time.Second {
-					t.Errorf("BLOCK_TIMEOUT = %v, want 60s", BLOCK_TIMEOUT)
+				if cfg.BlockTimeout != 60*time.Second {
+					t.Errorf("BlockTimeout = %v, want 60s", cfg.BlockTimeout)
 				}
-				if MAX_PENDING != 1000 {
-					t.Errorf("MAX_PENDING = %d, want 1000", MAX_PENDING)
+				if cfg.MaxPending != 1000 {
+					t.Errorf("MaxPending = %d, want 1000", cfg.MaxPending)
 				}
 			},
 		},
 		{
 			name: "custom timeout and limits",
 			envVars: map[string]string{
-				"CRE_WORKFLOW_ID":         "workflow123",
-				"DUCAT_AUTHORIZED_KEY":    "0xabc123",
-				"GATEWAY_CALLBACK_URL":    "http://example.com/webhook",
-				"BLOCK_TIMEOUT_SECONDS":   "30",
+				"CRE_WORKFLOW_ID":          "workflow123",
+				"DUCAT_AUTHORIZED_KEY":     "0xabc123",
+				"GATEWAY_CALLBACK_URL":     "http://example.com/webhook",
+				"BLOCK_TIMEOUT_SECONDS":    "30",
 				"CLEANUP_INTERVAL_SECONDS": "60",
-				"MAX_PENDING_REQUESTS":    "500",
+				"MAX_PENDING_REQUESTS":     "500",
 			},
 			shouldPanic: false,
-			validate: func(t *testing.T) {
-				if BLOCK_TIMEOUT != 30*time.Second {
-					t.Errorf("BLOCK_TIMEOUT = %v, want 30s", BLOCK_TIMEOUT)
+			validate: func(t *testing.T, cfg *GatewayConfig) {
+				if cfg.BlockTimeout != 30*time.Second {
+					t.Errorf("BlockTimeout = %v, want 30s", cfg.BlockTimeout)
 				}
-				if CLEANUP_INTERVAL != 60*time.Second {
-					t.Errorf("CLEANUP_INTERVAL = %v, want 60s", CLEANUP_INTERVAL)
+				if cfg.CleanupInterval != 60*time.Second {
+					t.Errorf("CleanupInterval = %v, want 60s", cfg.CleanupInterval)
 				}
-				if MAX_PENDING != 500 {
-					t.Errorf("MAX_PENDING = %d, want 500", MAX_PENDING)
+				if cfg.MaxPending != 500 {
+					t.Errorf("MaxPending = %d, want 500", cfg.MaxPending)
 				}
 			},
 		},
@@ -119,10 +175,10 @@ func TestLoadConfig(t *testing.T) {
 				}()
 			}
 
-			loadConfig()
+			cfg := loadConfig()
 
 			if tt.validate != nil {
-				tt.validate(t)
+				tt.validate(t, cfg)
 			}
 		})
 	}
@@ -142,8 +198,14 @@ func TestHandleHealth(t *testing.T) {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 	}
 
-	if string(body) != "OK" {
-		t.Errorf("body = %s, want OK", body)
+	// Health endpoint now returns JSON with status field
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatalf("failed to parse response: %v", err)
+	}
+
+	if status, ok := result["status"].(string); !ok || status != "healthy" {
+		t.Errorf("status = %v, want 'healthy'", result["status"])
 	}
 
 	// Check CORS header
@@ -214,7 +276,7 @@ func TestHandleCreateValidation(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/api/quote"+tt.queryParams, nil)
 			w := httptest.NewRecorder()
 
-			handleCreate(w, req)
+			server.handleCreate(w, req)
 
 			resp := w.Result()
 			body, _ := io.ReadAll(resp.Body)
@@ -237,12 +299,12 @@ func TestHandleCreateMaxPending(t *testing.T) {
 	resetGlobals()
 
 	// Set a low limit for testing
-	MAX_PENDING = 2
+	server.config.MaxPending = 2
 
 	// Fill up pending requests
-	for i := 0; i < MAX_PENDING; i++ {
+	for i := 0; i < server.config.MaxPending; i++ {
 		domain := fmt.Sprintf("test-domain-%d", i)
-		pendingRequests[domain] = &PendingRequest{
+		server.pendingRequests[domain] = &PendingRequest{
 			RequestID:  domain,
 			CreatedAt:  time.Now(),
 			ResultChan: make(chan *WebhookPayload, 1),
@@ -253,7 +315,7 @@ func TestHandleCreateMaxPending(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/quote?th=100", nil)
 	w := httptest.NewRecorder()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -267,7 +329,7 @@ func TestHandleCreateMaxPending(t *testing.T) {
 
 	// Cleanup
 	resetGlobals()
-	MAX_PENDING = 1000
+	server.config.MaxPending = 1000
 }
 
 // TestHandleWebhook tests webhook processing
@@ -276,99 +338,131 @@ func TestHandleWebhook(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	tests := []struct {
-		name           string
-		method         string
-		payload        interface{}
-		setupPending   bool
-		domain         string
-		expectedStatus int
-	}{
-		{
-			name:           "wrong method",
-			method:         "GET",
-			payload:        nil,
-			expectedStatus: http.StatusMethodNotAllowed,
-		},
-		{
-			name:           "invalid JSON",
-			method:         "POST",
-			payload:        "invalid json",
-			expectedStatus: http.StatusBadRequest,
-		},
-		{
-			name:   "valid webhook with pending request",
-			method: "POST",
-			payload: WebhookPayload{
-				EventType: "create",
-				EventID:   "event123",
-				Tags:      [][]string{{"domain", "test-domain"}},
-				Content:   `{"thold_price": 100.5, "thold_hash": "abc123"}`,
-			},
-			setupPending:   true,
-			domain:         "test-domain",
-			expectedStatus: http.StatusOK,
-		},
-		{
-			name:   "webhook without pending request",
-			method: "POST",
-			payload: WebhookPayload{
-				EventType: "create",
-				EventID:   "event456",
-				Tags:      [][]string{{"domain", "unknown-domain"}},
-				Content:   `{"thold_price": 100.5}`,
-			},
-			setupPending:   false,
-			expectedStatus: http.StatusOK,
-		},
-	}
+	t.Run("wrong method", func(t *testing.T) {
+		resetGlobals()
+		req := httptest.NewRequest("GET", "/webhook/ducat", nil)
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+		if w.Result().StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusMethodNotAllowed)
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			resetGlobals()
+	t.Run("invalid JSON", func(t *testing.T) {
+		resetGlobals()
+		req := httptest.NewRequest("POST", "/webhook/ducat", strings.NewReader("invalid json"))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+		if w.Result().StatusCode != http.StatusBadRequest {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusBadRequest)
+		}
+	})
 
-			// Setup pending request if needed
-			if tt.setupPending {
-				pendingRequests[tt.domain] = &PendingRequest{
-					RequestID:  tt.domain,
-					CreatedAt:  time.Now(),
-					ResultChan: make(chan *WebhookPayload, 1),
-					Status:     "pending",
-				}
+	t.Run("valid webhook with pending request", func(t *testing.T) {
+		resetGlobals()
+		domain := "test-domain"
+
+		// Setup pending request
+		server.pendingRequests[domain] = &PendingRequest{
+			RequestID:  domain,
+			CreatedAt:  time.Now(),
+			ResultChan: make(chan *WebhookPayload, 1),
+			Status:     "pending",
+		}
+
+		// Create properly signed webhook
+		payload := createSignedWebhook("create", domain, `{"thold_price": 100, "thold_hash": "abc123"}`, nil)
+		jsonData, _ := json.Marshal(payload)
+
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+
+		if w.Result().StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusOK)
+		}
+
+		// Verify pending request received the webhook
+		pending := server.pendingRequests[domain]
+		select {
+		case result := <-pending.ResultChan:
+			if result.EventID != payload.EventID {
+				t.Errorf("received event_id = %s, want %s", result.EventID, payload.EventID)
 			}
+		case <-time.After(100 * time.Millisecond):
+			t.Error("webhook did not unblock pending request")
+		}
+	})
 
-			var body io.Reader
-			if str, ok := tt.payload.(string); ok {
-				body = strings.NewReader(str)
-			} else if tt.payload != nil {
-				jsonData, _ := json.Marshal(tt.payload)
-				body = bytes.NewReader(jsonData)
-			}
+	t.Run("webhook without pending request", func(t *testing.T) {
+		resetGlobals()
 
-			req := httptest.NewRequest(tt.method, "/webhook/ducat", body)
-			w := httptest.NewRecorder()
+		// Create properly signed webhook for unknown domain
+		payload := createSignedWebhook("create", "unknown-domain", `{"thold_price": 100}`, nil)
+		jsonData, _ := json.Marshal(payload)
 
-			handleWebhook(w, req)
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
 
-			resp := w.Result()
-			if resp.StatusCode != tt.expectedStatus {
-				t.Errorf("status = %d, want %d", resp.StatusCode, tt.expectedStatus)
-			}
+		if w.Result().StatusCode != http.StatusOK {
+			t.Errorf("status = %d, want %d", w.Result().StatusCode, http.StatusOK)
+		}
+	})
 
-			// If we set up a pending request, verify it received the webhook
-			if tt.setupPending {
-				pending := pendingRequests[tt.domain]
-				select {
-				case result := <-pending.ResultChan:
-					if result.EventID != "event123" {
-						t.Errorf("received event_id = %s, want event123", result.EventID)
-					}
-				case <-time.After(100 * time.Millisecond):
-					t.Error("webhook did not unblock pending request")
-				}
-			}
-		})
-	}
+	t.Run("unsigned webhook rejected", func(t *testing.T) {
+		resetGlobals()
+
+		// Create unsigned webhook (missing signature)
+		payload := WebhookPayload{
+			EventType: "create",
+			EventID:   "event123",
+			PubKey:    strings.Repeat("a", 64),
+			Tags:      [][]string{{"domain", "test-domain"}},
+			Content:   `{"thold_price": 100}`,
+			CreatedAt: time.Now().Unix(),
+		}
+		jsonData, _ := json.Marshal(payload)
+
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d (unauthorized for unsigned webhook)", w.Result().StatusCode, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("expired webhook rejected", func(t *testing.T) {
+		resetGlobals()
+
+		// Create a signed webhook with an old timestamp
+		payload := createSignedWebhook("create", "test-domain", `{"thold_price": 100}`, nil)
+		// Manually override to make it expired (6 minutes old)
+		payload.CreatedAt = time.Now().Unix() - 360
+
+		// Re-sign with old timestamp
+		tagsJSON, _ := json.Marshal(payload.Tags)
+		serialized := fmt.Sprintf("[0,%q,%d,%d,%s,%q]",
+			payload.PubKey, payload.CreatedAt, payload.Kind, string(tagsJSON), payload.Content)
+		hash := sha256.Sum256([]byte(serialized))
+		payload.EventID = hex.EncodeToString(hash[:])
+
+		privKey, _ := btcec.PrivKeyFromBytes(testWebhookPrivKey)
+		eventIDBytes, _ := hex.DecodeString(payload.EventID)
+		sig, _ := schnorr.Sign(privKey, eventIDBytes)
+		payload.Sig = hex.EncodeToString(sig.Serialize())
+
+		jsonData, _ := json.Marshal(payload)
+
+		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
+		w := httptest.NewRecorder()
+		server.handleWebhook(w, req)
+
+		if w.Result().StatusCode != http.StatusUnauthorized {
+			t.Errorf("status = %d, want %d (unauthorized for expired webhook)", w.Result().StatusCode, http.StatusUnauthorized)
+		}
+	})
 }
 
 // TestHandleCheckValidation tests /check endpoint validation
@@ -431,7 +525,7 @@ func TestHandleCheckValidation(t *testing.T) {
 			req := httptest.NewRequest(tt.method, "/check", body)
 			w := httptest.NewRecorder()
 
-			handleCheck(w, req)
+			server.handleCheck(w, req)
 
 			resp := w.Result()
 			if resp.StatusCode != tt.expectedStatus {
@@ -485,7 +579,7 @@ func TestHandleStatus(t *testing.T) {
 			method: "GET",
 			path:   "/status/pending-req",
 			setupRequest: func() {
-				pendingRequests["pending-req"] = &PendingRequest{
+				server.pendingRequests["pending-req"] = &PendingRequest{
 					RequestID:  "pending-req",
 					CreatedAt:  time.Now(),
 					ResultChan: make(chan *WebhookPayload, 1),
@@ -511,12 +605,13 @@ func TestHandleStatus(t *testing.T) {
 			method: "GET",
 			path:   "/status/completed-req",
 			setupRequest: func() {
-				pendingRequests["completed-req"] = &PendingRequest{
+				server.pendingRequests["completed-req"] = &PendingRequest{
 					RequestID: "completed-req",
 					CreatedAt: time.Now(),
 					Status:    "completed",
 					Result: &WebhookPayload{
-						Content: `{"quote_price": 100.7, "thold_hash": "abc123"}`,
+						// Full CRE format payload with core-ts PriceContract fields
+						Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":100,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":95}`,
 					},
 				}
 			},
@@ -526,13 +621,23 @@ func TestHandleStatus(t *testing.T) {
 				if err := json.Unmarshal(body, &result); err != nil {
 					t.Fatalf("failed to parse response: %v", err)
 				}
-				// Check that quote_price was rounded down
-				if quotePrice, ok := result["quote_price"].(float64); ok {
-					if quotePrice != 100.0 {
-						t.Errorf("quote_price = %f, want 100.0 (rounded down)", quotePrice)
+				// Check core-ts PriceContract fields
+				if basePrice, ok := result["base_price"].(float64); ok {
+					if basePrice != 100.0 {
+						t.Errorf("base_price = %f, want 100.0", basePrice)
 					}
 				} else {
-					t.Error("quote_price not found in response")
+					t.Error("base_price not found in response")
+				}
+				// Verify PriceContract fields exist
+				if _, ok := result["chain_network"]; !ok {
+					t.Error("chain_network not found in response")
+				}
+				if _, ok := result["commit_hash"]; !ok {
+					t.Error("commit_hash not found in response")
+				}
+				if _, ok := result["contract_id"]; !ok {
+					t.Error("contract_id not found in response")
 				}
 			},
 		},
@@ -549,7 +654,7 @@ func TestHandleStatus(t *testing.T) {
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			w := httptest.NewRecorder()
 
-			handleStatus(w, req)
+			server.handleStatus(w, req)
 
 			resp := w.Result()
 			if resp.StatusCode != tt.expectedStatus {
@@ -571,54 +676,54 @@ func TestCleanupOldRequests(t *testing.T) {
 	resetGlobals()
 
 	// Set very short intervals for testing
-	oldCleanupInterval := CLEANUP_INTERVAL
-	oldBlockTimeout := BLOCK_TIMEOUT
-	CLEANUP_INTERVAL = 50 * time.Millisecond
-	BLOCK_TIMEOUT = 50 * time.Millisecond
+	oldCleanupInterval := server.config.CleanupInterval
+	oldBlockTimeout := server.config.BlockTimeout
+	server.config.CleanupInterval = 50 * time.Millisecond
+	server.config.BlockTimeout = 50 * time.Millisecond
 	defer func() {
-		CLEANUP_INTERVAL = oldCleanupInterval
-		BLOCK_TIMEOUT = oldBlockTimeout
+		server.config.CleanupInterval = oldCleanupInterval
+		server.config.BlockTimeout = oldBlockTimeout
 	}()
 
 	now := time.Now()
 
 	// Add various requests
-	pendingRequests["old-completed"] = &PendingRequest{
+	server.pendingRequests["old-completed"] = &PendingRequest{
 		RequestID:  "old-completed",
 		CreatedAt:  now.Add(-10 * time.Minute),
 		Status:     "completed",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["old-timeout"] = &PendingRequest{
+	server.pendingRequests["old-timeout"] = &PendingRequest{
 		RequestID:  "old-timeout",
 		CreatedAt:  now.Add(-10 * time.Minute),
 		Status:     "timeout",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["stale-pending"] = &PendingRequest{
+	server.pendingRequests["stale-pending"] = &PendingRequest{
 		RequestID:  "stale-pending",
 		CreatedAt:  now.Add(-5 * time.Minute),
 		Status:     "pending",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["recent-completed"] = &PendingRequest{
+	server.pendingRequests["recent-completed"] = &PendingRequest{
 		RequestID:  "recent-completed",
 		CreatedAt:  now.Add(-1 * time.Minute),
 		Status:     "completed",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	pendingRequests["active-pending"] = &PendingRequest{
+	server.pendingRequests["active-pending"] = &PendingRequest{
 		RequestID:  "active-pending",
 		CreatedAt:  now,
 		Status:     "pending",
 		ResultChan: make(chan *WebhookPayload, 1),
 	}
 
-	initialCount := len(pendingRequests)
+	initialCount := len(server.pendingRequests)
 	if initialCount != 5 {
 		t.Fatalf("setup failed: got %d requests, want 5", initialCount)
 	}
@@ -628,33 +733,33 @@ func TestCleanupOldRequests(t *testing.T) {
 	doneChan := make(chan bool)
 
 	go func() {
-		ticker := time.NewTicker(CLEANUP_INTERVAL)
+		ticker := time.NewTicker(server.config.CleanupInterval)
 		defer ticker.Stop()
 		defer close(doneChan)
 
 		select {
 		case <-ticker.C:
-			requestsMutex.Lock()
+			server.requestsMutex.Lock()
 			now := time.Now()
 			cleaned := 0
 
-			for id, req := range pendingRequests {
+			for id, req := range server.pendingRequests {
 				shouldDelete := false
 
 				if req.Status == "completed" && now.Sub(req.CreatedAt) > 5*time.Minute {
 					shouldDelete = true
 				} else if req.Status == "timeout" && now.Sub(req.CreatedAt) > 5*time.Minute {
 					shouldDelete = true
-				} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*BLOCK_TIMEOUT {
+				} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*server.config.BlockTimeout {
 					shouldDelete = true
 				}
 
 				if shouldDelete {
-					delete(pendingRequests, id)
+					delete(server.pendingRequests, id)
 					cleaned++
 				}
 			}
-			requestsMutex.Unlock()
+			server.requestsMutex.Unlock()
 		case <-stopChan:
 			return
 		}
@@ -669,16 +774,16 @@ func TestCleanupOldRequests(t *testing.T) {
 	}
 
 	// Verify cleanup
-	requestsMutex.RLock()
-	defer requestsMutex.RUnlock()
+	server.requestsMutex.RLock()
+	defer server.requestsMutex.RUnlock()
 
 	expectedRemaining := []string{"recent-completed", "active-pending"}
-	if len(pendingRequests) != len(expectedRemaining) {
-		t.Errorf("after cleanup: got %d requests, want %d", len(pendingRequests), len(expectedRemaining))
+	if len(server.pendingRequests) != len(expectedRemaining) {
+		t.Errorf("after cleanup: got %d requests, want %d", len(server.pendingRequests), len(expectedRemaining))
 	}
 
 	for _, key := range expectedRemaining {
-		if _, exists := pendingRequests[key]; !exists {
+		if _, exists := server.pendingRequests[key]; !exists {
 			t.Errorf("request %s should not have been cleaned up", key)
 		}
 	}
@@ -731,44 +836,68 @@ func TestGetTag(t *testing.T) {
 // TestGetTholdHash tests the helper function
 func TestGetTholdHash(t *testing.T) {
 	tests := []struct {
-		name     string
-		payload  *WebhookPayload
-		expected string
+		name        string
+		payload     *WebhookPayload
+		expected    string
+		expectError bool
 	}{
 		{
 			name: "valid payload",
 			payload: &WebhookPayload{
 				Content: `{"thold_hash": "abc123def456"}`,
 			},
-			expected: "abc123def456",
+			expected:    "abc123def456",
+			expectError: false,
 		},
 		{
 			name: "invalid JSON",
 			payload: &WebhookPayload{
 				Content: `invalid json`,
 			},
-			expected: "",
+			expected:    "",
+			expectError: true,
 		},
 		{
 			name: "missing thold_hash",
 			payload: &WebhookPayload{
 				Content: `{"other_field": "value"}`,
 			},
-			expected: "",
+			expected:    "",
+			expectError: false, // Valid JSON, just missing field
+		},
+		{
+			name:        "nil payload",
+			payload:     nil,
+			expected:    "",
+			expectError: true,
+		},
+		{
+			name: "empty content",
+			payload: &WebhookPayload{
+				Content: "",
+			},
+			expected:    "",
+			expectError: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := getTholdHash(tt.payload)
+			result, err := getTholdHash(tt.payload)
 			if result != tt.expected {
 				t.Errorf("getTholdHash() = %s, want %s", result, tt.expected)
+			}
+			if tt.expectError && err == nil {
+				t.Errorf("getTholdHash() expected error but got nil")
+			}
+			if !tt.expectError && err != nil {
+				t.Errorf("getTholdHash() unexpected error: %v", err)
 			}
 		})
 	}
 }
 
-// TestEncodeBase64URL tests the base64url encoding function
+// TestEncodeBase64URL tests the base64url encoding function using standard library
 func TestEncodeBase64URL(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -804,34 +933,41 @@ func TestEncodeBase64URL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := encodeBase64URL(tt.input)
+			result := base64.RawURLEncoding.EncodeToString(tt.input)
 			if result != tt.expected {
-				t.Errorf("encodeBase64URL() = %s, want %s", result, tt.expected)
+				t.Errorf("base64.RawURLEncoding.EncodeToString() = %s, want %s", result, tt.expected)
 			}
 		})
 	}
 }
 
-// TestGenerateRequestID tests request ID generation
+// TestGenerateRequestID tests request ID generation using ethsign package
 func TestGenerateRequestID(t *testing.T) {
-	id1 := generateRequestID()
-	id2 := generateRequestID()
+	id1, err := ethsign.GenerateRequestID()
+	if err != nil {
+		t.Fatalf("GenerateRequestID() error = %v", err)
+	}
+
+	id2, err := ethsign.GenerateRequestID()
+	if err != nil {
+		t.Fatalf("GenerateRequestID() error = %v", err)
+	}
 
 	if id1 == id2 {
-		t.Error("generateRequestID() should generate unique IDs")
+		t.Error("GenerateRequestID() should generate unique IDs")
 	}
 
 	if len(id1) != 32 {
-		t.Errorf("generateRequestID() length = %d, want 32", len(id1))
+		t.Errorf("GenerateRequestID() length = %d, want 32", len(id1))
 	}
 
 	// Verify it's valid hex
 	if _, err := hex.DecodeString(id1); err != nil {
-		t.Errorf("generateRequestID() returned invalid hex: %v", err)
+		t.Errorf("GenerateRequestID() returned invalid hex: %v", err)
 	}
 }
 
-// TestGenerateJWT tests JWT generation
+// TestGenerateJWT tests JWT generation using ethsign package
 func TestGenerateJWT(t *testing.T) {
 	// Generate a test private key
 	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
@@ -841,9 +977,10 @@ func TestGenerateJWT(t *testing.T) {
 	address := "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82"
 	digest := "0x1234567890abcdef"
 
-	token, err := generateJWT(privKey, address, digest)
+	reqID, _ := ethsign.GenerateRequestID()
+	token, err := ethsign.GenerateJWT(privKey, address, digest, reqID)
 	if err != nil {
-		t.Fatalf("generateJWT() error = %v", err)
+		t.Fatalf("GenerateJWT() error = %v", err)
 	}
 
 	// Verify JWT structure (header.payload.signature)
@@ -853,13 +990,14 @@ func TestGenerateJWT(t *testing.T) {
 	}
 
 	// Verify it's different each time (due to jti and timestamps)
-	token2, _ := generateJWT(privKey, address, digest)
+	reqID2, _ := ethsign.GenerateRequestID()
+	token2, _ := ethsign.GenerateJWT(privKey, address, digest, reqID2)
 	if token == token2 {
-		t.Error("generateJWT() should generate unique tokens due to jti")
+		t.Error("GenerateJWT() should generate unique tokens due to jti")
 	}
 }
 
-// TestSignEthereumMessage tests Ethereum message signing
+// TestSignEthereumMessage tests Ethereum message signing using ethsign package
 func TestSignEthereumMessage(t *testing.T) {
 	// Generate a test private key
 	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
@@ -868,9 +1006,9 @@ func TestSignEthereumMessage(t *testing.T) {
 
 	message := "test message"
 
-	signature, err := signEthereumMessage(privKey, message)
+	signature, err := ethsign.SignEthereumMessage(privKey, message)
 	if err != nil {
-		t.Fatalf("signEthereumMessage() error = %v", err)
+		t.Fatalf("SignEthereumMessage() error = %v", err)
 	}
 
 	// Verify signature length (65 bytes: r + s + v)
@@ -878,10 +1016,10 @@ func TestSignEthereumMessage(t *testing.T) {
 		t.Errorf("signature length = %d, want 65", len(signature))
 	}
 
-	// Verify recovery ID is valid (0-3)
-	recoveryID := signature[64]
-	if recoveryID > 3 {
-		t.Errorf("recovery ID = %d, want 0-3", recoveryID)
+	// Verify recovery ID is in Ethereum format (27 or 28, with v = recoveryID + 27)
+	v := signature[64]
+	if v < 27 || v > 30 {
+		t.Errorf("v = %d, want 27-30 (Ethereum format)", v)
 	}
 }
 
@@ -894,14 +1032,17 @@ func TestConcurrentWebhooks(t *testing.T) {
 	numRequests := 10
 	var wg sync.WaitGroup
 
+	// Pre-create signed payloads (must be done before concurrent send to get consistent event IDs)
+	payloads := make([]WebhookPayload, numRequests)
 	for i := 0; i < numRequests; i++ {
 		domain := fmt.Sprintf("test-domain-%d", i)
-		pendingRequests[domain] = &PendingRequest{
+		server.pendingRequests[domain] = &PendingRequest{
 			RequestID:  domain,
 			CreatedAt:  time.Now(),
 			ResultChan: make(chan *WebhookPayload, 1),
 			Status:     "pending",
 		}
+		payloads[i] = createSignedWebhook("create", domain, fmt.Sprintf(`{"thold_price": %d}`, i*100), nil)
 	}
 
 	// Send webhooks concurrently
@@ -910,19 +1051,11 @@ func TestConcurrentWebhooks(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			domain := fmt.Sprintf("test-domain-%d", idx)
-			payload := WebhookPayload{
-				EventType: "create",
-				EventID:   fmt.Sprintf("event-%d", idx),
-				Tags:      [][]string{{"domain", domain}},
-				Content:   fmt.Sprintf(`{"thold_price": %d}`, idx*100),
-			}
-
-			jsonData, _ := json.Marshal(payload)
+			jsonData, _ := json.Marshal(payloads[idx])
 			req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 			w := httptest.NewRecorder()
 
-			handleWebhook(w, req)
+			server.handleWebhook(w, req)
 
 			if w.Code != http.StatusOK {
 				t.Errorf("webhook %d: status = %d, want %d", idx, w.Code, http.StatusOK)
@@ -935,13 +1068,12 @@ func TestConcurrentWebhooks(t *testing.T) {
 	// Verify all requests received their webhooks
 	for i := 0; i < numRequests; i++ {
 		domain := fmt.Sprintf("test-domain-%d", i)
-		pending := pendingRequests[domain]
+		pending := server.pendingRequests[domain]
 
 		select {
 		case result := <-pending.ResultChan:
-			expectedEventID := fmt.Sprintf("event-%d", i)
-			if result.EventID != expectedEventID {
-				t.Errorf("domain %s: event_id = %s, want %s", domain, result.EventID, expectedEventID)
+			if result.EventID != payloads[i].EventID {
+				t.Errorf("domain %s: event_id = %s, want %s", domain, result.EventID, payloads[i].EventID)
 			}
 		case <-time.After(1 * time.Second):
 			t.Errorf("domain %s: did not receive webhook", domain)
@@ -951,23 +1083,19 @@ func TestConcurrentWebhooks(t *testing.T) {
 
 // BenchmarkHandleWebhook benchmarks webhook processing performance
 func BenchmarkHandleWebhook(b *testing.B) {
-	setupTestEnv(&testing.T{})
+	setupTestEnv(b)
 	loadConfig()
 	resetGlobals()
 
-	payload := WebhookPayload{
-		EventType: "create",
-		EventID:   "bench-event",
-		Tags:      [][]string{{"domain", "bench-domain"}},
-		Content:   `{"thold_price": 100}`,
-	}
+	// Create a properly signed webhook for benchmarking
+	payload := createSignedWebhook("create", "bench-domain", `{"thold_price": 100}`, nil)
 	jsonData, _ := json.Marshal(payload)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 		w := httptest.NewRecorder()
-		handleWebhook(w, req)
+		server.handleWebhook(w, req)
 	}
 }
 
@@ -977,7 +1105,7 @@ func BenchmarkEncodeBase64URL(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = encodeBase64URL(data)
+		_ = base64.RawURLEncoding.EncodeToString(data)
 	}
 }
 
@@ -1036,7 +1164,7 @@ func TestTriggerWorkflow(t *testing.T) {
 	defer mockServer.Close()
 
 	// Override gateway URL to use mock server
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	tests := []struct {
 		name        string
@@ -1067,15 +1195,15 @@ func TestTriggerWorkflow(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := triggerWorkflow(tt.op, tt.domain, tt.tholdPrice, tt.tholdHash, tt.callbackURL)
+			err := server.triggerWorkflow(tt.op, tt.domain, tt.tholdPrice, tt.tholdHash, tt.callbackURL)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("triggerWorkflow() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("server.triggerWorkflow() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-// TestTriggerWorkflowErrors tests error cases for triggerWorkflow
+// TestTriggerWorkflowErrors tests error cases for server.triggerWorkflow
 func TestTriggerWorkflowErrors(t *testing.T) {
 	setupTestEnv(t)
 	loadConfig()
@@ -1112,10 +1240,10 @@ func TestTriggerWorkflowErrors(t *testing.T) {
 			mockServer := tt.setupMock()
 			defer mockServer.Close()
 
-			GATEWAY_URL = mockServer.URL
+			server.config.GatewayURL = mockServer.URL
 
 			tholdPrice := 100.0
-			err := triggerWorkflow("create", "test-domain", &tholdPrice, nil, "http://example.com/webhook")
+			err := server.triggerWorkflow("create", "test-domain", &tholdPrice, nil, "http://example.com/webhook")
 			if err == nil {
 				t.Error("expected error but got nil")
 			}
@@ -1126,7 +1254,7 @@ func TestTriggerWorkflowErrors(t *testing.T) {
 	}
 }
 
-// TestComputeRecoveryIDEdgeCases tests edge cases in recovery ID computation
+// TestComputeRecoveryIDEdgeCases tests edge cases in recovery ID computation using ethsign package
 func TestComputeRecoveryIDEdgeCases(t *testing.T) {
 	// Generate test key
 	privateKeyHex := "e0144cfbe97dcb2554ebf918b1ee12c1a51d4db1385aea75ec96d6632806bb2c"
@@ -1141,9 +1269,9 @@ func TestComputeRecoveryIDEdgeCases(t *testing.T) {
 	}
 
 	for _, msg := range messages {
-		signature, err := signEthereumMessage(privKey, msg)
+		signature, err := ethsign.SignEthereumMessage(privKey, msg)
 		if err != nil {
-			t.Errorf("signEthereumMessage failed for message %q: %v", msg, err)
+			t.Errorf("SignEthereumMessage failed for message %q: %v", msg, err)
 			continue
 		}
 
@@ -1152,10 +1280,10 @@ func TestComputeRecoveryIDEdgeCases(t *testing.T) {
 			t.Errorf("signature length = %d, want 65 for message %q", len(signature), msg)
 		}
 
-		// Verify recovery ID is in valid range
-		recoveryID := signature[64]
-		if recoveryID > 3 {
-			t.Errorf("invalid recovery ID %d for message %q", recoveryID, msg)
+		// Verify v is in Ethereum format (27-30)
+		v := signature[64]
+		if v < 27 || v > 30 {
+			t.Errorf("invalid v value %d for message %q, want 27-30 (Ethereum format)", v, msg)
 		}
 	}
 }
@@ -1167,24 +1295,24 @@ func TestHandleCreateTimeout(t *testing.T) {
 	resetGlobals()
 
 	// Set very short timeout for testing
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 100 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+	oldTimeout := server.config.BlockTimeout
+	server.config.BlockTimeout = 100 * time.Millisecond
+	defer func() { server.config.BlockTimeout = oldTimeout }()
 
-	// Mock the triggerWorkflow to avoid actual HTTP calls
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow to avoid actual HTTP calls
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	req := httptest.NewRequest("GET", "/api/quote?th=100", nil)
 	w := httptest.NewRecorder()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 
@@ -1208,12 +1336,12 @@ func TestHandleCheckMaxPending(t *testing.T) {
 	resetGlobals()
 
 	// Set low limit
-	MAX_PENDING = 2
+	server.config.MaxPending = 2
 
 	// Fill pending requests
-	for i := 0; i < MAX_PENDING; i++ {
+	for i := 0; i < server.config.MaxPending; i++ {
 		domain := fmt.Sprintf("test-%d", i)
-		pendingRequests[domain] = &PendingRequest{
+		server.pendingRequests[domain] = &PendingRequest{
 			RequestID:  domain,
 			CreatedAt:  time.Now(),
 			ResultChan: make(chan *WebhookPayload, 1),
@@ -1230,7 +1358,7 @@ func TestHandleCheckMaxPending(t *testing.T) {
 	req := httptest.NewRequest("POST", "/check", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 	if resp.StatusCode != http.StatusServiceUnavailable {
@@ -1239,7 +1367,7 @@ func TestHandleCheckMaxPending(t *testing.T) {
 
 	// Cleanup
 	resetGlobals()
-	MAX_PENDING = 1000
+	server.config.MaxPending = 1000
 }
 
 // TestHandleCheckTimeout tests check endpoint timeout
@@ -1248,19 +1376,19 @@ func TestHandleCheckTimeout(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	oldTimeout := BLOCK_TIMEOUT
-	BLOCK_TIMEOUT = 100 * time.Millisecond
-	defer func() { BLOCK_TIMEOUT = oldTimeout }()
+	oldTimeout := server.config.BlockTimeout
+	server.config.BlockTimeout = 100 * time.Millisecond
+	defer func() { server.config.BlockTimeout = oldTimeout }()
 
-	// Mock the triggerWorkflow
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	checkReq := CheckRequest{
 		Domain:    "test-domain",
@@ -1271,7 +1399,7 @@ func TestHandleCheckTimeout(t *testing.T) {
 	req := httptest.NewRequest("POST", "/check", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1286,15 +1414,15 @@ func TestHandleCheckSuccess(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	// Mock the triggerWorkflow
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	checkReq := CheckRequest{
 		Domain:    "test-check-domain",
@@ -1309,15 +1437,16 @@ func TestHandleCheckSuccess(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 
-		requestsMutex.RLock()
-		pending, exists := pendingRequests["test-check-domain"]
-		requestsMutex.RUnlock()
+		server.requestsMutex.RLock()
+		pending, exists := server.pendingRequests["test-check-domain"]
+		server.requestsMutex.RUnlock()
 
 		if exists {
 			payload := &WebhookPayload{
 				EventType: "check_no_breach",
 				EventID:   "check-event-123",
-				Content:   `{"latest_price": 150.7, "thold_price": 100.0, "quote_price": 95.8}`,
+				// Full CRE format payload with core-ts PriceContract fields
+				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":95,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1326,7 +1455,7 @@ func TestHandleCheckSuccess(t *testing.T) {
 		}
 	}()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1337,17 +1466,15 @@ func TestHandleCheckSuccess(t *testing.T) {
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 
-	// Verify prices were rounded down
-	if quotePrice, ok := result["quote_price"].(float64); ok {
-		if quotePrice != 95.0 {
-			t.Errorf("quote_price = %f, want 95.0 (rounded down)", quotePrice)
+	// Verify core-ts PriceContract fields
+	if basePrice, ok := result["base_price"].(float64); ok {
+		if basePrice != 95.0 {
+			t.Errorf("base_price = %f, want 95.0", basePrice)
 		}
 	}
 
-	if latestPrice, ok := result["latest_price"].(float64); ok {
-		if latestPrice != 150.0 {
-			t.Errorf("latest_price = %f, want 150.0 (rounded down)", latestPrice)
-		}
+	if _, ok := result["chain_network"]; !ok {
+		t.Error("chain_network not found in response")
 	}
 }
 
@@ -1364,12 +1491,12 @@ func TestHandleCreateWorkflowError(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	req := httptest.NewRequest("GET", "/api/quote?th=100", nil)
 	w := httptest.NewRecorder()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 
@@ -1386,25 +1513,21 @@ func TestWebhookParseContentError(t *testing.T) {
 	resetGlobals()
 
 	domain := "test-parse-error"
-	pendingRequests[domain] = &PendingRequest{
+	server.pendingRequests[domain] = &PendingRequest{
 		RequestID:  domain,
 		CreatedAt:  time.Now(),
 		ResultChan: make(chan *WebhookPayload, 1),
 		Status:     "pending",
 	}
 
-	payload := WebhookPayload{
-		EventType: "create",
-		EventID:   "test-event",
-		Tags:      [][]string{{"domain", domain}},
-		Content:   `{invalid json}`,
-	}
-
+	// Create a properly signed webhook with invalid JSON content
+	// The content being invalid JSON is fine - we're testing that the webhook is still delivered
+	payload := createSignedWebhook("create", domain, `{invalid json}`, nil)
 	jsonData, _ := json.Marshal(payload)
 	req := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleWebhook(w, req)
+	server.handleWebhook(w, req)
 
 	resp := w.Result()
 	// Webhook handler should still return 200 even with bad content
@@ -1413,11 +1536,11 @@ func TestWebhookParseContentError(t *testing.T) {
 	}
 
 	// Verify the webhook was still delivered to the pending request
-	pending := pendingRequests[domain]
+	pending := server.pendingRequests[domain]
 	select {
 	case result := <-pending.ResultChan:
-		if result.EventID != "test-event" {
-			t.Errorf("event_id = %s, want test-event", result.EventID)
+		if result.EventID != payload.EventID {
+			t.Errorf("event_id = %s, want %s", result.EventID, payload.EventID)
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("webhook not delivered to pending request")
@@ -1437,15 +1560,10 @@ func TestHandleWebhookDuplicateDelivery(t *testing.T) {
 		ResultChan: make(chan *WebhookPayload, 1),
 		Status:     "pending",
 	}
-	pendingRequests[domain] = pending
+	server.pendingRequests[domain] = pending
 
-	payload := WebhookPayload{
-		EventType: "create",
-		EventID:   "dup-event",
-		Tags:      [][]string{{"domain", domain}},
-		Content:   `{"test": "data"}`,
-	}
-
+	// Create a properly signed webhook
+	payload := createSignedWebhook("create", domain, `{"test": "data"}`, nil)
 	jsonData, _ := json.Marshal(payload)
 
 	// Send first webhook
@@ -1460,13 +1578,13 @@ func TestHandleWebhookDuplicateDelivery(t *testing.T) {
 		}
 	}()
 
-	handleWebhook(w1, req1)
+	server.handleWebhook(w1, req1)
 	time.Sleep(50 * time.Millisecond)
 
-	// Send duplicate webhook (same event_id should be ignored by default select in handleWebhook)
+	// Send duplicate webhook (same event_id should be ignored by default select in server.handleWebhook)
 	req2 := httptest.NewRequest("POST", "/webhook/ducat", bytes.NewReader(jsonData))
 	w2 := httptest.NewRecorder()
-	handleWebhook(w2, req2)
+	server.handleWebhook(w2, req2)
 	time.Sleep(50 * time.Millisecond)
 
 	// Both should return 200
@@ -1502,7 +1620,7 @@ func TestHandleCheckWorkflowError(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	checkReq := CheckRequest{
 		Domain:    "test-domain",
@@ -1513,7 +1631,7 @@ func TestHandleCheckWorkflowError(t *testing.T) {
 	req := httptest.NewRequest("POST", "/check", bytes.NewReader(jsonData))
 	w := httptest.NewRecorder()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1529,13 +1647,13 @@ func TestHandleCheckBreach(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	// Mock the triggerWorkflow
+	// Mock the server.triggerWorkflow
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
+	server.config.GatewayURL = mockServer.URL
 
 	checkReq := CheckRequest{
 		Domain:    "test-breach-domain",
@@ -1550,15 +1668,15 @@ func TestHandleCheckBreach(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 
-		requestsMutex.RLock()
-		pending, exists := pendingRequests["test-breach-domain"]
-		requestsMutex.RUnlock()
+		server.requestsMutex.RLock()
+		pending, exists := server.pendingRequests["test-breach-domain"]
+		server.requestsMutex.RUnlock()
 
 		if exists {
 			payload := &WebhookPayload{
 				EventType: "breach",
 				EventID:   "breach-event-123",
-				Content:   `{"latest_price": 90.5, "thold_price": 100.0, "thold_key": "secret123"}`,
+				Content:   `{"event_type":"breach","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":90,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":"secret123","thold_price":100}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1567,7 +1685,7 @@ func TestHandleCheckBreach(t *testing.T) {
 		}
 	}()
 
-	handleCheck(w, req)
+	server.handleCheck(w, req)
 
 	resp := w.Result()
 
@@ -1594,15 +1712,15 @@ func TestHandleCreateSuccess(t *testing.T) {
 	loadConfig()
 	resetGlobals()
 
-	// Mock the triggerWorkflow
-	originalGatewayURL := GATEWAY_URL
+	// Mock the server.triggerWorkflow
+	originalGatewayURL := server.config.GatewayURL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"result": "ok"}`))
 	}))
 	defer mockServer.Close()
-	GATEWAY_URL = mockServer.URL
-	defer func() { GATEWAY_URL = originalGatewayURL }()
+	server.config.GatewayURL = mockServer.URL
+	defer func() { server.config.GatewayURL = originalGatewayURL }()
 
 	req := httptest.NewRequest("GET", "/api/quote?th=100.5", nil)
 	w := httptest.NewRecorder()
@@ -1611,25 +1729,26 @@ func TestHandleCreateSuccess(t *testing.T) {
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 
-		requestsMutex.RLock()
+		server.requestsMutex.RLock()
 		// Find the pending request (domain is generated, so we need to iterate)
 		var pending *PendingRequest
 		var domain string
-		for d, p := range pendingRequests {
+		for d, p := range server.pendingRequests {
 			if p.Status == "pending" {
 				pending = p
 				domain = d
 				break
 			}
 		}
-		requestsMutex.RUnlock()
+		server.requestsMutex.RUnlock()
 
 		if pending != nil {
 			payload := &WebhookPayload{
 				EventType: "create",
 				EventID:   "create-event-123",
 				Tags:      [][]string{{"domain", domain}},
-				Content:   `{"thold_price": 100.5, "thold_hash": "abc123", "quote_price": 99.8, "latest_price": 105.3}`,
+				// Full CRE format payload with core-ts PriceContract fields
+				Content: `{"event_type":"active","chain_network":"mutiny","oracle_pubkey":"abc123pubkey","base_price":99,"base_stamp":1699999000,"commit_hash":"commit123","contract_id":"contract456","oracle_sig":"sig789","thold_hash":"abc123def456","thold_key":null,"thold_price":100}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1638,7 +1757,7 @@ func TestHandleCreateSuccess(t *testing.T) {
 		}
 	}()
 
-	handleCreate(w, req)
+	server.handleCreate(w, req)
 
 	resp := w.Result()
 
@@ -1649,16 +1768,23 @@ func TestHandleCreateSuccess(t *testing.T) {
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 
-	// Verify prices were rounded down
-	if quotePrice, ok := result["quote_price"].(float64); ok {
-		if quotePrice != 99.0 {
-			t.Errorf("quote_price = %f, want 99.0 (rounded down)", quotePrice)
+	// Verify core-ts PriceContract fields
+	if basePrice, ok := result["base_price"].(float64); ok {
+		if basePrice != 99.0 {
+			t.Errorf("base_price = %f, want 99.0", basePrice)
 		}
 	}
 
-	if latestPrice, ok := result["latest_price"].(float64); ok {
-		if latestPrice != 105.0 {
-			t.Errorf("latest_price = %f, want 105.0 (rounded down)", latestPrice)
-		}
+	// Verify PriceContract fields exist
+	if network, ok := result["chain_network"].(string); !ok || network != "mutiny" {
+		t.Errorf("chain_network = %v, want 'mutiny'", result["chain_network"])
+	}
+
+	if _, ok := result["commit_hash"]; !ok {
+		t.Error("commit_hash not found in response")
+	}
+
+	if _, ok := result["contract_id"]; !ok {
+		t.Error("contract_id not found in response")
 	}
 }

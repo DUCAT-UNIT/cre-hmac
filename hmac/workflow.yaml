@@ -5,6 +5,30 @@
 # Each target defines user-workflow and workflow-artifacts groups.
 # Settings here override CRE Project Settings File values.
 #
+# Supported handlers:
+# - createQuote: Create new price threshold commitment (HTTP trigger)
+# - checkQuote: Check existing quote for breach (HTTP trigger)
+# - evaluateQuotes: Batch evaluate multiple quotes (HTTP trigger)
+# - generateQuotes: Auto-generate quotes at price intervals (Cron trigger)
+#
+# HTTP Trigger Actions:
+# - action=create OR thold_price: Create new quote
+# - action=check OR thold_hash: Check existing quote
+# - action=evaluate + thold_hashes[]: Batch evaluate quotes
+#
+# Cron Trigger Configuration (in config.json):
+# - cron_schedule: Cron expression (e.g., "0 */5 * * * *" for every 5 minutes)
+# - rate_min: Minimum rate multiplier (e.g., 1.35 for 135% of current price)
+# - rate_max: Maximum rate multiplier (e.g., 5.00 for 500% of current price)
+# - step_size: Rate increment (e.g., 0.05 for 5% steps)
+# - quote_domain: Domain prefix for generated quotes
+#
+# Cron Expression Examples:
+# - "*/30 * * * * *": Every 30 seconds
+# - "0 */5 * * * *": Every 5 minutes at second 0
+# - "0 0 * * * *": Every hour at minute 0, second 0
+# - "TZ=America/New_York 0 9 * * 1-5": Every weekday at 9 AM Eastern
+#
 # Example custom target:
 # my-target:
 #   user-workflow:

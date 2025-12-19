@@ -1,8 +1,11 @@
+//go:build ignore
+
 package main
 
 import (
 	"fmt"
 	"os"
+
 	"ducat/crypto"
 )
 

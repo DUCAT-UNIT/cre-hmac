@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,46 +13,210 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"os/signal"
+	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"ducat/internal/ethsign"
+
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"golang.org/x/crypto/sha3"
+	"golang.org/x/time/rate"
 )
 
-// Configuration - loaded from environment variables
-var (
-	WORKFLOW_ID      string
-	GATEWAY_URL      string
-	AUTHORIZED_KEY   string
-	CALLBACK_URL     string
-	BLOCK_TIMEOUT    time.Duration
-	CLEANUP_INTERVAL time.Duration
-	MAX_PENDING      int // Maximum number of pending requests to prevent memory exhaustion
-)
+// GatewayConfig holds all gateway server configuration
+type GatewayConfig struct {
+	WorkflowID      string
+	GatewayURL      string
+	AuthorizedKey   string
+	CallbackURL     string
+	BlockTimeout    time.Duration
+	CleanupInterval time.Duration
+	MaxPending      int
+
+	// Rate limiting configuration (per-IP)
+	IPRateLimit  rate.Limit // requests per second per IP
+	IPBurstLimit int        // burst capacity per IP
+
+	// Webhook security - expected CRE Schnorr public key (64 hex chars)
+	// MANDATORY: webhooks must be signed by this key to be accepted
+	ExpectedWebhookPubKey string
+}
+
+// IPRateLimiter manages per-IP rate limiters with automatic cleanup
+type IPRateLimiter struct {
+	limiters map[string]*rateLimiterEntry
+	mu       sync.RWMutex
+	rate     rate.Limit
+	burst    int
+}
+
+type rateLimiterEntry struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+// NewIPRateLimiter creates a new per-IP rate limiter
+func NewIPRateLimiter(r rate.Limit, b int) *IPRateLimiter {
+	return &IPRateLimiter{
+		limiters: make(map[string]*rateLimiterEntry),
+		rate:     r,
+		burst:    b,
+	}
+}
+
+// GetLimiter returns the rate limiter for the given IP, creating one if needed
+func (i *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	entry, exists := i.limiters[ip]
+	if !exists {
+		limiter := rate.NewLimiter(i.rate, i.burst)
+		i.limiters[ip] = &rateLimiterEntry{
+			limiter:  limiter,
+			lastSeen: time.Now(),
+		}
+		return limiter
+	}
+
+	entry.lastSeen = time.Now()
+	return entry.limiter
+}
+
+// Cleanup removes rate limiters that haven't been used recently
+func (i *IPRateLimiter) Cleanup(maxAge time.Duration) int {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	now := time.Now()
+	cleaned := 0
+	for ip, entry := range i.limiters {
+		if now.Sub(entry.lastSeen) > maxAge {
+			delete(i.limiters, ip)
+			cleaned++
+		}
+	}
+	return cleaned
+}
+
+// CircuitBreaker implements a simple circuit breaker pattern to prevent cascading failures
+type CircuitBreaker struct {
+	mu              sync.RWMutex
+	failures        int
+	lastFailure     time.Time
+	state           string // "closed", "open", "half-open"
+	threshold       int    // failures before opening
+	resetTimeout    time.Duration
+	halfOpenMaxReqs int // max requests to try in half-open state
+	halfOpenReqs    int
+}
+
+// NewCircuitBreaker creates a new circuit breaker with default settings
+func NewCircuitBreaker(threshold int, resetTimeout time.Duration) *CircuitBreaker {
+	return &CircuitBreaker{
+		threshold:       threshold,
+		resetTimeout:    resetTimeout,
+		state:           "closed",
+		halfOpenMaxReqs: 3,
+	}
+}
+
+// Allow checks if a request should be allowed through
+func (cb *CircuitBreaker) Allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
+	case "closed":
+		return true
+	case "open":
+		// Check if we should transition to half-open
+		if time.Since(cb.lastFailure) > cb.resetTimeout {
+			cb.state = "half-open"
+			cb.halfOpenReqs = 0
+			return true
+		}
+		return false
+	case "half-open":
+		// Allow limited requests in half-open state
+		if cb.halfOpenReqs < cb.halfOpenMaxReqs {
+			cb.halfOpenReqs++
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+// RecordSuccess records a successful request
+func (cb *CircuitBreaker) RecordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.state == "half-open" {
+		// Reset on success in half-open state
+		cb.state = "closed"
+		cb.failures = 0
+	}
+}
+
+// RecordFailure records a failed request
+func (cb *CircuitBreaker) RecordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failures++
+	cb.lastFailure = time.Now()
+
+	if cb.state == "half-open" || cb.failures >= cb.threshold {
+		cb.state = "open"
+	}
+}
+
+// State returns the current circuit breaker state
+func (cb *CircuitBreaker) State() string {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.state
+}
+
+// GatewayServer encapsulates all server state
+type GatewayServer struct {
+	config          *GatewayConfig
+	privateKey      *ecdsa.PrivateKey
+	logger          *zap.Logger
+	pendingRequests map[string]*PendingRequest
+	requestsMutex   sync.RWMutex
+	shutdownChan    chan struct{}
+	ipRateLimiter   *IPRateLimiter
+	circuitBreaker  *CircuitBreaker
+}
 
 // Request tracking
 type PendingRequest struct {
-	RequestID   string
-	CreatedAt   time.Time
-	ResultChan  chan *WebhookPayload
-	Status      string // "pending", "completed", "timeout"
-	Result      *WebhookPayload
-	TimedOut    bool
+	RequestID  string
+	CreatedAt  time.Time
+	ResultChan chan *WebhookPayload
+	Status     string // "pending", "completed", "timeout"
+	Result     *WebhookPayload
+	TimedOut   bool
 }
 
+// Global server instance (initialized in init)
 var (
-	pendingRequests = make(map[string]*PendingRequest)
-	requestsMutex   sync.RWMutex
-	privateKey      *ecdsa.PrivateKey
-	logger          *zap.Logger
+	server *GatewayServer
+	logger *zap.Logger
 )
 
 // Prometheus metrics
@@ -128,7 +291,163 @@ var (
 		},
 		[]string{"dependency"},
 	)
+
+	rateLimitRejected = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_rate_limit_rejected_total",
+			Help: "Total number of requests rejected due to rate limiting",
+		},
+		[]string{"endpoint"},
+	)
+
+	panicsRecovered = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "gateway_panics_recovered_total",
+			Help: "Total number of panics recovered by the server",
+		},
+	)
+
+	webhookSignatureFailures = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_webhook_signature_failures_total",
+			Help: "Total number of webhook signature verification failures",
+		},
+		[]string{"reason"},
+	)
 )
+
+// validatePrivateKey validates that a hex-encoded private key is exactly 32 bytes
+// and falls within the valid range for secp256k1 (1 < key < curve order).
+func validatePrivateKey(hexKey string) error {
+	if len(hexKey) != 64 {
+		return fmt.Errorf("private key must be 64 hex chars, got %d", len(hexKey))
+	}
+
+	keyBytes, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return fmt.Errorf("invalid hex encoding: %w", err)
+	}
+
+	// Check key is in valid range (0 < key < curve order)
+	keyInt := new(big.Int).SetBytes(keyBytes)
+	curveOrder := btcec.S256().Params().N
+
+	if keyInt.Sign() == 0 {
+		return fmt.Errorf("private key cannot be zero")
+	}
+	if keyInt.Cmp(curveOrder) >= 0 {
+		return fmt.Errorf("private key exceeds curve order")
+	}
+
+	return nil
+}
+
+// verifyWebhookSignature verifies that a webhook payload has a valid Nostr event signature.
+// This validates that the webhook actually came from the CRE and hasn't been tampered with.
+// The event ID must be the SHA256 hash of the canonical serialized event, and the signature
+// must be a valid BIP-340 Schnorr signature over the event ID using the event's public key.
+//
+// SECURITY: This prevents attackers from injecting fake webhook payloads to spoof
+// price contract responses. Without this verification, an attacker could send arbitrary
+// webhooks to manipulate oracle responses.
+func verifyWebhookSignature(payload *WebhookPayload) error {
+	if payload == nil {
+		return fmt.Errorf("payload cannot be nil")
+	}
+
+	// Validate required fields
+	if payload.EventID == "" {
+		return fmt.Errorf("missing event_id")
+	}
+	if payload.PubKey == "" {
+		return fmt.Errorf("missing pubkey")
+	}
+	if payload.Sig == "" {
+		return fmt.Errorf("missing signature")
+	}
+
+	// Validate field lengths
+	if len(payload.EventID) != 64 {
+		return fmt.Errorf("invalid event_id length: expected 64 hex chars, got %d", len(payload.EventID))
+	}
+	if len(payload.PubKey) != 64 {
+		return fmt.Errorf("invalid pubkey length: expected 64 hex chars, got %d", len(payload.PubKey))
+	}
+	if len(payload.Sig) != 128 {
+		return fmt.Errorf("invalid signature length: expected 128 hex chars, got %d", len(payload.Sig))
+	}
+
+	// Recompute event ID to verify integrity
+	// NIP-01 format: [0, <pubkey>, <created_at>, <kind>, <tags>, <content>]
+	tagsJSON, err := json.Marshal(payload.Tags)
+	if err != nil {
+		return fmt.Errorf("failed to marshal tags: %w", err)
+	}
+	serialized := fmt.Sprintf("[0,%q,%d,%d,%s,%q]",
+		payload.PubKey, payload.CreatedAt, payload.Kind, string(tagsJSON), payload.Content)
+
+	computedHash := sha256.Sum256([]byte(serialized))
+	computedID := hex.EncodeToString(computedHash[:])
+
+	if computedID != payload.EventID {
+		return fmt.Errorf("event_id mismatch: computed %s, got %s", computedID, payload.EventID)
+	}
+
+	// Decode and verify Schnorr signature
+	sigBytes, err := hex.DecodeString(payload.Sig)
+	if err != nil {
+		return fmt.Errorf("invalid signature hex: %w", err)
+	}
+
+	sig, err := schnorr.ParseSignature(sigBytes)
+	if err != nil {
+		return fmt.Errorf("invalid schnorr signature format: %w", err)
+	}
+
+	pubKeyBytes, err := hex.DecodeString(payload.PubKey)
+	if err != nil {
+		return fmt.Errorf("invalid pubkey hex: %w", err)
+	}
+
+	pubKey, err := schnorr.ParsePubKey(pubKeyBytes)
+	if err != nil {
+		return fmt.Errorf("invalid schnorr pubkey: %w", err)
+	}
+
+	eventIDBytes, err := hex.DecodeString(payload.EventID)
+	if err != nil {
+		return fmt.Errorf("invalid event_id hex: %w", err)
+	}
+
+	if !sig.Verify(eventIDBytes, pubKey) {
+		return fmt.Errorf("schnorr signature verification failed")
+	}
+
+	return nil
+}
+
+// panicRecoveryMiddleware catches panics in HTTP handlers and logs them.
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				panicsRecovered.Inc()
+				if logger != nil {
+					logger.Error("panic recovered in HTTP handler",
+						zap.Any("error", err),
+						zap.String("path", r.URL.Path),
+						zap.String("method", r.Method),
+						zap.String("stack", string(debug.Stack())),
+					)
+				} else {
+					log.Printf("PANIC: %v\nStack: %s", err, debug.Stack())
+				}
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
 // Client request types
 type CreateRequest struct {
@@ -154,25 +473,23 @@ type WebhookPayload struct {
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
-type PriceEvent struct {
-	EventOrigin  interface{} `json:"event_origin"`
-	EventPrice   interface{} `json:"event_price"`
-	EventStamp   interface{} `json:"event_stamp"`
-	EventType    string      `json:"event_type"`
-	LatestOrigin string      `json:"latest_origin"`
-	LatestPrice  float64     `json:"latest_price"`
-	LatestStamp  int64       `json:"latest_stamp"`
-	QuoteOrigin  string      `json:"quote_origin"`
-	QuotePrice   float64     `json:"quote_price"`
-	QuoteStamp   int64       `json:"quote_stamp"`
-	IsExpired    bool        `json:"is_expired"`
-	SrvNetwork   string      `json:"srv_network"`
-	SrvPubkey    string      `json:"srv_pubkey"`
-	TholdHash    string      `json:"thold_hash"`
-	TholdKey     string      `json:"thold_key"`
-	TholdPrice   float64     `json:"thold_price"`
-	ReqID        string      `json:"req_id"`
-	ReqSig       string      `json:"req_sig"`
+// PriceContractResponse matches core-ts PriceContract schema exactly
+// CRE publishes this format directly to Nostr - no transformation needed
+// This is what client-sdk expects from the gateway
+type PriceContractResponse struct {
+	// PriceObservation fields (from core-ts)
+	ChainNetwork string `json:"chain_network"` // Bitcoin network
+	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
+	BasePrice    int64  `json:"base_price"`    // Quote creation price
+	BaseStamp    int64  `json:"base_stamp"`    // Quote creation timestamp
+
+	// PriceContract fields (from core-ts)
+	CommitHash string  `json:"commit_hash"` // hash340(tag, preimage) - 32 bytes hex
+	ContractID string  `json:"contract_id"` // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig  string  `json:"oracle_sig"`  // Schnorr signature - 64 bytes hex
+	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdKey   *string `json:"thold_key"`   // Secret (null if sealed) - 32 bytes hex
+	TholdPrice int64   `json:"thold_price"` // Threshold price
 }
 
 // Response types
@@ -211,38 +528,59 @@ func init() {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	loadConfig()
+	// Load configuration into struct
+	config := loadConfig()
 
-	// Load private key from environment variable
+	// Load and validate private key from environment variable
 	privateKeyHex := os.Getenv("DUCAT_PRIVATE_KEY")
 	if privateKeyHex == "" {
 		logger.Fatal("DUCAT_PRIVATE_KEY environment variable not set")
 	}
 
 	privateKeyHex = strings.TrimPrefix(privateKeyHex, "0x")
+
+	// Validate private key format and range before use
+	if err := validatePrivateKey(privateKeyHex); err != nil {
+		logger.Fatal("Invalid private key", zap.Error(err))
+	}
+
 	privKeyBytes, err := hex.DecodeString(privateKeyHex)
 	if err != nil {
 		logger.Fatal("Failed to decode private key", zap.Error(err))
 	}
 
-	privateKey, err = crypto.ToECDSA(privKeyBytes)
+	privateKey, err := crypto.ToECDSA(privKeyBytes)
 	if err != nil {
 		logger.Fatal("Failed to parse private key", zap.Error(err))
 	}
 
+	// Initialize server with config
+	// Circuit breaker: 5 failures opens circuit, 30 second reset timeout
+	server = &GatewayServer{
+		config:          config,
+		privateKey:      privateKey,
+		logger:          logger,
+		pendingRequests: make(map[string]*PendingRequest),
+		shutdownChan:    make(chan struct{}),
+		ipRateLimiter:   NewIPRateLimiter(config.IPRateLimit, config.IPBurstLimit),
+		circuitBreaker:  NewCircuitBreaker(5, 30*time.Second),
+	}
+
 	logger.Info("Gateway server initialized",
-		zap.String("authorized_key", AUTHORIZED_KEY),
-		zap.String("callback_url", CALLBACK_URL),
-		zap.Int("max_pending", MAX_PENDING),
-		zap.Duration("block_timeout", BLOCK_TIMEOUT),
-		zap.String("workflow_id", WORKFLOW_ID),
+		zap.String("authorized_key", config.AuthorizedKey),
+		zap.String("callback_url", config.CallbackURL),
+		zap.Int("max_pending", config.MaxPending),
+		zap.Duration("block_timeout", config.BlockTimeout),
+		zap.String("workflow_id", config.WorkflowID),
+		zap.Float64("ip_rate_limit", float64(config.IPRateLimit)),
+		zap.Int("ip_burst_limit", config.IPBurstLimit),
 	)
 
 	// Start cleanup goroutine
-	go cleanupOldRequests()
+	go server.cleanupOldRequests()
 }
 
-func loadConfig() {
+func loadConfig() *GatewayConfig {
 	// Use basic log for config errors since logger might not be initialized yet
 	logFatal := func(msg string, args ...interface{}) {
 		if logger != nil {
@@ -260,69 +598,121 @@ func loadConfig() {
 		}
 	}
 
+	config := &GatewayConfig{}
+
 	// Required configuration
-	WORKFLOW_ID = os.Getenv("CRE_WORKFLOW_ID")
-	if WORKFLOW_ID == "" {
+	config.WorkflowID = os.Getenv("CRE_WORKFLOW_ID")
+	if config.WorkflowID == "" {
 		logFatal("CRE_WORKFLOW_ID environment variable not set")
 	}
 
-	GATEWAY_URL = os.Getenv("CRE_GATEWAY_URL")
-	if GATEWAY_URL == "" {
-		GATEWAY_URL = "https://01.gateway.zone-a.cre.chain.link" // Default
-		logWarn("CRE_GATEWAY_URL not set, using default: " + GATEWAY_URL)
+	config.GatewayURL = os.Getenv("CRE_GATEWAY_URL")
+	if config.GatewayURL == "" {
+		config.GatewayURL = "https://01.gateway.zone-a.cre.chain.link" // Default
+		logWarn("CRE_GATEWAY_URL not set, using default: " + config.GatewayURL)
 	}
 
-	AUTHORIZED_KEY = os.Getenv("DUCAT_AUTHORIZED_KEY")
-	if AUTHORIZED_KEY == "" {
+	config.AuthorizedKey = os.Getenv("DUCAT_AUTHORIZED_KEY")
+	if config.AuthorizedKey == "" {
 		logFatal("DUCAT_AUTHORIZED_KEY environment variable not set")
 	}
 
-	CALLBACK_URL = os.Getenv("GATEWAY_CALLBACK_URL")
-	if CALLBACK_URL == "" {
+	config.CallbackURL = os.Getenv("GATEWAY_CALLBACK_URL")
+	if config.CallbackURL == "" {
 		logFatal("GATEWAY_CALLBACK_URL environment variable not set")
 	}
 
 	// Optional configuration with defaults
 	blockTimeoutStr := os.Getenv("BLOCK_TIMEOUT_SECONDS")
 	if blockTimeoutStr == "" {
-		BLOCK_TIMEOUT = 60 * time.Second
+		config.BlockTimeout = 60 * time.Second
 	} else {
 		var seconds int
 		if _, err := fmt.Sscanf(blockTimeoutStr, "%d", &seconds); err != nil {
 			logFatal("Invalid BLOCK_TIMEOUT_SECONDS: %v", err)
 		}
-		BLOCK_TIMEOUT = time.Duration(seconds) * time.Second
+		config.BlockTimeout = time.Duration(seconds) * time.Second
 	}
 
 	cleanupIntervalStr := os.Getenv("CLEANUP_INTERVAL_SECONDS")
 	if cleanupIntervalStr == "" {
-		CLEANUP_INTERVAL = 2 * time.Minute // More aggressive cleanup (was 5 minutes)
+		config.CleanupInterval = 2 * time.Minute
 	} else {
 		var seconds int
 		if _, err := fmt.Sscanf(cleanupIntervalStr, "%d", &seconds); err != nil {
 			logFatal("Invalid CLEANUP_INTERVAL_SECONDS: %v", err)
 		}
-		CLEANUP_INTERVAL = time.Duration(seconds) * time.Second
+		config.CleanupInterval = time.Duration(seconds) * time.Second
 	}
 
 	maxPendingStr := os.Getenv("MAX_PENDING_REQUESTS")
 	if maxPendingStr == "" {
-		MAX_PENDING = 1000 // Default: allow up to 1000 concurrent pending requests
+		config.MaxPending = 1000
 	} else {
-		if _, err := fmt.Sscanf(maxPendingStr, "%d", &MAX_PENDING); err != nil {
+		if _, err := fmt.Sscanf(maxPendingStr, "%d", &config.MaxPending); err != nil {
 			logFatal("Invalid MAX_PENDING_REQUESTS: %v", err)
 		}
 	}
+
+	// Per-IP rate limiting configuration
+	// Default: 10 requests/second per IP with burst of 20
+	// This prevents individual IPs from overwhelming the service
+	ipRateLimitStr := os.Getenv("IP_RATE_LIMIT")
+	if ipRateLimitStr == "" {
+		config.IPRateLimit = 10 // 10 req/sec per IP
+	} else {
+		var rateLimit float64
+		if _, err := fmt.Sscanf(ipRateLimitStr, "%f", &rateLimit); err != nil {
+			logFatal("Invalid IP_RATE_LIMIT: %v", err)
+		}
+		config.IPRateLimit = rate.Limit(rateLimit)
+	}
+
+	ipBurstStr := os.Getenv("IP_BURST_LIMIT")
+	if ipBurstStr == "" {
+		config.IPBurstLimit = 20 // burst of 20 per IP
+	} else {
+		if _, err := fmt.Sscanf(ipBurstStr, "%d", &config.IPBurstLimit); err != nil {
+			logFatal("Invalid IP_BURST_LIMIT: %v", err)
+		}
+	}
+
+	// SECURITY: Expected CRE public key for webhook signature validation
+	// MANDATORY in production: Webhooks MUST be signed by this key to be accepted
+	config.ExpectedWebhookPubKey = os.Getenv("CRE_WEBHOOK_PUBKEY")
+	if config.ExpectedWebhookPubKey == "" {
+		// Allow unset only when running tests (GO_TEST environment is set by go test)
+		if os.Getenv("GO_TEST") != "1" && !strings.HasSuffix(os.Args[0], ".test") {
+			logFatal("CRE_WEBHOOK_PUBKEY is REQUIRED - webhooks must be signed by a known CRE public key")
+		}
+		// For tests, use the pubkey derived from testWebhookPrivKey ("aa...aa")
+		// This matches the test private key in gateway_server_test.go
+		config.ExpectedWebhookPubKey = "6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3"
+		logWarn("CRE_WEBHOOK_PUBKEY not set - using test dummy (only valid in test mode)")
+	} else {
+		// Validate format: must be exactly 64 lowercase hex characters
+		if len(config.ExpectedWebhookPubKey) != 64 {
+			logFatal("CRE_WEBHOOK_PUBKEY must be 64 hex characters (32 bytes), got %d", len(config.ExpectedWebhookPubKey))
+		}
+		if _, err := hex.DecodeString(config.ExpectedWebhookPubKey); err != nil {
+			logFatal("CRE_WEBHOOK_PUBKEY invalid hex: %v", err)
+		}
+	}
+
+	return config
 }
 
 func main() {
 	defer logger.Sync()
 
-	// Wrap handlers with metrics middleware
-	http.Handle("/api/quote", metricsMiddleware("create", http.HandlerFunc(handleCreate)))
-	http.Handle("/webhook/ducat", metricsMiddleware("webhook", http.HandlerFunc(handleWebhook)))
-	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/readiness", handleReadiness)
+	// Wrap all handlers with panic recovery and metrics middleware
+	// Rate limiting applied to both /api/quote and /webhook/ducat to prevent DoS
+	http.Handle("/api/quote", panicRecoveryMiddleware(
+		metricsMiddleware("create", server.rateLimitMiddleware(http.HandlerFunc(server.handleCreate)))))
+	http.Handle("/webhook/ducat", panicRecoveryMiddleware(
+		metricsMiddleware("webhook", server.rateLimitMiddleware(http.HandlerFunc(server.handleWebhook)))))
+	http.Handle("/health", panicRecoveryMiddleware(http.HandlerFunc(handleHealth)))
+	http.Handle("/readiness", panicRecoveryMiddleware(http.HandlerFunc(server.handleReadiness)))
 	http.Handle("/metrics", promhttp.Handler())
 
 	port := os.Getenv("PORT")
@@ -333,8 +723,8 @@ func main() {
 
 	logger.Info("DUCAT Blocking Gateway Server starting",
 		zap.String("port", port),
-		zap.Duration("block_timeout", BLOCK_TIMEOUT),
-		zap.Int("max_pending", MAX_PENDING),
+		zap.Duration("block_timeout", server.config.BlockTimeout),
+		zap.Int("max_pending", server.config.MaxPending),
 	)
 
 	logger.Info("Endpoints registered",
@@ -347,9 +737,48 @@ func main() {
 		}),
 	)
 
-	if err := http.ListenAndServe(port, nil); err != nil {
-		logger.Fatal("Server failed", zap.Error(err))
+	// Create HTTP server for graceful shutdown
+	httpServer := &http.Server{
+		Addr:         port,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: server.config.BlockTimeout + 10*time.Second, // Allow for blocking requests
+		IdleTimeout:  120 * time.Second,
 	}
+
+	// Channel to signal server shutdown complete
+	serverDone := make(chan struct{})
+
+	// Start server in goroutine
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatal("Server failed", zap.Error(err))
+		}
+		close(serverDone)
+	}()
+
+	// Wait for interrupt signal for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigChan
+
+	logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
+
+	// Signal cleanup goroutine to stop
+	close(server.shutdownChan)
+
+	// Create shutdown context with timeout
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Gracefully shutdown HTTP server
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		logger.Error("Server shutdown error", zap.Error(err))
+	}
+
+	// Wait for server to finish
+	<-serverDone
+
+	logger.Info("Server shutdown complete")
 }
 
 // metricsMiddleware wraps HTTP handlers with request metrics
@@ -370,6 +799,55 @@ func metricsMiddleware(endpoint string, next http.Handler) http.Handler {
 	})
 }
 
+// getClientIP extracts the real client IP, handling X-Forwarded-For header
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header (for reverse proxies)
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff != "" {
+		// Take the first IP in the chain (original client)
+		ips := strings.Split(xff, ",")
+		if len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if ip != "" {
+				return ip
+			}
+		}
+	}
+
+	// Check X-Real-IP header
+	xri := r.Header.Get("X-Real-IP")
+	if xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// Fall back to RemoteAddr (strip port)
+	ip := r.RemoteAddr
+	if colonIdx := strings.LastIndex(ip, ":"); colonIdx != -1 {
+		ip = ip[:colonIdx]
+	}
+	return ip
+}
+
+// rateLimitMiddleware applies per-IP token bucket rate limiting to protect against DoS attacks.
+// Returns 429 Too Many Requests if the rate limit is exceeded for the client's IP.
+func (s *GatewayServer) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientIP := getClientIP(r)
+		limiter := s.ipRateLimiter.GetLimiter(clientIP)
+
+		if !limiter.Allow() {
+			rateLimitRejected.WithLabelValues(r.URL.Path).Inc()
+			s.logger.Warn("Per-IP rate limit exceeded",
+				zap.String("client_ip", clientIP),
+				zap.String("endpoint", r.URL.Path),
+			)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // responseWriter wraps http.ResponseWriter to capture status code
 type responseWriter struct {
 	http.ResponseWriter
@@ -381,8 +859,23 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// GET /api/quote?th=PRICE - Blocks until webhook arrives or timeout
-func handleCreate(w http.ResponseWriter, r *http.Request) {
+// handleCreate handles GET /api/quote?th=PRICE requests by creating a tracked threshold request,
+// triggering the CRE workflow, and blocking until a matching webhook arrives or the server timeout elapses.
+//
+// It validates the required `th` query parameter (must be a positive number), enqueues a PendingRequest
+// (rejecting with 503 if the server is at capacity), and invokes the external workflow. If a matching
+// webhook is received before the timeout, the handler returns the webhook's CRE `PriceContractResponse`
+// as JSON. If the wait times out, the handler responds with 202 Accepted and a SyncResponse containing
+// the request ID for polling via GET /status/{request_id}.
+//
+// Observed HTTP behaviors:
+//  - 200: successful CRE response returned as JSON.
+//  - 202: request timed out; polling instruction returned.
+//  - 400: missing or invalid `th` parameter.
+//  - 405: method not allowed (only GET and OPTIONS supported).
+//  - 500: failure to trigger the CRE workflow.
+//  - 503: server at capacity (too many pending requests).
+func (s *GatewayServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Set CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -435,39 +928,47 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we've hit the max pending requests limit
-	requestsMutex.Lock()
-	currentPending := len(pendingRequests)
-	if currentPending >= MAX_PENDING {
-		requestsMutex.Unlock()
-		logger.Warn("Max pending requests reached, rejecting CREATE request",
+	s.requestsMutex.Lock()
+	currentPending := len(s.pendingRequests)
+	if currentPending >= s.config.MaxPending {
+		s.requestsMutex.Unlock()
+		s.logger.Warn("Max pending requests reached, rejecting CREATE request",
 			zap.Int("current_pending", currentPending),
-			zap.Int("max_pending", MAX_PENDING),
+			zap.Int("max_pending", s.config.MaxPending),
 		)
 		http.Error(w, "Server at capacity, please retry later", http.StatusServiceUnavailable)
 		return
 	}
-	pendingRequests[trackingKey] = pending
-	currentPending = len(pendingRequests)
-	requestsMutex.Unlock()
+	s.pendingRequests[trackingKey] = pending
+	currentPending = len(s.pendingRequests)
+	s.requestsMutex.Unlock()
 
 	// Update pending requests gauge
 	pendingRequestsGauge.Set(float64(currentPending))
 
-	logger.Info("CREATE request initiated",
+	s.logger.Info("CREATE request initiated",
 		zap.String("domain", domain),
 		zap.Float64("threshold_price", th),
 		zap.String("tracking_key", trackingKey),
 		zap.Int("pending_count", currentPending),
-		zap.Int("max_pending", MAX_PENDING),
+		zap.Int("max_pending", s.config.MaxPending),
 	)
 
 	// Trigger CRE workflow with configured callback URL
-	if err := triggerWorkflow("create", domain, &th, nil, CALLBACK_URL); err != nil {
-		logger.Error("Failed to trigger workflow",
+	if err := s.triggerWorkflow("create", domain, &th, nil, s.config.CallbackURL); err != nil {
+		s.logger.Error("Failed to trigger workflow",
 			zap.String("domain", domain),
 			zap.Error(err),
 		)
 		workflowTriggers.WithLabelValues("create", "error").Inc()
+
+		// Clean up pending request on failure
+		s.requestsMutex.Lock()
+		delete(s.pendingRequests, trackingKey)
+		currentPending = len(s.pendingRequests)
+		s.requestsMutex.Unlock()
+		pendingRequestsGauge.Set(float64(currentPending))
+
 		http.Error(w, fmt.Sprintf("Failed to trigger workflow: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -477,52 +978,53 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	select {
 	case result := <-pending.ResultChan:
 		// Webhook arrived! Return result immediately
-		tholdHash := getTholdHash(result)
-		logger.Info("CREATE request completed",
+		tholdHash, tholdErr := getTholdHash(result)
+		if tholdErr != nil {
+			s.logger.Warn("Failed to extract thold_hash from webhook content",
+				zap.String("domain", domain),
+				zap.Error(tholdErr),
+			)
+		}
+		s.logger.Info("CREATE request completed",
 			zap.String("domain", domain),
 			zap.String("thold_hash", tholdHash),
-			zap.String("event_id", result.EventID),
+			zap.String("event_id", truncateEventID(result.EventID)),
 		)
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "completed"
 		pending.Result = result
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
-		// Parse the content field to JSON and return only data
-		var contentData map[string]interface{}
-		if err := json.Unmarshal([]byte(result.Content), &contentData); err != nil {
-			logger.Warn("Failed to parse webhook content JSON",
+		// Parse CRE response - already in core-ts PriceContract format
+		var priceContract PriceContractResponse
+		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
+			s.logger.Warn("Failed to parse webhook content JSON",
 				zap.String("domain", domain),
 				zap.Error(err),
 			)
-			contentData = map[string]interface{}{"raw": result.Content}
-		}
-
-		// Round down quote_price and latest_price to whole numbers
-		if quotePrice, ok := contentData["quote_price"].(float64); ok {
-			contentData["quote_price"] = float64(int64(quotePrice))
-		}
-		if latestPrice, ok := contentData["latest_price"].(float64); ok {
-			contentData["latest_price"] = float64(int64(latestPrice))
+			// Fall back to raw content on parse error
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"raw": result.Content})
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(contentData)
+		json.NewEncoder(w).Encode(priceContract)
 
-	case <-time.After(BLOCK_TIMEOUT):
+	case <-time.After(s.config.BlockTimeout):
 		// Timeout - return 202 with request_id for polling
 		requestTimeouts.WithLabelValues("create").Inc()
-		logger.Warn("CREATE request timeout",
+		s.logger.Warn("CREATE request timeout",
 			zap.String("domain", domain),
 			zap.String("request_id", trackingKey),
-			zap.Duration("timeout", BLOCK_TIMEOUT),
+			zap.Duration("timeout", s.config.BlockTimeout),
 		)
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "timeout"
 		pending.TimedOut = true
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
 		response := SyncResponse{
 			Status:    "timeout",
@@ -535,8 +1037,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /check - Blocks until webhook arrives or timeout
-func handleCheck(w http.ResponseWriter, r *http.Request) {
+// handleCheck handles POST /check requests by triggering a CRE "check" workflow and blocking until the corresponding webhook arrives or s.config.BlockTimeout elapses.
+// It validates the JSON body (domain and 40-char thold_hash), registers a PendingRequest keyed by domain (enforcing s.config.MaxPending), and invokes the workflow.
+// If a matching webhook is received before timeout, the pending request is marked completed and the parsed PriceContractResponse is returned (falls back to raw content on JSON parse failure).
+// If s.config.BlockTimeout elapses, the pending request is marked timed out and a 202 Accepted SyncResponse containing the request ID is returned for polling.
+func (s *GatewayServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -566,25 +1071,48 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we've hit the max pending requests limit
-	requestsMutex.Lock()
-	if len(pendingRequests) >= MAX_PENDING {
-		requestsMutex.Unlock()
-		log.Printf("⚠️  Max pending requests reached (%d), rejecting CHECK request", MAX_PENDING)
+	s.requestsMutex.Lock()
+	currentPending := len(s.pendingRequests)
+	if currentPending >= s.config.MaxPending {
+		s.requestsMutex.Unlock()
+		logger.Warn("Max pending requests reached, rejecting CHECK request",
+			zap.Int("current_pending", currentPending),
+			zap.Int("max_pending", s.config.MaxPending),
+		)
 		http.Error(w, "Server at capacity, please retry later", http.StatusServiceUnavailable)
 		return
 	}
-	pendingRequests[trackingKey] = pending
-	requestsMutex.Unlock()
+	s.pendingRequests[trackingKey] = pending
+	currentPending = len(s.pendingRequests)
+	s.requestsMutex.Unlock()
 
-	log.Printf("🔍 CHECK: %s | Hash: %s | Tracking Key: %s | Pending: %d/%d",
-		req.Domain, req.TholdHash, trackingKey, len(pendingRequests), MAX_PENDING)
+	logger.Info("CHECK request initiated",
+		zap.String("domain", req.Domain),
+		zap.String("thold_hash", req.TholdHash),
+		zap.String("tracking_key", trackingKey),
+		zap.Int("pending_count", currentPending),
+		zap.Int("max_pending", s.config.MaxPending),
+	)
 
 	// Trigger CRE workflow with configured callback URL
-	if err := triggerWorkflow("check", req.Domain, nil, &req.TholdHash, CALLBACK_URL); err != nil {
-		log.Printf("❌ Failed to trigger workflow: %v", err)
+	if err := s.triggerWorkflow("check", req.Domain, nil, &req.TholdHash, s.config.CallbackURL); err != nil {
+		logger.Error("Failed to trigger workflow",
+			zap.String("domain", req.Domain),
+			zap.Error(err),
+		)
+		workflowTriggers.WithLabelValues("check", "error").Inc()
+
+		// Clean up pending request on failure
+		s.requestsMutex.Lock()
+		delete(s.pendingRequests, trackingKey)
+		currentPending = len(s.pendingRequests)
+		s.requestsMutex.Unlock()
+		pendingRequestsGauge.Set(float64(currentPending))
+
 		http.Error(w, fmt.Sprintf("Failed to trigger workflow: %v", err), http.StatusInternalServerError)
 		return
 	}
+	workflowTriggers.WithLabelValues("check", "success").Inc()
 
 	// Block waiting for webhook or timeout
 	select {
@@ -592,42 +1120,49 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 		// Webhook arrived! Return result immediately
 		eventType := result.EventType
 		if eventType == "breach" {
-			log.Printf("🚨 BREACH detected: %s | Secret revealed!", req.Domain)
+			logger.Info("BREACH detected - secret revealed",
+				zap.String("domain", req.Domain),
+			)
 		} else {
-			log.Printf("✅ CHECK completed: %s | Status: %s", req.Domain, eventType)
+			logger.Info("CHECK completed",
+				zap.String("domain", req.Domain),
+				zap.String("status", eventType),
+			)
 		}
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "completed"
 		pending.Result = result
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
-		// Parse the content field to JSON and return only data
-		var contentData map[string]interface{}
-		if err := json.Unmarshal([]byte(result.Content), &contentData); err != nil {
-			log.Printf("⚠️  Failed to parse content JSON: %v", err)
-			contentData = map[string]interface{}{"raw": result.Content}
-		}
-
-		// Round down quote_price and latest_price to whole numbers
-		if quotePrice, ok := contentData["quote_price"].(float64); ok {
-			contentData["quote_price"] = float64(int64(quotePrice))
-		}
-		if latestPrice, ok := contentData["latest_price"].(float64); ok {
-			contentData["latest_price"] = float64(int64(latestPrice))
+		// Parse CRE response - already in core-ts PriceContract format
+		var priceContract PriceContractResponse
+		if err := json.Unmarshal([]byte(result.Content), &priceContract); err != nil {
+			logger.Warn("Failed to parse content JSON",
+				zap.String("domain", req.Domain),
+				zap.Error(err),
+			)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{"raw": result.Content})
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(contentData)
+		json.NewEncoder(w).Encode(priceContract)
 
-	case <-time.After(BLOCK_TIMEOUT):
+	case <-time.After(s.config.BlockTimeout):
 		// Timeout - return 202 with request_id for polling
-		log.Printf("⏱️  CHECK timeout: %s | Request ID: %s (use /status to poll)", req.Domain, trackingKey)
+		requestTimeouts.WithLabelValues("check").Inc()
+		logger.Warn("CHECK request timeout",
+			zap.String("domain", req.Domain),
+			zap.String("request_id", trackingKey),
+			zap.Duration("timeout", s.config.BlockTimeout),
+		)
 
-		requestsMutex.Lock()
+		s.requestsMutex.Lock()
 		pending.Status = "timeout"
 		pending.TimedOut = true
-		requestsMutex.Unlock()
+		s.requestsMutex.Unlock()
 
 		response := SyncResponse{
 			Status:    "timeout",
@@ -640,8 +1175,18 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /webhook/ducat - Receives callbacks from CRE and unblocks waiting requests
-func handleWebhook(w http.ResponseWriter, r *http.Request) {
+// handleWebhook receives POST callbacks from the CRE workflow and unblocks waiting requests.
+//
+// Webhook Domain Resolution:
+// The handler extracts the tracking domain from the webhook payload's tags. If no "domain" tag
+// is present, it falls back to using the event_id as the domain key. This fallback ensures
+// backward compatibility with CRE workflows that may not include explicit domain tags.
+//
+// Note for CRE Integration:
+// CRE workflows should include a "domain" tag in their Nostr event to ensure proper request
+// matching. The domain should match the request_id generated by handleCreate/handleCheck.
+// Example: Tags: [["d", commit_hash], ["domain", request_id]]
+func (s *GatewayServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -661,27 +1206,111 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract domain from tags to match pending request
+	// SECURITY: Validate Content field is not empty
+	// Empty content would result in invalid/empty price contract data
+	if payload.Content == "" {
+		webhookSignatureFailures.WithLabelValues("empty_content").Inc()
+		logger.Warn("Webhook has empty content field",
+			zap.String("event_id", truncateEventID(payload.EventID)),
+		)
+		http.Error(w, "Webhook content cannot be empty", http.StatusBadRequest)
+		return
+	}
+
+	// SECURITY: Validate Tags array is present
+	// Tags are required for domain matching and Nostr event structure
+	if payload.Tags == nil {
+		webhookSignatureFailures.WithLabelValues("nil_tags").Inc()
+		logger.Warn("Webhook has nil tags array",
+			zap.String("event_id", truncateEventID(payload.EventID)),
+		)
+		http.Error(w, "Webhook tags cannot be nil", http.StatusBadRequest)
+		return
+	}
+
+	// SECURITY: Verify webhook signature to prevent spoofed payloads
+	// This ensures the webhook actually came from CRE with a valid Nostr event signature
+	if err := verifyWebhookSignature(&payload); err != nil {
+		webhookSignatureFailures.WithLabelValues("verification_failed").Inc()
+		logger.Error("Webhook signature verification failed",
+			zap.Error(err),
+			zap.String("event_id", truncateEventID(payload.EventID)),
+			zap.String("pubkey", payload.PubKey),
+		)
+		http.Error(w, "Signature verification failed", http.StatusUnauthorized)
+		return
+	}
+
+	// SECURITY: Verify webhook is signed by expected CRE public key
+	// This prevents attackers from forging valid signatures with their own keys
+	// ExpectedWebhookPubKey is now MANDATORY (checked at startup)
+	if payload.PubKey != s.config.ExpectedWebhookPubKey {
+		webhookSignatureFailures.WithLabelValues("wrong_pubkey").Inc()
+		s.logger.Warn("Webhook signed by unauthorized key",
+			zap.String("event_id", truncateEventID(payload.EventID)),
+		)
+		http.Error(w, "Webhook signed by unauthorized key", http.StatusUnauthorized)
+		return
+	}
+
+	// SECURITY: Verify webhook timestamp freshness to prevent replay attacks
+	// Webhooks older than 5 minutes are rejected to limit replay window
+	// Allow 30 seconds of future drift to handle minor clock skew between servers
+	const maxWebhookAge = 5 * 60      // 5 minutes in seconds
+	const maxClockSkew int64 = 30    // 30 seconds tolerance for future timestamps
+	currentTime := time.Now().Unix()
+	webhookAge := currentTime - payload.CreatedAt
+	if webhookAge < -maxClockSkew {
+		// Future timestamp beyond acceptable clock skew - likely attack
+		webhookSignatureFailures.WithLabelValues("future_timestamp").Inc()
+		logger.Warn("Webhook has future timestamp beyond clock skew tolerance",
+			zap.Int64("created_at", payload.CreatedAt),
+			zap.Int64("current_time", currentTime),
+			zap.String("event_id", truncateEventID(payload.EventID)),
+		)
+		http.Error(w, "Invalid timestamp", http.StatusUnauthorized)
+		return
+	}
+	if webhookAge > maxWebhookAge {
+		webhookSignatureFailures.WithLabelValues("expired").Inc()
+		logger.Warn("Webhook timestamp expired",
+			zap.Int64("age_seconds", webhookAge),
+			zap.Int64("max_age_seconds", maxWebhookAge),
+			zap.String("event_id", truncateEventID(payload.EventID)),
+		)
+		http.Error(w, "Webhook expired", http.StatusUnauthorized)
+		return
+	}
+
+	// SECURITY: Extract domain from tags to match pending request
+	// Domain tag is REQUIRED - no fallback to event_id to prevent spoofing
 	domain := getTag(payload.Tags, "domain")
 	if domain == "" {
-		logger.Warn("Webhook missing domain tag, using event_id fallback",
-			zap.String("event_id", payload.EventID),
+		webhookSignatureFailures.WithLabelValues("missing_domain").Inc()
+		s.logger.Warn("Webhook missing required domain tag",
+			zap.String("event_id", truncateEventID(payload.EventID)),
 		)
-		domain = payload.EventID
+		http.Error(w, "Missing required domain tag", http.StatusBadRequest)
+		return
 	}
 
 	// Find the pending request by domain
-	requestsMutex.Lock()
-	pending, exists := pendingRequests[domain]
-	requestsMutex.Unlock()
+	// Copy channel reference while holding lock to prevent race with cleanup
+	s.requestsMutex.Lock()
+	pending, exists := s.pendingRequests[domain]
+	var resultChan chan *WebhookPayload
+	if exists && pending != nil {
+		resultChan = pending.ResultChan
+	}
+	s.requestsMutex.Unlock()
 
-	if !exists {
+	if !exists || resultChan == nil {
 		// This is fine - might be a duplicate webhook from another DON node
 		// or a request that already timed out
 		webhooksReceived.WithLabelValues(payload.EventType, "no_match").Inc()
 		logger.Debug("Webhook received but no pending request found",
 			zap.String("domain", domain),
-			zap.String("event_id", payload.EventID),
+			zap.String("event_id", truncateEventID(payload.EventID)),
 			zap.String("event_type", payload.EventType),
 		)
 		w.WriteHeader(http.StatusOK)
@@ -690,20 +1319,21 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send result to the channel (non-blocking)
+	// Using local copy of channel to avoid race condition
 	select {
-	case pending.ResultChan <- &payload:
+	case resultChan <- &payload:
 		webhooksReceived.WithLabelValues(payload.EventType, "matched").Inc()
 		logger.Info("Webhook received and matched",
 			zap.String("event_type", payload.EventType),
 			zap.String("domain", domain),
-			zap.String("event_id", payload.EventID),
+			zap.String("event_id", truncateEventID(payload.EventID)),
 		)
 	default:
 		// Channel already has a result or was closed - this is a duplicate webhook
 		webhooksReceived.WithLabelValues(payload.EventType, "duplicate").Inc()
 		logger.Debug("Duplicate webhook ignored",
 			zap.String("domain", domain),
-			zap.String("event_id", payload.EventID),
+			zap.String("event_id", truncateEventID(payload.EventID)),
 		)
 	}
 
@@ -711,8 +1341,17 @@ func handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// GET /status/{request_id} - Manual polling fallback
-func handleStatus(w http.ResponseWriter, r *http.Request) {
+// handleStatus responds to GET /status/{request_id} with the current state of a tracked request.
+// 
+// If the request exists and its status is "completed" and the webhook payload can be unmarshaled
+// into a PriceContractResponse, the handler returns that PriceContractResponse as JSON.
+// Otherwise the handler returns a SyncResponse JSON envelope containing the request's status,
+// request ID, and any captured Result; when status is "pending" the response includes a message
+// indicating processing is still underway.
+// 
+// The handler returns HTTP 405 for non-GET methods, 400 when request_id is missing, and 404 when
+// the request_id is not found.
+func (s *GatewayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -724,27 +1363,21 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestsMutex.RLock()
-	pending, exists := pendingRequests[requestID]
-	requestsMutex.RUnlock()
+	s.requestsMutex.RLock()
+	pending, exists := s.pendingRequests[requestID]
+	s.requestsMutex.RUnlock()
 
 	if !exists {
 		http.Error(w, "Request not found", http.StatusNotFound)
 		return
 	}
 
-	// If completed, parse and round down quote_price
+	// If completed, return PriceContract directly (CRE already outputs correct format)
 	if pending.Status == "completed" && pending.Result != nil {
-		var contentData map[string]interface{}
-		if err := json.Unmarshal([]byte(pending.Result.Content), &contentData); err == nil {
-			// Round down quote_price to whole number
-			if quotePrice, ok := contentData["quote_price"].(float64); ok {
-				contentData["quote_price"] = float64(int64(quotePrice))
-			}
-
-			// Return modified content data directly
+		var priceContract PriceContractResponse
+		if err := json.Unmarshal([]byte(pending.Result.Content), &priceContract); err == nil {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(contentData)
+			json.NewEncoder(w).Encode(priceContract)
 			return
 		}
 	}
@@ -811,7 +1444,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /readiness - Readiness probe (is the server ready to accept traffic?)
-func handleReadiness(w http.ResponseWriter, r *http.Request) {
+func (s *GatewayServer) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 
@@ -822,18 +1455,18 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 	overallStatus := "healthy"
 
 	// 1. Check CRE Gateway reachability
-	creHealth := checkCREGateway(ctx)
+	creHealth := s.checkCREGateway(ctx)
 	deps["cre_gateway"] = creHealth
 	if creHealth.Status != "up" {
 		overallStatus = "degraded"
 	}
 
 	// 2. Check capacity
-	requestsMutex.RLock()
-	currentPending := len(pendingRequests)
-	requestsMutex.RUnlock()
+	s.requestsMutex.RLock()
+	currentPending := len(s.pendingRequests)
+	s.requestsMutex.RUnlock()
 
-	capacityPercent := float64(currentPending) / float64(MAX_PENDING) * 100
+	capacityPercent := float64(currentPending) / float64(s.config.MaxPending) * 100
 	capacityStatus := "up"
 	capacityMessage := "Capacity available"
 
@@ -854,7 +1487,7 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Check if private key is loaded
-	if privateKey == nil {
+	if s.privateKey == nil {
 		deps["authentication"] = Health{
 			Status:      "down",
 			Message:     "Private key not loaded",
@@ -878,7 +1511,7 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 		Dependencies: deps,
 		Metrics: HealthMetrics{
 			PendingRequests: currentPending,
-			MaxPending:      MAX_PENDING,
+			MaxPending:      s.config.MaxPending,
 			CapacityUsed:    capacityPercent,
 		},
 	}
@@ -921,14 +1554,14 @@ func handleReadiness(w http.ResponseWriter, r *http.Request) {
 }
 
 // checkCREGateway verifies connectivity to the CRE gateway
-func checkCREGateway(ctx context.Context) Health {
+func (s *GatewayServer) checkCREGateway(ctx context.Context) Health {
 	start := time.Now()
 
 	// Create a HEAD request with timeout
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(checkCtx, "HEAD", GATEWAY_URL, nil)
+	req, err := http.NewRequestWithContext(checkCtx, "HEAD", s.config.GatewayURL, nil)
 	if err != nil {
 		return Health{
 			Status:      "down",
@@ -948,7 +1581,7 @@ func checkCREGateway(ctx context.Context) Health {
 	if err != nil {
 		logger.Warn("CRE gateway health check failed",
 			zap.Error(err),
-			zap.String("gateway_url", GATEWAY_URL),
+			zap.String("gateway_url", s.config.GatewayURL),
 		)
 		return Health{
 			Status:      "down",
@@ -976,7 +1609,18 @@ func checkCREGateway(ctx context.Context) Health {
 }
 
 // triggerWorkflow sends HTTP trigger to CRE gateway using proper JWT format
-func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, callbackURL string) error {
+// Uses circuit breaker to prevent cascading failures when CRE gateway is unavailable
+func (s *GatewayServer) triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, callbackURL string) error {
+	// Check circuit breaker before attempting request
+	if !s.circuitBreaker.Allow() {
+		s.logger.Warn("Circuit breaker open - rejecting request to CRE gateway",
+			zap.String("operation", op),
+			zap.String("domain", domain),
+			zap.String("circuit_state", s.circuitBreaker.State()),
+		)
+		return fmt.Errorf("circuit breaker open: CRE gateway temporarily unavailable")
+	}
+
 	// Build input
 	input := map[string]interface{}{
 		"domain":       domain,
@@ -999,12 +1643,14 @@ func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, 
 		"params": map[string]interface{}{
 			"input": input,
 			"workflow": map[string]interface{}{
-				"workflowID": WORKFLOW_ID,
+				"workflowID": s.config.WorkflowID,
 			},
 		},
 	}
 
-	rpcJSON, err := json.Marshal(rpcRequest)
+	// Use deterministic JSON marshaling for consistent digest computation
+	// This ensures the same request always produces the same signature
+	rpcJSON, err := marshalSorted(rpcRequest)
 	if err != nil {
 		return fmt.Errorf("failed to marshal RPC request: %w", err)
 	}
@@ -1013,14 +1659,20 @@ func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, 
 	digest := sha256.Sum256(rpcJSON)
 	digestHex := "0x" + hex.EncodeToString(digest[:])
 
-	// Generate JWT token
-	token, err := generateJWT(privateKey, AUTHORIZED_KEY, digestHex)
+	// Generate cryptographically random request ID
+	requestID, err := ethsign.GenerateRequestID()
+	if err != nil {
+		return fmt.Errorf("failed to generate request ID: %w", err)
+	}
+
+	// Generate JWT token using shared ethsign package
+	token, err := ethsign.GenerateJWT(s.privateKey, s.config.AuthorizedKey, digestHex, requestID)
 	if err != nil {
 		return fmt.Errorf("failed to generate JWT: %w", err)
 	}
 
 	// Send request
-	req, err := http.NewRequest("POST", GATEWAY_URL, bytes.NewReader(rpcJSON))
+	req, err := http.NewRequest("POST", s.config.GatewayURL, bytes.NewReader(rpcJSON))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -1031,6 +1683,7 @@ func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		s.circuitBreaker.RecordFailure()
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1038,201 +1691,30 @@ func triggerWorkflow(op, domain string, tholdPrice *float64, tholdHash *string, 
 	respBody, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != 200 && resp.StatusCode != 202 {
+		// 5xx errors indicate CRE gateway issues, trigger circuit breaker
+		if resp.StatusCode >= 500 {
+			s.circuitBreaker.RecordFailure()
+		}
 		return fmt.Errorf("non-success status %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	// Success - record it to potentially close the circuit
+	s.circuitBreaker.RecordSuccess()
 	return nil
 }
 
-// generateJWT creates a proper JWT token with header.payload.signature format
-func generateJWT(privKey *ecdsa.PrivateKey, address, digest string) (string, error) {
-	now := time.Now().Unix()
-
-	// Create header (base64url encoded)
-	header := map[string]interface{}{
-		"alg": "ETH",
-		"typ": "JWT",
+// truncateEventID safely truncates an event ID to 16 characters for logging.
+// This prevents log injection attacks where attackers could embed malicious content
+// in long event IDs. Returns the full string if shorter than 16 chars.
+func truncateEventID(eventID string) string {
+	if len(eventID) <= 16 {
+		return eventID
 	}
-	headerJSON, _ := json.Marshal(header)
-	headerB64 := encodeBase64URL(headerJSON)
-
-	// Create payload (base64url encoded)
-	payload := map[string]interface{}{
-		"digest": digest,
-		"iss":    address,
-		"iat":    now,
-		"exp":    now + 300, // 5 minutes
-		"jti":    generateRequestID(),
-	}
-	payloadJSON, _ := json.Marshal(payload)
-	payloadB64 := encodeBase64URL(payloadJSON)
-
-	// Message to sign: header.payload
-	message := headerB64 + "." + payloadB64
-
-	// Sign the message
-	signature, err := signEthereumMessage(privKey, message)
-	if err != nil {
-		return "", fmt.Errorf("failed to sign JWT: %w", err)
-	}
-
-	// Encode signature as base64url
-	signatureB64 := encodeBase64URL(signature)
-
-	// Final JWT: header.payload.signature
-	return message + "." + signatureB64, nil
+	return eventID[:16]
 }
 
-// Ethereum message signing (same as trigger-http tool)
-func signEthereumMessage(privKey *ecdsa.PrivateKey, message string) ([]byte, error) {
-	prefix := fmt.Sprintf("\x19Ethereum Signed Message:\n%d%s", len(message), message)
-
-	hash := sha3.NewLegacyKeccak256()
-	hash.Write([]byte(prefix))
-	messageHash := hash.Sum(nil)
-
-	// Sign using standard ECDSA
-	r, s, err := ecdsa.Sign(rand.Reader, privKey, messageHash)
-	if err != nil {
-		return nil, fmt.Errorf("signing failed: %w", err)
-	}
-
-	// Normalize s to lower value (BIP-62)
-	halfOrder := new(big.Int).Div(btcec.S256().N, big.NewInt(2))
-	if s.Cmp(halfOrder) > 0 {
-		s.Sub(btcec.S256().N, s)
-	}
-
-	// Convert to btcec for recovery ID computation
-	privKeyBytes := crypto.FromECDSA(privKey)
-	btcPrivKey, btcPubKey := btcec.PrivKeyFromBytes(privKeyBytes)
-
-	// Convert r, s to btcec.ModNScalar
-	var rScalar, sScalar btcec.ModNScalar
-	rScalar.SetByteSlice(r.Bytes())
-	sScalar.SetByteSlice(s.Bytes())
-
-	recoveryID := computeRecoveryID(btcPrivKey, btcPubKey, messageHash, &rScalar, &sScalar)
-
-	// Format: r || s || v
-	rBytes := r.Bytes()
-	sBytes := s.Bytes()
-
-	rPadded := make([]byte, 32)
-	sPadded := make([]byte, 32)
-	copy(rPadded[32-len(rBytes):], rBytes)
-	copy(sPadded[32-len(sBytes):], sBytes)
-
-	result := make([]byte, 65)
-	copy(result[0:32], rPadded)
-	copy(result[32:64], sPadded)
-	result[64] = recoveryID
-
-	return result, nil
-}
-
-func computeRecoveryID(privKey *btcec.PrivateKey, pubKey *btcec.PublicKey, messageHash []byte, r, s *btcec.ModNScalar) byte {
-	for recoveryID := byte(0); recoveryID < 4; recoveryID++ {
-		recoveredPubKey := tryRecoverPublicKey(messageHash, r, s, recoveryID)
-		if recoveredPubKey != nil {
-			recoveredBytes := recoveredPubKey.SerializeUncompressed()
-			expectedBytes := pubKey.SerializeUncompressed()
-			if bytes.Equal(recoveredBytes, expectedBytes) {
-				return recoveryID
-			}
-		}
-	}
-	return 0
-}
-
-func tryRecoverPublicKey(messageHash []byte, r, s *btcec.ModNScalar, recoveryID byte) *btcec.PublicKey {
-	curve := btcec.S256()
-	rBytes := r.Bytes()
-	sBytes := s.Bytes()
-
-	rBig := new(big.Int).SetBytes(rBytes[:])
-	sBig := new(big.Int).SetBytes(sBytes[:])
-
-	if recoveryID&2 == 2 {
-		rBig.Add(rBig, curve.N)
-	}
-
-	if rBig.Cmp(curve.P) >= 0 {
-		return nil
-	}
-
-	ySquared := new(big.Int).Exp(rBig, big.NewInt(3), curve.P)
-	ySquared.Add(ySquared, curve.B)
-	ySquared.Mod(ySquared, curve.P)
-
-	y := new(big.Int).ModSqrt(ySquared, curve.P)
-	if y == nil {
-		return nil
-	}
-
-	if (recoveryID&1 == 1 && y.Bit(0) == 0) || (recoveryID&1 == 0 && y.Bit(0) == 1) {
-		y.Sub(curve.P, y)
-	}
-
-	var xFieldVal, yFieldVal btcec.FieldVal
-	xFieldVal.SetByteSlice(rBig.Bytes())
-	yFieldVal.SetByteSlice(y.Bytes())
-	R := btcec.NewPublicKey(&xFieldVal, &yFieldVal)
-
-	e := new(big.Int).SetBytes(messageHash)
-	rInv := new(big.Int).ModInverse(rBig, curve.N)
-
-	sR_x, sR_y := curve.ScalarMult(R.X(), R.Y(), sBig.Bytes())
-	eNeg := new(big.Int).Neg(e)
-	eNeg.Mod(eNeg, curve.N)
-	eG_x, eG_y := curve.ScalarBaseMult(eNeg.Bytes())
-
-	qX, qY := curve.Add(sR_x, sR_y, eG_x, eG_y)
-	qX, qY = curve.ScalarMult(qX, qY, rInv.Bytes())
-
-	var qXFieldVal, qYFieldVal btcec.FieldVal
-	qXFieldVal.SetByteSlice(qX.Bytes())
-	qYFieldVal.SetByteSlice(qY.Bytes())
-
-	return btcec.NewPublicKey(&qXFieldVal, &qYFieldVal)
-}
-
-func encodeBase64URL(data []byte) string {
-	encoded := make([]byte, len(data)*4/3+4)
-	n := 0
-	for i := 0; i < len(data); i += 3 {
-		remaining := len(data) - i
-		if remaining >= 3 {
-			chunk := uint32(data[i])<<16 | uint32(data[i+1])<<8 | uint32(data[i+2])
-			encoded[n] = base64URLChars[(chunk>>18)&0x3F]
-			encoded[n+1] = base64URLChars[(chunk>>12)&0x3F]
-			encoded[n+2] = base64URLChars[(chunk>>6)&0x3F]
-			encoded[n+3] = base64URLChars[chunk&0x3F]
-			n += 4
-		} else if remaining == 2 {
-			chunk := uint32(data[i])<<16 | uint32(data[i+1])<<8
-			encoded[n] = base64URLChars[(chunk>>18)&0x3F]
-			encoded[n+1] = base64URLChars[(chunk>>12)&0x3F]
-			encoded[n+2] = base64URLChars[(chunk>>6)&0x3F]
-			n += 3
-		} else {
-			chunk := uint32(data[i]) << 16
-			encoded[n] = base64URLChars[(chunk>>18)&0x3F]
-			encoded[n+1] = base64URLChars[(chunk>>12)&0x3F]
-			n += 2
-		}
-	}
-	return string(encoded[:n])
-}
-
-const base64URLChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-
-func generateRequestID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
+// getTag extracts the value for a given key from a Nostr-style tags slice.
+// It returns the second element of the first tag whose first element equals key, or an empty string if no match is found.
 func getTag(tags [][]string, key string) string {
 	for _, tag := range tags {
 		if len(tag) >= 2 && tag[0] == key {
@@ -1242,63 +1724,175 @@ func getTag(tags [][]string, key string) string {
 	return ""
 }
 
-func getTholdHash(payload *WebhookPayload) string {
-	var priceEvent PriceEvent
-	json.Unmarshal([]byte(payload.Content), &priceEvent)
-	return priceEvent.TholdHash
+// getTholdHash extracts the TholdHash field from the WebhookPayload's Content interpreted as a PriceContractResponse.
+// Returns the thold_hash and any JSON parsing error encountered.
+// Callers should handle the error case appropriately (e.g., log warning and use empty string).
+func getTholdHash(payload *WebhookPayload) (string, error) {
+	if payload == nil || payload.Content == "" {
+		return "", fmt.Errorf("payload or content is nil/empty")
+	}
+	var priceContract PriceContractResponse
+	if err := json.Unmarshal([]byte(payload.Content), &priceContract); err != nil {
+		return "", fmt.Errorf("failed to parse content as PriceContractResponse: %w", err)
+	}
+	return priceContract.TholdHash, nil
 }
 
-// Cleanup old completed/timed-out requests to prevent memory leak
-func cleanupOldRequests() {
-	ticker := time.NewTicker(CLEANUP_INTERVAL)
+// marshalSorted marshals v to JSON with all map keys sorted lexicographically at every level.
+// This ensures deterministic output for consistent digest computation across requests.
+func marshalSorted(v interface{}) ([]byte, error) {
+	// Convert to map structure first via standard JSON round-trip
+	temp, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	var data interface{}
+	if err := json.Unmarshal(temp, &data); err != nil {
+		return nil, err
+	}
+
+	// Custom marshal with sorted keys
+	var buf bytes.Buffer
+	if err := marshalSortedRecursive(&buf, data); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+// marshalSortedRecursive writes the JSON encoding of v to buf with all map keys
+// sorted lexicographically at every level.
+func marshalSortedRecursive(buf *bytes.Buffer, v interface{}) error {
+	switch val := v.(type) {
+	case map[string]interface{}:
+		buf.WriteString("{")
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for i, k := range keys {
+			if i > 0 {
+				buf.WriteString(",")
+			}
+			keyBytes, _ := json.Marshal(k)
+			buf.Write(keyBytes)
+			buf.WriteString(":")
+			if err := marshalSortedRecursive(buf, val[k]); err != nil {
+				return err
+			}
+		}
+		buf.WriteString("}")
+	case []interface{}:
+		buf.WriteString("[")
+		for i, item := range val {
+			if i > 0 {
+				buf.WriteString(",")
+			}
+			if err := marshalSortedRecursive(buf, item); err != nil {
+				return err
+			}
+		}
+		buf.WriteString("]")
+	default:
+		b, err := json.Marshal(val)
+		if err != nil {
+			return err
+		}
+		buf.Write(b)
+	}
+	return nil
+}
+
+// cleanupOldRequests periodically removes stale requests to prevent memory leaks.
+// It respects the shutdownChan for graceful termination during server shutdown.
+//
+// Cleanup strategy:
+//   - Remove completed requests older than 5 minutes
+//   - Remove timed-out requests older than 5 minutes (clients should poll /status)
+//   - Remove stale pending requests older than 2x s.config.BlockTimeout (edge case handling)
+//
+// SAFETY: We collect requests to delete first, then close their channels outside
+// the main loop to prevent issues with concurrent channel operations.
+func (s *GatewayServer) cleanupOldRequests() {
+	ticker := time.NewTicker(s.config.CleanupInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		requestsMutex.Lock()
-		now := time.Now()
-		cleaned := 0
+	for {
+		select {
+		case <-s.shutdownChan:
+			logger.Info("Cleanup goroutine received shutdown signal")
+			return
+		case <-ticker.C:
+			// Collect requests to delete (don't modify map while iterating)
+			var toDelete []string
+			var channelsToClose []chan *WebhookPayload
 
-		for id, req := range pendingRequests {
-			// More aggressive cleanup strategy:
-			// 1. Remove completed requests older than 5 minutes
-			// 2. Remove timed-out requests older than 5 minutes (they should poll /status)
-			// 3. Remove any stale pending requests older than 2x BLOCK_TIMEOUT
-			shouldDelete := false
+			s.requestsMutex.Lock()
+			now := time.Now()
 
-			if req.Status == "completed" && now.Sub(req.CreatedAt) > 5*time.Minute {
-				shouldDelete = true
-			} else if req.Status == "timeout" && now.Sub(req.CreatedAt) > 5*time.Minute {
-				shouldDelete = true
-			} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*BLOCK_TIMEOUT {
-				// Stale pending request that never completed or timed out (shouldn't happen)
-				age := now.Sub(req.CreatedAt)
-				logger.Warn("Cleaning up stale pending request",
-					zap.String("request_id", id),
-					zap.Duration("age", age),
-					zap.String("status", req.Status),
+			for id, req := range s.pendingRequests {
+				shouldDelete := false
+
+				if req.Status == "completed" && now.Sub(req.CreatedAt) > 5*time.Minute {
+					shouldDelete = true
+				} else if req.Status == "timeout" && now.Sub(req.CreatedAt) > 5*time.Minute {
+					shouldDelete = true
+				} else if req.Status == "pending" && now.Sub(req.CreatedAt) > 2*s.config.BlockTimeout {
+					// Stale pending request that never completed or timed out (shouldn't happen)
+					age := now.Sub(req.CreatedAt)
+					logger.Warn("Cleaning up stale pending request",
+						zap.String("request_id", id),
+						zap.Duration("age", age),
+						zap.String("status", req.Status),
+					)
+					shouldDelete = true
+				}
+
+				if shouldDelete {
+					toDelete = append(toDelete, id)
+					// Collect channel to close (only if not nil and request was pending)
+					if req.ResultChan != nil && req.Status == "pending" {
+						channelsToClose = append(channelsToClose, req.ResultChan)
+					}
+				}
+			}
+
+			// Delete collected requests
+			for _, id := range toDelete {
+				delete(s.pendingRequests, id)
+			}
+
+			currentPending := len(s.pendingRequests)
+			s.requestsMutex.Unlock()
+
+			// Close channels outside the lock to avoid blocking other operations
+			// This signals any waiting handlers that the request was cleaned up
+			for _, ch := range channelsToClose {
+				close(ch)
+			}
+
+			cleaned := len(toDelete)
+
+			if cleaned > 0 {
+				requestsCleanedUp.Add(float64(cleaned))
+				logger.Info("Cleanup completed",
+					zap.Int("removed", cleaned),
+					zap.Int("pending", currentPending),
+					zap.Int("max_pending", s.config.MaxPending),
 				)
-				shouldDelete = true
 			}
 
-			if shouldDelete {
-				delete(pendingRequests, id)
-				cleaned++
+			// Update gauge after cleanup
+			pendingRequestsGauge.Set(float64(currentPending))
+
+			// Clean up stale IP rate limiters (IPs not seen in 10 minutes)
+			ipsCleaned := s.ipRateLimiter.Cleanup(10 * time.Minute)
+			if ipsCleaned > 0 {
+				logger.Debug("Cleaned up stale IP rate limiters", zap.Int("count", ipsCleaned))
 			}
 		}
-
-		currentPending := len(pendingRequests)
-		requestsMutex.Unlock()
-
-		if cleaned > 0 {
-			requestsCleanedUp.Add(float64(cleaned))
-			logger.Info("Cleanup completed",
-				zap.Int("removed", cleaned),
-				zap.Int("pending", currentPending),
-				zap.Int("max_pending", MAX_PENDING),
-			)
-		}
-
-		// Update gauge after cleanup
-		pendingRequestsGauge.Set(float64(currentPending))
 	}
 }

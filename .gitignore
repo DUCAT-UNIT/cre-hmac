@@ -19,6 +19,12 @@ hmac/tmp.wasm
 *.so
 *.dylib
 
+# Tool binaries
+gateway_server
+trigger_http
+webhook_server
+tools/gateway-server
+
 # Go test artifacts
 *.test
 *.out

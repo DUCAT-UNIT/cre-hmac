@@ -3,167 +3,123 @@
 package main
 
 import (
-	"fmt"
-	"math"
-	"regexp"
+	"ducat/shared"
 
 	"github.com/shopspring/decimal"
 )
 
-// Config holds workflow configuration (non-sensitive values only)
-type Config struct {
-	ClientID      string `json:"client_id"`
-	DataStreamURL string `json:"data_stream_url"`
-	FeedID        string `json:"feed_id"`
-	RelayURL      string `json:"relay_url"`
-	Network       string `json:"network"`
+// =============================================================================
+// Type Aliases - Import from shared package to avoid duplication
+// =============================================================================
+
+// Config is an alias for shared.Config
+type Config = shared.Config
+
+// HttpRequestData is an alias for shared.HttpRequestData
+type HttpRequestData = shared.HttpRequestData
+
+// EvaluateQuotesRequest is an alias for shared.EvaluateQuotesRequest
+type EvaluateQuotesRequest = shared.EvaluateQuotesRequest
+
+// QuoteEvaluationResult is an alias for shared.QuoteEvaluationResult
+type QuoteEvaluationResult = shared.QuoteEvaluationResult
+
+// EvaluateQuotesResponse is an alias for shared.EvaluateQuotesResponse
+type EvaluateQuotesResponse = shared.EvaluateQuotesResponse
+
+// EvaluationSummary is an alias for shared.EvaluationSummary
+type EvaluationSummary = shared.EvaluationSummary
+
+// GenerateQuotesRequest is an alias for shared.GenerateQuotesRequest
+type GenerateQuotesRequest = shared.GenerateQuotesRequest
+
+// GenerateQuotesResponse is an alias for shared.GenerateQuotesResponse
+type GenerateQuotesResponse = shared.GenerateQuotesResponse
+
+// PriceEvent is an alias for shared.PriceEvent
+type PriceEvent = shared.PriceEvent
+
+// NostrEvent is an alias for shared.NostrEvent
+type NostrEvent = shared.NostrEvent
+
+// RelayResponse is an alias for shared.RelayResponse
+type RelayResponse = shared.RelayResponse
+
+// =============================================================================
+// Validation Function Aliases
+// =============================================================================
+
+// IsValidTholdHash checks if a string is a valid threshold hash (40 lowercase hex chars)
+func IsValidTholdHash(hash string) bool {
+	return shared.IsValidTholdHash(hash)
 }
 
-// Validate validates the configuration
-func (c *Config) Validate() error {
-	if c.ClientID == "" {
-		return fmt.Errorf("client_id required")
-	}
-	if c.DataStreamURL == "" || c.RelayURL == "" {
-		return fmt.Errorf("URLs required")
-	}
-	if c.FeedID == "" {
-		return fmt.Errorf("feed_id required")
-	}
-	return nil
-}
+// =============================================================================
+// WASM-Specific Types (not shared with other packages)
+// =============================================================================
 
-// PriceData represents Chainlink price data
+// PriceData represents Chainlink price data with consensus aggregation tags
+// This is WASM-specific due to the consensus_aggregation struct tags
 type PriceData struct {
 	Price  decimal.Decimal `json:"price" consensus_aggregation:"median"`
 	Origin string          `json:"origin" consensus_aggregation:"identical"`
 	Stamp  int64           `json:"stamp" consensus_aggregation:"median"`
 }
 
-// HttpRequestData represents incoming HTTP request
-type HttpRequestData struct {
-	Domain      string   `json:"domain"`
-	TholdPrice  *float64 `json:"thold_price,omitempty"`
-	TholdHash   *string  `json:"thold_hash,omitempty"`
-	CallbackURL *string  `json:"callback_url,omitempty"` // Optional webhook for result notification
-}
-
-// Validate validates request data
-func (r *HttpRequestData) Validate() error {
-	// Domain validation
-	if r.Domain == "" {
-		return fmt.Errorf("domain required")
-	}
-	if len(r.Domain) > MaxDomainLength {
-		return fmt.Errorf("domain too long: max %d chars, got %d", MaxDomainLength, len(r.Domain))
-	}
-	if !isValidDomain(r.Domain) {
-		return fmt.Errorf("domain contains invalid characters (only alphanumeric, dots, hyphens, underscores allowed)")
-	}
-
-	// Request type validation
-	if r.TholdPrice == nil && r.TholdHash == nil {
-		return fmt.Errorf("either thold_price or thold_hash required")
-	}
-	if r.TholdPrice != nil && r.TholdHash != nil {
-		return fmt.Errorf("cannot specify both thold_price and thold_hash")
-	}
-
-	// Threshold price validation
-	if r.TholdPrice != nil {
-		price := *r.TholdPrice
-		// Check for NaN
-		if price != price {
-			return fmt.Errorf("threshold price is NaN")
-		}
-		// Check for infinity
-		if math.IsInf(price, 0) {
-			return fmt.Errorf("threshold price is infinite")
-		}
-		// Check bounds
-		if price <= 0 {
-			return fmt.Errorf("threshold price must be positive, got %.2f", price)
-		}
-		if price > MaxPriceValue {
-			return fmt.Errorf("threshold price exceeds maximum %.0f, got %.2f", MaxPriceValue, price)
-		}
-	}
-
-	// Threshold hash validation
-	if r.TholdHash != nil {
-		hash := *r.TholdHash
-		if len(hash) != 40 {
-			return fmt.Errorf("invalid thold_hash length: expected 40 hex chars, got %d", len(hash))
-		}
-		if !isValidHex(hash) {
-			return fmt.Errorf("invalid thold_hash format: must be lowercase hex")
-		}
-	}
-
-	return nil
-}
-
-// isValidDomain checks if domain contains only allowed characters
-// Allows: alphanumeric, dots, hyphens, underscores
-// This prevents injection attacks and ensures domain is safe for use in HMAC
-func isValidDomain(domain string) bool {
-	// Pattern: alphanumeric, dots, hyphens, underscores only
-	// No spaces, no special chars, no control characters
-	validDomain := regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
-	return validDomain.MatchString(domain)
-}
-
-// isValidHex checks if string is valid lowercase hex
-func isValidHex(s string) bool {
-	validHex := regexp.MustCompile(`^[0-9a-f]+$`)
-	return validHex.MatchString(s)
-}
-
-// PriceEvent represents a price threshold event (matches price-oracle structure)
-// Core price-oracle fields with DUCAT cryptographic extensions
-type PriceEvent struct {
-	// Core price event fields (from price-oracle PriceEvent)
-	EventOrigin  *string  `json:"event_origin"`   // nullable - null if not breached
-	EventPrice   *float64 `json:"event_price"`    // nullable - null if not breached
-	EventStamp   *int64   `json:"event_stamp"`    // nullable - null if not breached
-	EventType    string   `json:"event_type"`     // "active" or "breach"
-	LatestOrigin string   `json:"latest_origin"`  // current price origin
-	LatestPrice  float64  `json:"latest_price"`   // current price
-	LatestStamp  int64    `json:"latest_stamp"`   // current timestamp
-	QuoteOrigin  string   `json:"quote_origin"`   // quote creation origin
-	QuotePrice   float64  `json:"quote_price"`    // quote creation price
-	QuoteStamp   int64    `json:"quote_stamp"`    // quote creation timestamp
-
-	// DUCAT cryptographic extensions (from price-oracle EventQuoteTemplate)
-	IsExpired  bool     `json:"is_expired"`  // true if threshold breached
-	SrvNetwork string   `json:"srv_network"` // Bitcoin network (Mainnet/Testnet/Mutinynet)
-	SrvPubkey  string   `json:"srv_pubkey"`  // Server Schnorr public key
-	TholdHash  string   `json:"thold_hash"`  // Hash160 commitment
-	TholdKey   *string  `json:"thold_key"`   // Secret (null if not breached, populated if breached)
-	TholdPrice float64  `json:"thold_price"` // Threshold price
-	ReqID      string   `json:"req_id"`      // Deterministic request ID
-	ReqSig     string   `json:"req_sig"`     // Schnorr signature of request ID
-}
-
-// NostrEvent represents a Nostr NIP-01 event
-type NostrEvent struct {
-	ID        string     `json:"id"`
-	PubKey    string     `json:"pubkey"`
-	CreatedAt int64      `json:"created_at"`
-	Kind      int        `json:"kind"`
-	Tags      [][]string `json:"tags"`
-	Content   string     `json:"content"`
-	Sig       string     `json:"sig"`
-}
-
-// RelayResponse represents relay operation response
-type RelayResponse struct {
-	Success bool   `json:"success" consensus_aggregation:"identical"`
-	Message string `json:"message" consensus_aggregation:"identical"`
-}
-
 // KeyDerivation holds derived cryptographic keys
+// This is WASM-specific as it's only used in the CRE workflow
 type KeyDerivation struct {
 	PrivateKey    []byte
 	SchnorrPubkey string
+}
+
+// Zero securely zeroes the private key bytes to prevent memory leakage.
+// SECURITY: Call this via defer immediately after deriveKeys() returns successfully.
+func (k *KeyDerivation) Zero() {
+	if k != nil && k.PrivateKey != nil {
+		for i := range k.PrivateKey {
+			k.PrivateKey[i] = 0
+		}
+	}
+}
+
+// BatchGeneratedInfo is sent to gateway after batch quote generation
+// Gateway caches this to serve the current base price to clients
+type BatchGeneratedInfo struct {
+	BasePrice int64 `json:"base_price"` // BTC/USD price used for this batch
+	BaseStamp int64 `json:"base_stamp"` // Timestamp when batch was generated
+}
+
+// PriceContractResponse matches core-ts PriceContract schema exactly
+// This is the format sent to the gateway - no transformation needed
+type PriceContractResponse struct {
+	// PriceObservation fields (from core-ts)
+	ChainNetwork string `json:"chain_network"` // Bitcoin network
+	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
+	BasePrice    int64  `json:"base_price"`    // Quote creation price
+	BaseStamp    int64  `json:"base_stamp"`    // Quote creation timestamp
+
+	// PriceContract fields (from core-ts)
+	CommitHash string  `json:"commit_hash"` // hash340(tag, preimage) - 32 bytes hex
+	ContractID string  `json:"contract_id"` // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig  string  `json:"oracle_sig"`  // Schnorr signature - 64 bytes hex
+	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdKey   *string `json:"thold_key"`   // Secret (null if sealed) - 32 bytes hex
+	TholdPrice int64   `json:"thold_price"` // Threshold price
+}
+
+// ToPriceContractResponse converts PriceEvent to PriceContractResponse
+func ToPriceContractResponse(p *PriceEvent) *PriceContractResponse {
+	return &PriceContractResponse{
+		ChainNetwork: p.ChainNetwork,
+		OraclePubkey: p.OraclePubkey,
+		BasePrice:    p.BasePrice,
+		BaseStamp:    p.BaseStamp,
+		CommitHash:   p.CommitHash,
+		ContractID:   p.ContractID,
+		OracleSig:    p.OracleSig,
+		TholdHash:    p.TholdHash,
+		TholdKey:     p.TholdKey,
+		TholdPrice:   int64(p.TholdPrice),
+	}
 }

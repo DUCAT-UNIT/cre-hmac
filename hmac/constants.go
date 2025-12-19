@@ -22,8 +22,4 @@ const (
 	// Event states
 	EventTypeActive = "active"
 	EventTypeBreach = "breach"
-
-	// HMAC domain separators
-	DomainSeparatorServer    = "DUCAT_SERVER_KEY_V1"
-	DomainSeparatorThreshold = "DUCAT_THRESHOLD_V1"
 )
