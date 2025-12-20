@@ -51,6 +51,11 @@ type GatewayConfig struct {
 	// Webhook security - expected CRE Schnorr public key (64 hex chars)
 	// MANDATORY: webhooks must be signed by this key to be accepted
 	ExpectedWebhookPubKey string
+
+	// Liquidation service configuration
+	LiquidationURL      string        // URL of the liquidation service endpoint
+	LiquidationInterval time.Duration // How often to poll the liquidation service
+	LiquidationEnabled  bool          // Whether to enable liquidation polling
 }
 
 // IPRateLimiter manages per-IP rate limiters with automatic cleanup
@@ -574,10 +579,18 @@ func init() {
 		zap.String("workflow_id", config.WorkflowID),
 		zap.Float64("ip_rate_limit", float64(config.IPRateLimit)),
 		zap.Int("ip_burst_limit", config.IPBurstLimit),
+		zap.Bool("liquidation_enabled", config.LiquidationEnabled),
+		zap.String("liquidation_url", config.LiquidationURL),
+		zap.Duration("liquidation_interval", config.LiquidationInterval),
 	)
 
 	// Start cleanup goroutine
 	go server.cleanupOldRequests()
+
+	// Start liquidation poller if enabled
+	if config.LiquidationEnabled {
+		go server.pollLiquidationService()
+	}
 }
 
 func loadConfig() *GatewayConfig {
@@ -697,6 +710,32 @@ func loadConfig() *GatewayConfig {
 		if _, err := hex.DecodeString(config.ExpectedWebhookPubKey); err != nil {
 			logFatal("CRE_WEBHOOK_PUBKEY invalid hex: %v", err)
 		}
+	}
+
+	// Liquidation service configuration
+	config.LiquidationURL = os.Getenv("LIQUIDATION_SERVICE_URL")
+	if config.LiquidationURL == "" {
+		config.LiquidationURL = "http://localhost:4001/liq/api/at-risk"
+	}
+
+	// Liquidation polling interval (default: 90 seconds / 1.5 minutes)
+	liquidationIntervalStr := os.Getenv("LIQUIDATION_INTERVAL_SECONDS")
+	if liquidationIntervalStr == "" {
+		config.LiquidationInterval = 90 * time.Second
+	} else {
+		var seconds int
+		if _, err := fmt.Sscanf(liquidationIntervalStr, "%d", &seconds); err != nil {
+			logFatal("Invalid LIQUIDATION_INTERVAL_SECONDS: %v", err)
+		}
+		config.LiquidationInterval = time.Duration(seconds) * time.Second
+	}
+
+	// Enable liquidation polling (default: true if URL is set)
+	liquidationEnabled := os.Getenv("LIQUIDATION_ENABLED")
+	if liquidationEnabled == "" {
+		config.LiquidationEnabled = true // Enabled by default
+	} else {
+		config.LiquidationEnabled = liquidationEnabled == "true" || liquidationEnabled == "1"
 	}
 
 	return config
@@ -1803,6 +1842,315 @@ func marshalSortedRecursive(buf *bytes.Buffer, v interface{}) error {
 		}
 		buf.Write(b)
 	}
+	return nil
+}
+
+// AtRiskVault represents a vault that is at risk of liquidation
+type AtRiskVault struct {
+	VaultID       string  `json:"vault_id"`
+	TholdHash     string  `json:"thold_hash"`
+	TholdPrice    float64 `json:"thold_price"`
+	CurrentRatio  float64 `json:"current_ratio"`
+	CollateralBTC float64 `json:"collateral_btc"`
+	DebtDUSD      float64 `json:"debt_dusd"`
+}
+
+// AtRiskResponse is the response from the liquidation service
+type AtRiskResponse struct {
+	AtRiskVaults []AtRiskVault `json:"at_risk_vaults"`
+	TotalCount   int           `json:"total_count"`
+	CurrentPrice float64       `json:"current_price"`
+	Threshold    float64       `json:"threshold"`
+	Timestamp    int64         `json:"timestamp"`
+}
+
+// Prometheus metrics for liquidation polling
+var (
+	liquidationPollsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_liquidation_polls_total",
+			Help: "Total number of liquidation service polls by status",
+		},
+		[]string{"status"},
+	)
+
+	liquidationAtRiskGauge = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "gateway_liquidation_at_risk_count",
+			Help: "Current number of at-risk vaults from last poll",
+		},
+	)
+
+	liquidationPollDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "gateway_liquidation_poll_duration_seconds",
+			Help:    "Liquidation poll latency in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+
+	liquidationCheckTriggers = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "gateway_liquidation_check_triggers_total",
+			Help: "Total number of CRE check triggers for at-risk vaults by status",
+		},
+		[]string{"status"},
+	)
+)
+
+// pollLiquidationService periodically polls the liquidation service for at-risk vaults.
+// It runs every config.LiquidationInterval (default 90 seconds) and logs at-risk vault info.
+// This allows the gateway to be aware of vaults that may need liquidation and can trigger
+// the CRE workflow to check their breach status.
+func (s *GatewayServer) pollLiquidationService() {
+	s.logger.Info("Starting liquidation service poller",
+		zap.String("url", s.config.LiquidationURL),
+		zap.Duration("interval", s.config.LiquidationInterval),
+	)
+
+	// Do an initial poll immediately
+	s.doLiquidationPoll()
+
+	ticker := time.NewTicker(s.config.LiquidationInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.shutdownChan:
+			s.logger.Info("Liquidation poller received shutdown signal")
+			return
+		case <-ticker.C:
+			s.doLiquidationPoll()
+		}
+	}
+}
+
+// doLiquidationPoll makes a single request to the liquidation service and processes the response
+func (s *GatewayServer) doLiquidationPoll() {
+	start := time.Now()
+
+	// Create HTTP request with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", s.config.LiquidationURL, nil)
+	if err != nil {
+		s.logger.Error("Failed to create liquidation poll request", zap.Error(err))
+		liquidationPollsTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		s.logger.Warn("Liquidation service unreachable",
+			zap.Error(err),
+			zap.String("url", s.config.LiquidationURL),
+		)
+		liquidationPollsTotal.WithLabelValues("unreachable").Inc()
+		return
+	}
+	defer resp.Body.Close()
+
+	duration := time.Since(start)
+	liquidationPollDuration.Observe(duration.Seconds())
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		s.logger.Warn("Liquidation service returned non-200 status",
+			zap.Int("status_code", resp.StatusCode),
+			zap.String("body", string(body)),
+		)
+		liquidationPollsTotal.WithLabelValues("error").Inc()
+		return
+	}
+
+	// Parse response
+	var atRiskResp AtRiskResponse
+	if err := json.NewDecoder(resp.Body).Decode(&atRiskResp); err != nil {
+		s.logger.Error("Failed to parse liquidation service response", zap.Error(err))
+		liquidationPollsTotal.WithLabelValues("parse_error").Inc()
+		return
+	}
+
+	// Update metrics
+	liquidationAtRiskGauge.Set(float64(atRiskResp.TotalCount))
+	liquidationPollsTotal.WithLabelValues("success").Inc()
+
+	// Log results
+	if atRiskResp.TotalCount > 0 {
+		s.logger.Info("At-risk vaults detected",
+			zap.Int("count", atRiskResp.TotalCount),
+			zap.Float64("current_price", atRiskResp.CurrentPrice),
+			zap.Float64("threshold", atRiskResp.Threshold),
+			zap.Duration("poll_duration", duration),
+		)
+
+		// Log details for each at-risk vault (up to first 10)
+		logLimit := 10
+		if len(atRiskResp.AtRiskVaults) < logLimit {
+			logLimit = len(atRiskResp.AtRiskVaults)
+		}
+		for i := 0; i < logLimit; i++ {
+			vault := atRiskResp.AtRiskVaults[i]
+			s.logger.Debug("At-risk vault",
+				zap.String("vault_id", vault.VaultID),
+				zap.String("thold_hash", vault.TholdHash),
+				zap.Float64("current_ratio", vault.CurrentRatio),
+				zap.Float64("thold_price", vault.TholdPrice),
+			)
+		}
+		if atRiskResp.TotalCount > logLimit {
+			s.logger.Debug("Additional at-risk vaults not logged",
+				zap.Int("remaining", atRiskResp.TotalCount-logLimit),
+			)
+		}
+
+		// Trigger CRE check workflow for each at-risk vault to potentially reveal thold_key
+		s.triggerCheckForAtRiskVaults(atRiskResp.AtRiskVaults)
+	} else {
+		s.logger.Debug("No at-risk vaults",
+			zap.Float64("current_price", atRiskResp.CurrentPrice),
+			zap.Float64("threshold", atRiskResp.Threshold),
+			zap.Duration("poll_duration", duration),
+		)
+	}
+}
+
+// triggerBatchEvaluate triggers the CRE "evaluate" workflow with a batch of thold_hashes.
+// This will cause the oracle to check if any prices have breached their thresholds and reveal
+// the thold_key if so. The breach events are published to Nostr and picked up by the liquidation service.
+func (s *GatewayServer) triggerCheckForAtRiskVaults(vaults []AtRiskVault) {
+	if len(vaults) == 0 {
+		return
+	}
+
+	// Collect all valid thold_hashes
+	var tholdHashes []string
+	for _, vault := range vaults {
+		// Skip if thold_hash is empty or invalid (must be 40 hex chars)
+		if len(vault.TholdHash) != 40 {
+			s.logger.Debug("Skipping vault with invalid thold_hash",
+				zap.String("vault_id", vault.VaultID),
+				zap.String("thold_hash", vault.TholdHash),
+			)
+			continue
+		}
+		tholdHashes = append(tholdHashes, vault.TholdHash)
+	}
+
+	if len(tholdHashes) == 0 {
+		s.logger.Debug("No valid thold_hashes to evaluate")
+		return
+	}
+
+	s.logger.Info("Triggering batch CRE evaluate for at-risk vaults",
+		zap.Int("count", len(tholdHashes)),
+	)
+
+	// Generate a unique domain for this batch evaluation
+	domain := fmt.Sprintf("liq-batch-%d", time.Now().UnixNano())
+
+	// Trigger the batch evaluate workflow
+	err := s.triggerEvaluateWorkflow(domain, tholdHashes, s.config.CallbackURL)
+	if err != nil {
+		s.logger.Error("Failed to trigger batch evaluate workflow",
+			zap.Int("batch_size", len(tholdHashes)),
+			zap.Error(err),
+		)
+		liquidationCheckTriggers.WithLabelValues("error").Inc()
+	} else {
+		liquidationCheckTriggers.WithLabelValues("success").Inc()
+		s.logger.Info("Triggered batch evaluate workflow",
+			zap.Int("batch_size", len(tholdHashes)),
+			zap.String("domain", domain),
+		)
+	}
+}
+
+// triggerEvaluateWorkflow sends HTTP trigger to CRE gateway for batch quote evaluation
+func (s *GatewayServer) triggerEvaluateWorkflow(domain string, tholdHashes []string, callbackURL string) error {
+	// Check circuit breaker before attempting request
+	if !s.circuitBreaker.Allow() {
+		s.logger.Warn("Circuit breaker open - rejecting evaluate request to CRE gateway",
+			zap.String("domain", domain),
+			zap.String("circuit_state", s.circuitBreaker.State()),
+		)
+		return fmt.Errorf("circuit breaker open: CRE gateway temporarily unavailable")
+	}
+
+	// Build input for evaluate workflow
+	input := map[string]interface{}{
+		"domain":       domain,
+		"thold_hashes": tholdHashes,
+		"callback_url": callbackURL,
+	}
+
+	// Create JSON-RPC request
+	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
+	rpcRequest := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      reqID,
+		"method":  "workflows.execute",
+		"params": map[string]interface{}{
+			"input": input,
+			"workflow": map[string]interface{}{
+				"workflowID": s.config.WorkflowID,
+			},
+		},
+	}
+
+	// Use deterministic JSON marshaling for consistent digest computation
+	rpcJSON, err := marshalSorted(rpcRequest)
+	if err != nil {
+		return fmt.Errorf("failed to marshal RPC request: %w", err)
+	}
+
+	// Compute SHA256 digest of the request
+	digest := sha256.Sum256(rpcJSON)
+	digestHex := "0x" + hex.EncodeToString(digest[:])
+
+	// Generate cryptographically random request ID
+	requestID, err := ethsign.GenerateRequestID()
+	if err != nil {
+		return fmt.Errorf("failed to generate request ID: %w", err)
+	}
+
+	// Generate JWT token using shared ethsign package
+	token, err := ethsign.GenerateJWT(s.privateKey, s.config.AuthorizedKey, digestHex, requestID)
+	if err != nil {
+		return fmt.Errorf("failed to generate JWT: %w", err)
+	}
+
+	// Send request
+	req, err := http.NewRequest("POST", s.config.GatewayURL, bytes.NewReader(rpcJSON))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		s.circuitBreaker.RecordFailure()
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != 200 && resp.StatusCode != 202 {
+		// 5xx errors indicate CRE gateway issues, trigger circuit breaker
+		if resp.StatusCode >= 500 {
+			s.circuitBreaker.RecordFailure()
+		}
+		return fmt.Errorf("non-success status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Success - record it to potentially close the circuit
+	s.circuitBreaker.RecordSuccess()
 	return nil
 }
 
