@@ -78,6 +78,76 @@ func publishEvent(config *Config, logger *slog.Logger, sendRequester *http.SendR
 	}, nil
 }
 
+// publishEventsBatch publishes multiple signed NIP-33 events to relay in a single request
+// Events are sent as a JSON array, relay processes them atomically
+// Returns success only if ALL events are accepted
+func publishEventsBatch(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, events []*NostrEvent) (*RelayResponse, error) {
+	// Validate inputs
+	if config == nil {
+		return nil, fmt.Errorf("config cannot be nil")
+	}
+	if len(events) == 0 {
+		return &RelayResponse{Success: true, Message: "No events to publish"}, nil
+	}
+
+	// Validate all events before sending
+	for i, event := range events {
+		if event == nil {
+			return nil, fmt.Errorf("event at index %d cannot be nil", i)
+		}
+		if event.ID == "" {
+			return nil, fmt.Errorf("event at index %d has empty ID", i)
+		}
+		if event.Sig == "" {
+			return nil, fmt.Errorf("event at index %d has empty signature", i)
+		}
+	}
+
+	// Convert WebSocket URL to HTTP API URL
+	apiURL := strings.Replace(config.RelayURL, "ws://", "http://", 1)
+	apiURL = strings.Replace(apiURL, "wss://", "https://", 1)
+	apiURL = apiURL + "/api/quotes/batch"
+
+	logger.Info("Publishing event batch to relay", "url", apiURL, "count", len(events))
+
+	// Marshal events array to JSON
+	eventsJSON, err := json.Marshal(events)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal events: %w", err)
+	}
+
+	// POST batch to relay API endpoint
+	resp, err := sendRequester.SendRequest(&http.Request{
+		Method: "POST",
+		Url:    apiURL,
+		Body:   eventsJSON,
+		Headers: map[string]string{
+			"Content-Type": "application/json",
+		},
+	}).Await()
+
+	if err != nil {
+		logger.Error("Failed to publish batch to relay", "error", err)
+		return nil, fmt.Errorf("relay batch publish failed: %w", err)
+	}
+
+	// Accept both 200 OK and 201 Created as success
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+		logger.Error("Non-success status from relay batch", "status", resp.StatusCode, "body", string(resp.Body))
+		return &RelayResponse{
+			Success: false,
+			Message: fmt.Sprintf("relay returned status %d: %s", resp.StatusCode, string(resp.Body)),
+		}, nil
+	}
+
+	logger.Info("Successfully published event batch to relay", "count", len(events))
+
+	return &RelayResponse{
+		Success: true,
+		Message: fmt.Sprintf("Batch of %d events published successfully", len(events)),
+	}, nil
+}
+
 // fetchEvent retrieves quote by event ID and verifies signature
 func fetchEvent(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, eventID string) (*NostrEvent, error) {
 	// Validate inputs
