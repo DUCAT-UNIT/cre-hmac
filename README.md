@@ -10,6 +10,107 @@ Creates Hash160 commitments to price thresholds that reveal their secret only wh
 
 ## Architecture
 
+### System Overview
+
+```
+                          ┌────────────────────────────────────────────────────────────┐
+                          │                    DUCAT Oracle System                     │
+                          └────────────────────────────────────────────────────────────┘
+
+┌─────────────────┐                ┌─────────────────┐                ┌─────────────────┐
+│    Frontend     │                │    Regulator    │                │    Validator    │
+│  (Web/Mobile)   │                │  (Gateway API)  │                │   (Protocol)    │
+└────────┬────────┘                └────────┬────────┘                └────────┬────────┘
+         │                                  │                                  │
+         │ 1. GET /api/quote?th=95000       │                                  │
+         │─────────────────────────────────▶│                                  │
+         │                                  │                                  │
+         │                     ┌────────────┴────────────┐                     │
+         │                     │   Quote Resolution      │                     │
+         │                     │                         │                     │
+         │                     │  1. Check local cache   │                     │
+         │                     │  2. Query Nostr relay   │                     │
+         │                     │  3. Fallback to CRE     │                     │
+         │                     └────────────┬────────────┘                     │
+         │                                  │                                  │
+         │                                  │ 2. GET /api/quotes?d=<commit_hash>
+         │                                  │─────────────────────────────────┐│
+         │                                  │                                 ││
+         │                                  │        ┌─────────────────┐      ││
+         │                                  │        │   Nostr Relay   │◀─────┘│
+         │                                  │        │  (NIP-33 Store) │       │
+         │                                  │        └────────┬────────┘       │
+         │                                  │                 │                │
+         │                                  │◀────────────────┘                │
+         │ 3. QuoteResponse + collateral_ratio                                 │
+         │◀─────────────────────────────────│                                  │
+         │                                  │                                  │
+         │ 4. Execute TX with thold_hash    │                                  │
+         │─────────────────────────────────────────────────────────────────────▶
+         │                                  │                                  │
+         │                                  │    5. Poll at-risk vaults        │
+         │                                  │◀─────────────────────────────────│
+         │                                  │                                  │
+         │                                  │    6. Batch evaluate (if any)    │
+         │                                  │─────────────────────────────────┐│
+         │                                  │                                 ││
+         │                                  │        ┌─────────────────┐      ││
+         │                                  │        │   CRE (WASM)    │◀─────┘│
+         │                                  │        │  Chainlink DON  │       │
+         │                                  │        └────────┬────────┘       │
+         │                                  │                 │                │
+         │                                  │                 │ 7. Publish breached quotes
+         │                                  │                 │                │
+         │                                  │        ┌────────▼────────┐       │
+         │                                  │        │   Nostr Relay   │       │
+         │                                  │        └────────┬────────┘       │
+         │                                  │                 │                │
+         │                                  │                 │ 8. WS subscription
+         │                                  │                 │────────────────▶
+         │                                  │                                  │
+         │ 9. Liquidation notification      │                                  │
+         │◀─────────────────────────────────────────────────────────────────────
+```
+
+### Quote Flow Detail
+
+```
+Frontend                    Regulator                   Nostr Relay                 CRE
+   │                           │                            │                        │
+   │ GET /api/quote?th=95000   │                            │                        │
+   │──────────────────────────▶│                            │                        │
+   │                           │                            │                        │
+   │                           │──┐ Calculate commit_hash   │                        │
+   │                           │  │ (BIP-340 tagged hash)   │                        │
+   │                           │◀─┘                         │                        │
+   │                           │                            │                        │
+   │                           │ 1. Check local cache       │                        │
+   │                           │────────────────────────────│                        │
+   │                           │                            │                        │
+   │                           │ 2. GET /api/quotes?d=hash  │                        │
+   │                           │───────────────────────────▶│                        │
+   │                           │                            │                        │
+   │                           │ Pre-baked quote (kind:30078)                        │
+   │                           │◀───────────────────────────│                        │
+   │                           │                            │                        │
+   │                           │──┐ 3. Calculate            │                        │
+   │                           │  │ collateral_ratio =      │                        │
+   │                           │  │ thold_price/base_price  │                        │
+   │                           │◀─┘                         │                        │
+   │                           │                            │                        │
+   │ QuoteResponse             │                            │                        │
+   │◀──────────────────────────│                            │                        │
+   │                           │                            │                        │
+   │ (If not found)            │                            │                        │
+   │                           │ 4. POST /api/trigger       │                        │
+   │                           │───────────────────────────────────────────────────▶│
+   │                           │                            │                        │
+   │                           │ Webhook response           │                        │
+   │◀──────────────────────────│◀───────────────────────────────────────────────────│
+```
+
+### CRE Workflow
+
 ```
 ┌──────────────┐       ┌──────────────┐
 │  CRE (WASM)  │──────▶│ Nostr Relay  │
