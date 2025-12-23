@@ -225,3 +225,119 @@ func MustTruncatePriceToUint32(price float64) uint32 {
 	}
 	return result
 }
+
+// ValidateCronExpression validates a 6-field cron expression.
+// Format: second minute hour day month weekday
+// Examples:
+//   - "0 */5 * * * *" - every 5 minutes
+//   - "0 */90 * * * *" - every 90 seconds
+//   - "0 0 * * * *" - every hour
+//
+// Supports: numbers, *, /, - (ranges), and , (lists)
+func ValidateCronExpression(expr string) error {
+	if expr == "" {
+		return fmt.Errorf("cron expression cannot be empty")
+	}
+
+	fields := strings.Fields(expr)
+	if len(fields) != 6 {
+		return fmt.Errorf("cron expression must have 6 fields (second minute hour day month weekday), got %d", len(fields))
+	}
+
+	// Field constraints: [min, max]
+	constraints := []struct {
+		name string
+		min  int
+		max  int
+	}{
+		{"second", 0, 59},
+		{"minute", 0, 59},
+		{"hour", 0, 23},
+		{"day", 1, 31},
+		{"month", 1, 12},
+		{"weekday", 0, 6},
+	}
+
+	for i, field := range fields {
+		if err := validateCronField(field, constraints[i].name, constraints[i].min, constraints[i].max); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateCronField validates a single cron field
+func validateCronField(field, name string, min, max int) error {
+	// Handle wildcard
+	if field == "*" {
+		return nil
+	}
+
+	// Handle lists (e.g., "1,2,3")
+	if strings.Contains(field, ",") {
+		parts := strings.Split(field, ",")
+		for _, part := range parts {
+			if err := validateCronField(part, name, min, max); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Handle step values (e.g., "*/5" or "0-30/5")
+	if strings.Contains(field, "/") {
+		parts := strings.Split(field, "/")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid step in %s field: %s", name, field)
+		}
+		// Validate the step value
+		var step int
+		if _, err := fmt.Sscanf(parts[1], "%d", &step); err != nil || step <= 0 {
+			return fmt.Errorf("invalid step value in %s field: %s", name, field)
+		}
+		// Validate the base (could be * or a range)
+		if parts[0] != "*" {
+			if err := validateCronField(parts[0], name, min, max); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Handle ranges (e.g., "1-5")
+	if strings.Contains(field, "-") {
+		parts := strings.Split(field, "-")
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid range in %s field: %s", name, field)
+		}
+		var start, end int
+		if _, err := fmt.Sscanf(parts[0], "%d", &start); err != nil {
+			return fmt.Errorf("invalid range start in %s field: %s", name, field)
+		}
+		if _, err := fmt.Sscanf(parts[1], "%d", &end); err != nil {
+			return fmt.Errorf("invalid range end in %s field: %s", name, field)
+		}
+		if start < min || start > max {
+			return fmt.Errorf("%s field range start %d out of bounds [%d-%d]", name, start, min, max)
+		}
+		if end < min || end > max {
+			return fmt.Errorf("%s field range end %d out of bounds [%d-%d]", name, end, min, max)
+		}
+		if start > end {
+			return fmt.Errorf("%s field range start %d > end %d", name, start, end)
+		}
+		return nil
+	}
+
+	// Handle single number
+	var val int
+	if _, err := fmt.Sscanf(field, "%d", &val); err != nil {
+		return fmt.Errorf("invalid value in %s field: %s", name, field)
+	}
+	if val < min || val > max {
+		return fmt.Errorf("%s field value %d out of bounds [%d-%d]", name, val, min, max)
+	}
+
+	return nil
+}

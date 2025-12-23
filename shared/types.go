@@ -5,26 +5,84 @@ import (
 	"math"
 )
 
-// Config holds workflow configuration (non-sensitive values only)
+// Config holds CRE workflow configuration.
+// All fields are non-sensitive and safe to log. Secrets (private keys) are
+// fetched separately via the CRE runtime.
+//
+// Required fields: ClientID, DataStreamURL, FeedID, RelayURL, Network, AuthorizedKey
+// Optional fields: CronSchedule, RateMin, RateMax, StepSize, QuoteDomain, GatewayCallbackURL
+//
+// Security considerations:
+//   - DataStreamURL must use HTTPS (except localhost for development)
+//   - RelayURL must use WSS/HTTPS (except localhost for development)
+//   - AuthorizedKey must be set to restrict HTTP trigger access
 type Config struct {
-	ClientID      string `json:"client_id"`
-	DataStreamURL string `json:"data_stream_url"`
-	FeedID        string `json:"feed_id"`
-	RelayURL      string `json:"relay_url"`
-	Network       string `json:"network"`
+	// ClientID identifies this workflow instance to Chainlink Data Streams.
+	// Used for authentication and rate limiting.
+	// Example: "ducat-oracle-mainnet"
+	ClientID string `json:"client_id"`
 
-	// SECURITY: Authorized Ethereum address for HTTP trigger authentication
-	// This MUST be set in production - requests will only be accepted from this address
-	// Format: "0x" + 40 hex chars (e.g., "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82")
+	// DataStreamURL is the Chainlink Data Streams API endpoint.
+	// Must use HTTPS in production (http:// only allowed for localhost).
+	// Example: "https://api.testnet-dataengine.chain.link"
+	DataStreamURL string `json:"data_stream_url"`
+
+	// FeedID is the Chainlink Data Streams feed identifier for BTC/USD.
+	// Format: "0x" + 64 hex chars (32 bytes)
+	// Example: "0x00037da06502da8c6d9e7d9e4b...
+	FeedID string `json:"feed_id"`
+
+	// RelayURL is the Nostr relay endpoint for publishing/fetching events.
+	// Must use WSS or HTTPS in production (ws:// or http:// only for localhost).
+	// The relay must implement /api/quotes and /api/quotes/batch endpoints.
+	// Example: "wss://relay.ducat.network" or "http://localhost:7000"
+	RelayURL string `json:"relay_url"`
+
+	// Network identifies the Bitcoin network for chain-specific operations.
+	// Used in commit hash computation for domain separation.
+	// Valid values: "mainnet", "testnet", "signet", "mutinynet"
+	Network string `json:"network"`
+
+	// AuthorizedKey is the Ethereum address authorized to trigger HTTP requests.
+	// SECURITY: This MUST be set in production to restrict access.
+	// Format: "0x" + 40 lowercase hex chars
+	// Example: "0x5b3ebc3622dd75f0a680c2b7e4613ad813c72f82"
 	AuthorizedKey string `json:"authorized_key"`
 
-	// Cron-based quote generation settings
-	CronSchedule       string  `json:"cron_schedule,omitempty"`        // Cron expression (e.g., "0 */5 * * * *" for every 5 minutes)
-	RateMin            float64 `json:"rate_min,omitempty"`             // Minimum rate (e.g., 1.35 for 135%)
-	RateMax            float64 `json:"rate_max,omitempty"`             // Maximum rate (e.g., 5.00 for 500%)
-	StepSize           float64 `json:"step_size,omitempty"`            // Step increment (e.g., 0.05 for 5%)
-	QuoteDomain        string  `json:"quote_domain,omitempty"`         // Domain prefix for generated quotes
-	GatewayCallbackURL string  `json:"gateway_callback_url,omitempty"` // Gateway URL for batch completion notifications
+	// CronSchedule is the cron expression for automatic quote generation.
+	// Uses 6-field format: second minute hour day month weekday
+	// Example: "0 */90 * * * *" (every 90 seconds)
+	// When set, RateMin, RateMax, and StepSize are required.
+	CronSchedule string `json:"cron_schedule,omitempty"`
+
+	// RateMin is the minimum collateral rate for quote generation.
+	// Expressed as a multiplier (1.35 = 135% collateral).
+	// Must be >= 1.01 (at least 1% above current price).
+	// Example: 1.35 generates quotes starting at 135% of current price
+	RateMin float64 `json:"rate_min,omitempty"`
+
+	// RateMax is the maximum collateral rate for quote generation.
+	// Expressed as a multiplier (5.00 = 500% collateral).
+	// Must be > RateMin.
+	// Example: 5.00 generates quotes up to 500% of current price
+	RateMax float64 `json:"rate_max,omitempty"`
+
+	// StepSize is the rate increment between generated quotes.
+	// Expressed as a multiplier increment (0.01 = 1% steps).
+	// Must be between 0.01 and 1.0.
+	// Example: 0.01 with RateMin=1.35, RateMax=5.00 generates 366 quotes
+	StepSize float64 `json:"step_size,omitempty"`
+
+	// QuoteDomain is the domain prefix for generated quote identifiers.
+	// Used for organizing quotes by batch/purpose.
+	// Example: "auto-gen" results in domains like "auto-gen-1734567890"
+	QuoteDomain string `json:"quote_domain,omitempty"`
+
+	// GatewayCallbackURL receives notifications when batch generation completes.
+	// The CRE workflow POSTs a JSON payload with base_price and base_stamp.
+	// Optional - if empty, no callback is sent.
+	// Example: "https://gateway.ducat.network/webhook/batch"
+	GatewayCallbackURL string `json:"gateway_callback_url,omitempty"`
 }
 
 // Validate validates the configuration
@@ -114,6 +172,10 @@ func (c *Config) ValidateCronConfig() error {
 		return fmt.Errorf("cron_schedule required when rate parameters are set")
 	}
 	if c.CronSchedule != "" {
+		// Validate cron expression format
+		if err := ValidateCronExpression(c.CronSchedule); err != nil {
+			return fmt.Errorf("invalid cron_schedule: %w", err)
+		}
 		if c.RateMin <= 0 {
 			return fmt.Errorf("rate_min must be positive when cron_schedule is set, got %.4f", c.RateMin)
 		}
