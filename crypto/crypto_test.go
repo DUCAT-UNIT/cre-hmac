@@ -1212,3 +1212,88 @@ func findSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+// BenchmarkCreatePriceContract benchmarks full contract creation
+func BenchmarkCreatePriceContract(b *testing.B) {
+	kd, err := DeriveKeys(testPrivateKey)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer kd.Zero()
+
+	obs := PriceObservation{
+		OraclePubkey: kd.SchnorrPubkey,
+		ChainNetwork: "mutiny",
+		BasePrice:    100000,
+		BaseStamp:    1700000000,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := CreatePriceContract(testPrivateKey, obs, 90000)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkVerifyPriceContract benchmarks contract verification
+func BenchmarkVerifyPriceContract(b *testing.B) {
+	kd, err := DeriveKeys(testPrivateKey)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer kd.Zero()
+
+	obs := PriceObservation{
+		OraclePubkey: kd.SchnorrPubkey,
+		ChainNetwork: "mutiny",
+		BasePrice:    100000,
+		BaseStamp:    1700000000,
+	}
+
+	contract, err := CreatePriceContract(testPrivateKey, obs, 90000)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := VerifyPriceContract(contract); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkBatchContractCreation simulates batch quote generation (366 quotes)
+func BenchmarkBatchContractCreation(b *testing.B) {
+	kd, err := DeriveKeys(testPrivateKey)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer kd.Zero()
+
+	numQuotes := 366
+	basePrice := uint32(100000)
+	baseStamp := uint32(1700000000)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < numQuotes; j++ {
+			tholdPrice := uint32(float64(basePrice) * (1.35 + float64(j)*0.01))
+			obs := PriceObservation{
+				OraclePubkey: kd.SchnorrPubkey,
+				ChainNetwork: "mutiny",
+				BasePrice:    basePrice,
+				BaseStamp:    baseStamp,
+			}
+			_, err := CreatePriceContract(testPrivateKey, obs, tholdPrice)
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
