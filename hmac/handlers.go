@@ -46,7 +46,8 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
 	priceData, err := priceDataPromise.Await()
 	if err != nil {
-		return nil, fmt.Errorf("price fetch failed: %w", err)
+		logger.Error("Price fetch failed", "error", err)
+		return nil, ErrPriceFetchFailed(err)
 	}
 
 	currentPrice, _ := priceData.Price.Float64()
@@ -63,13 +64,15 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		// Threshold above current (immediate breach mode)
 		minThreshold := currentPrice * (1 + MinThresholdDistance)
 		if tholdPrice < minThreshold {
-			return nil, fmt.Errorf("threshold too close to current price (above): min %.2f, got %.2f", minThreshold, tholdPrice)
+			logger.Warn("Threshold too close to current price", "mode", "above", "minRequired", minThreshold, "got", tholdPrice)
+			return nil, ErrThresholdTooClose()
 		}
 	} else {
 		// Threshold below current (downside protection mode)
 		maxThreshold := currentPrice * (1 - MinThresholdDistance)
 		if tholdPrice > maxThreshold {
-			return nil, fmt.Errorf("threshold too close to current price (below): max %.2f, got %.2f", maxThreshold, tholdPrice)
+			logger.Warn("Threshold too close to current price", "mode", "below", "maxAllowed", maxThreshold, "got", tholdPrice)
+			return nil, ErrThresholdTooClose()
 		}
 	}
 
@@ -87,7 +90,8 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		uint32(tholdPrice),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("price contract creation failed: %w", err)
+		logger.Error("Price contract creation failed", "error", err)
+		return nil, ErrContractCreationFailed(err)
 	}
 
 	// Build PriceContractResponse - matches core-ts PriceContract schema exactly
@@ -197,7 +201,8 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
 	priceData, err := priceDataPromise.Await()
 	if err != nil {
-		return nil, fmt.Errorf("price fetch failed: %w", err)
+		logger.Error("Price fetch failed", "error", err)
+		return nil, ErrPriceFetchFailed(err)
 	}
 
 	currentPrice, _ := priceData.Price.Float64()
@@ -501,185 +506,6 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 	return response, nil
 }
 
-// generateQuotes auto-generates price quotes at intervals from rate_min to rate_max
-// 1. Fetch current BTC/USD price
-// 2. Calculate threshold prices at each step
-// 3. Create and publish quotes for each threshold
-// generateQuotes generates threshold quotes across the requested rate range, publishes each
-// quote as a signed Nostr threshold-commitment event, and returns a summary containing
-// created thold_hashes and price range information.
-//
-// It fetches the current BTC/USD price, iterates rates from RateMin to RateMax by StepSize,
-// creates a price contract for each rate (secret withheld), signs the contract ID with the
-// oracle Schnorr key, publishes the resulting Nostr event, and collects successfully published
-// thold_hash values. Failures to create, sign, marshal, or publish an individual quote are
-// skipped and do not abort the overall generation process. The function returns an error only
-// for unrecoverable setup failures (for example, key derivation or the initial price fetch).
-//
-// If CallbackURL is provided, a best-effort JSON callback with the generation summary is sent
-// asynchronously; callback failures are ignored.
-func generateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *GenerateQuotesRequest) (*GenerateQuotesResponse, error) {
-	logger := runtime.Logger()
-	logger.Info("Generating quotes", "rateMin", requestData.RateMin, "rateMax", requestData.RateMax, "stepSize", requestData.StepSize)
-
-	// Derive keys from private key
-	keys, err := deriveKeys(wc.PrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("key derivation failed: %w", err)
-	}
-	// SECURITY: Zero private key bytes after handler completes
-	defer keys.Zero()
-
-	// Fetch current BTC/USD price with consensus
-	client := &http.Client{}
-	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
-	priceData, err := priceDataPromise.Await()
-	if err != nil {
-		return nil, fmt.Errorf("price fetch failed: %w", err)
-	}
-
-	currentPrice, _ := priceData.Price.Float64()
-	quoteStamp := priceData.Stamp
-	logger.Info("Fetched current price for quote generation", "currentPrice", currentPrice)
-
-	// Calculate number of quotes to generate
-	var tholdHashes []string
-	var minThold, maxThold float64
-	quotesCreated := 0
-
-	// Use QuoteDomain if provided, otherwise use Domain
-	quoteDomainPrefix := requestData.QuoteDomain
-	if quoteDomainPrefix == "" {
-		quoteDomainPrefix = requestData.Domain
-	}
-
-	// Generate quotes from rate_min to rate_max
-	for rate := requestData.RateMin; rate <= requestData.RateMax+0.0001; rate += requestData.StepSize {
-		tholdPrice := currentPrice * rate
-
-		// SECURITY: Check for uint32 overflow before casting
-		// MaxPriceValue is uint32 max (4,294,967,295)
-		if tholdPrice > float64(MaxPriceValue) {
-			logger.Warn("Skipping threshold price exceeding uint32 max", "rate", rate, "tholdPrice", tholdPrice)
-			continue
-		}
-		if currentPrice > float64(MaxPriceValue) {
-			logger.Warn("Current price exceeds uint32 max", "currentPrice", currentPrice)
-			continue
-		}
-
-		// Track min/max thresholds
-		if minThold == 0 || tholdPrice < minThold {
-			minThold = tholdPrice
-		}
-		if tholdPrice > maxThold {
-			maxThold = tholdPrice
-		}
-
-		// Create price contract
-		contract, err := createPriceContract(
-			wc.PrivateKey,
-			keys.SchnorrPubkey,
-			wc.Config.Network,
-			uint32(currentPrice),
-			uint32(quoteStamp),
-			uint32(tholdPrice),
-		)
-		if err != nil {
-			logger.Warn("Failed to create contract", "rate", rate, "error", err)
-			continue
-		}
-
-		tholdHash := contract.TholdHash
-
-		// Sign contract ID with Schnorr
-		oracleSig, err := signSchnorr(keys.PrivateKey, contract.ContractID)
-		if err != nil {
-			logger.Warn("Failed to sign contract", "rate", rate, "error", err)
-			continue
-		}
-
-		// Build PriceContractResponse - matches core-ts PriceContract schema exactly
-		eventData := PriceContractResponse{
-			ChainNetwork: wc.Config.Network,
-			OraclePubkey: keys.SchnorrPubkey,
-			BasePrice:    int64(currentPrice),
-			BaseStamp:    quoteStamp,
-			CommitHash:   contract.CommitHash,
-			ContractID:   contract.ContractID,
-			OracleSig:    oracleSig,
-			TholdHash:    tholdHash,
-			TholdKey:     nil, // Secret NOT revealed for active quotes
-			TholdPrice:   int64(tholdPrice),
-		}
-
-		eventJSON, err := json.Marshal(eventData)
-		if err != nil {
-			logger.Warn("Failed to marshal event", "rate", rate, "error", err)
-			continue
-		}
-
-		// Create Nostr event
-		nostrEvent := &NostrEvent{
-			PubKey:    keys.SchnorrPubkey,
-			CreatedAt: quoteStamp,
-			Kind:      NostrEventKindThresholdCommitment,
-			Tags: [][]string{
-				{"d", contract.CommitHash}, // NIP-33 replaceable event identifier
-			},
-			Content: string(eventJSON),
-		}
-
-		if err := signNostrEvent(nostrEvent, keys.PrivateKey); err != nil {
-			logger.Warn("Failed to sign event", "rate", rate, "error", err)
-			continue
-		}
-
-		// Publish to relay with consensus
-		relayRespPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-				return publishEvent(wc.Config, log, sr, nostrEvent)
-			},
-			cre.ConsensusAggregationFromTags[*RelayResponse](),
-		)
-
-		relayResp, err := relayRespPromise.Await()
-		if err != nil || !relayResp.Success {
-			logger.Warn("Failed to publish event", "rate", rate, "error", err)
-			continue
-		}
-
-		tholdHashes = append(tholdHashes, tholdHash)
-		quotesCreated++
-		logger.Info("Created quote", "rate", rate, "tholdPrice", tholdPrice, "tholdHash", tholdHash)
-	}
-
-	response := &GenerateQuotesResponse{
-		QuotesCreated: quotesCreated,
-		CurrentPrice:  currentPrice,
-		TholdHashes:   tholdHashes,
-		GeneratedAt:   quoteStamp,
-	}
-	response.Range.MinThold = minThold
-	response.Range.MaxThold = maxThold
-
-	logger.Info("Quote generation complete", "created", quotesCreated, "minThold", minThold, "maxThold", maxThold)
-
-	// Send webhook callback if URL provided
-	if requestData.CallbackURL != nil && *requestData.CallbackURL != "" {
-		webhookPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-				sendJSONCallback(wc.Config, log, sr, *requestData.CallbackURL, requestData.Domain, "generate", response)
-				return &RelayResponse{Success: true, Message: "webhook sent"}, nil
-			},
-			cre.ConsensusAggregationFromTags[*RelayResponse](),
-		)
-		_, _ = webhookPromise.Await()
-	}
-
-	return response, nil
-}
-
 // QuoteJob represents a single quote to be generated
 type QuoteJob struct {
 	Rate       float64
@@ -718,7 +544,8 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
 	priceData, err := priceDataPromise.Await()
 	if err != nil {
-		return nil, fmt.Errorf("price fetch failed: %w", err)
+		logger.Error("Price fetch failed", "error", err)
+		return nil, ErrPriceFetchFailed(err)
 	}
 
 	currentPrice, _ := priceData.Price.Float64()
@@ -737,7 +564,8 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 
 	// SECURITY: Validate current price doesn't exceed uint32 max
 	if currentPrice > float64(MaxPriceValue) {
-		return nil, fmt.Errorf("current price %.2f exceeds uint32 max (%d)", currentPrice, MaxPriceValue)
+		logger.Error("Current price exceeds maximum", "price", currentPrice, "max", MaxPriceValue)
+		return nil, ErrPriceInvalid(fmt.Errorf("price exceeds maximum"))
 	}
 
 	for rate := requestData.RateMin; rate <= requestData.RateMax+0.0001; rate += requestData.StepSize {
@@ -841,48 +669,56 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 
 	logger.Info("Signed events prepared", "count", len(signedEvents))
 
-	// Launch all publish requests in parallel
-	type PublishPromise struct {
-		SignedEvent SignedEvent
-		Promise     cre.Promise[*RelayResponse]
-	}
-	var promises []PublishPromise
-
+	// Collect all events for batch publish
+	var events []*NostrEvent
+	var tholdHashes []string
 	for _, se := range signedEvents {
-		// Capture for closure
-		event := se.Event
+		events = append(events, se.Event)
+		tholdHashes = append(tholdHashes, se.TholdHash)
+	}
 
-		promise := http.SendRequest(wc, runtime, client,
+	// Publish all events in a single batch request with retry
+	// Retry up to 3 times with exponential backoff on failure
+	const maxRetries = 3
+	var quotesCreated int
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		batchPromise := http.SendRequest(wc, runtime, client,
 			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-				return publishEvent(wc.Config, log, sr, event)
+				return publishEventsBatch(wc.Config, log, sr, events)
 			},
 			cre.ConsensusAggregationFromTags[*RelayResponse](),
 		)
 
-		promises = append(promises, PublishPromise{
-			SignedEvent: se,
-			Promise:     promise,
-		})
-	}
-
-	logger.Info("Launched parallel publish requests", "count", len(promises))
-
-	// Await all promises and collect results
-	var tholdHashes []string
-	quotesCreated := 0
-
-	for _, pp := range promises {
-		relayResp, err := pp.Promise.Await()
-		if err != nil || !relayResp.Success {
-			logger.Warn("Failed to publish event", "rate", pp.SignedEvent.Job.Rate, "error", err)
+		relayResp, err := batchPromise.Await()
+		if err != nil {
+			lastErr = err
+			logger.Warn("Batch publish attempt failed", "attempt", attempt, "maxRetries", maxRetries, "error", err)
 			continue
 		}
 
-		tholdHashes = append(tholdHashes, pp.SignedEvent.TholdHash)
-		quotesCreated++
+		if !relayResp.Success {
+			lastErr = fmt.Errorf("relay rejected batch: %s", relayResp.Message)
+			logger.Warn("Batch publish attempt rejected", "attempt", attempt, "maxRetries", maxRetries, "message", relayResp.Message)
+			continue
+		}
+
+		// Success
+		quotesCreated = len(signedEvents)
+		lastErr = nil
+		logger.Info("Batch publish successful", "attempt", attempt, "count", quotesCreated)
+		break
 	}
 
-	logger.Info("Parallel quote generation complete", "created", quotesCreated, "total", len(jobs))
+	// Clear results on complete failure
+	if lastErr != nil {
+		logger.Error("Batch publish failed after all retries", "error", lastErr, "attempts", maxRetries)
+		tholdHashes = nil
+		quotesCreated = 0
+	}
+
+	logger.Info("Quote generation complete", "created", quotesCreated, "total", len(jobs))
 
 	response := &GenerateQuotesResponse{
 		QuotesCreated: quotesCreated,

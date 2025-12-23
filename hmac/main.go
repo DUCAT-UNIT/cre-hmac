@@ -183,16 +183,18 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 	privateKeySecret, err := runtime.GetSecret(privateKeyReq).Await()
 	if err != nil {
 		logger.Error("Failed to fetch private_key secret", "error", err)
-		return nil, fmt.Errorf("failed to fetch private_key: %w", err)
+		return nil, ErrSecretFetchFailed("private_key", err)
 	}
 	if len(privateKeySecret.Value) != 64 {
-		return nil, fmt.Errorf("private_key must be 64 hex characters, got %d", len(privateKeySecret.Value))
+		logger.Error("Invalid private_key length", "expected", 64, "got", len(privateKeySecret.Value))
+		return nil, ErrValidationFailed("private_key")
 	}
 
 	// Decode private key to bytes immediately
 	privateKeyBytes, err := hex.DecodeString(privateKeySecret.Value)
 	if err != nil {
-		return nil, fmt.Errorf("private_key is not valid hex: %w", err)
+		logger.Error("Invalid private_key hex format", "error", err)
+		return nil, ErrValidationFailed("private_key")
 	}
 
 	clientSecretReq := &pb.SecretRequest{Id: SecretClientSecret}
@@ -203,14 +205,15 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 			privateKeyBytes[i] = 0
 		}
 		logger.Error("Failed to fetch client_secret secret", "error", err)
-		return nil, fmt.Errorf("failed to fetch client_secret: %w", err)
+		return nil, ErrSecretFetchFailed("client_secret", err)
 	}
 	if clientSecretSecret.Value == "" {
 		// Zero private key bytes before returning error
 		for i := range privateKeyBytes {
 			privateKeyBytes[i] = 0
 		}
-		return nil, fmt.Errorf("client_secret cannot be empty")
+		logger.Error("client_secret is empty")
+		return nil, ErrValidationFailed("client_secret")
 	}
 
 	return &WorkflowConfig{
