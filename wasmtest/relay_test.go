@@ -278,3 +278,190 @@ func TestMockRelayClient_ConcurrentAccess(t *testing.T) {
 		t.Error("Expected some published events from concurrent access")
 	}
 }
+
+// TestMockRelayClient_GetLatestQuoteTimestamp tests rate limiting timestamp behavior
+func TestMockRelayClient_GetLatestQuoteTimestamp(t *testing.T) {
+	tests := []struct {
+		name           string
+		setupTimestamp int64
+		setupError     error
+		storedEvents   []*shared.NostrEvent
+		oraclePubkey   string
+		wantTimestamp  int64
+		wantErr        bool
+	}{
+		{
+			name:           "explicit timestamp set",
+			setupTimestamp: 1700000100,
+			oraclePubkey:   "test-pubkey",
+			wantTimestamp:  1700000100,
+			wantErr:        false,
+		},
+		{
+			name:           "no quotes exist",
+			setupTimestamp: 0,
+			oraclePubkey:   "test-pubkey",
+			wantTimestamp:  0,
+			wantErr:        false,
+		},
+		{
+			name:       "find from stored events",
+			oraclePubkey: "test-pubkey",
+			storedEvents: []*shared.NostrEvent{
+				{ID: "event1", PubKey: "test-pubkey", CreatedAt: 1700000050, Tags: [][]string{{"d", "hash1"}}},
+				{ID: "event2", PubKey: "test-pubkey", CreatedAt: 1700000100, Tags: [][]string{{"d", "hash2"}}},
+				{ID: "event3", PubKey: "other-pubkey", CreatedAt: 1700000200, Tags: [][]string{{"d", "hash3"}}},
+			},
+			wantTimestamp: 1700000100, // Most recent from test-pubkey
+			wantErr:       false,
+		},
+		{
+			name:         "relay error",
+			setupError:   errors.New("relay unavailable"),
+			oraclePubkey: "test-pubkey",
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := NewMockRelayClient()
+			client.LatestQuoteTimestamp = tt.setupTimestamp
+			client.LatestTimestampError = tt.setupError
+
+			// Add stored events if provided
+			for _, event := range tt.storedEvents {
+				for _, tag := range event.Tags {
+					if len(tag) >= 2 && tag[0] == "d" {
+						client.StoredEvents[tag[1]] = event
+						break
+					}
+				}
+			}
+
+			timestamp, err := client.GetLatestQuoteTimestamp(tt.oraclePubkey)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetLatestQuoteTimestamp() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr && timestamp != tt.wantTimestamp {
+				t.Errorf("GetLatestQuoteTimestamp() = %d, want %d", timestamp, tt.wantTimestamp)
+			}
+		})
+	}
+}
+
+// TestMockLogger tests all MockLogger methods
+func TestMockLogger(t *testing.T) {
+	logger := NewMockLogger()
+
+	// Test Info
+	logger.Info("test info message", "key1", "value1")
+	if len(logger.Messages) != 1 {
+		t.Errorf("Expected 1 message after Info, got %d", len(logger.Messages))
+	}
+	if logger.Messages[0].Level != "INFO" {
+		t.Errorf("Expected INFO level, got %s", logger.Messages[0].Level)
+	}
+	if logger.Messages[0].Message != "test info message" {
+		t.Errorf("Expected 'test info message', got %s", logger.Messages[0].Message)
+	}
+
+	// Test Error
+	logger.Error("test error message", "error", "some error")
+	if len(logger.Messages) != 2 {
+		t.Errorf("Expected 2 messages after Error, got %d", len(logger.Messages))
+	}
+	if logger.Messages[1].Level != "ERROR" {
+		t.Errorf("Expected ERROR level, got %s", logger.Messages[1].Level)
+	}
+	if logger.Messages[1].Message != "test error message" {
+		t.Errorf("Expected 'test error message', got %s", logger.Messages[1].Message)
+	}
+
+	// Test Warn
+	logger.Warn("test warning message", "warning", "some warning")
+	if len(logger.Messages) != 3 {
+		t.Errorf("Expected 3 messages after Warn, got %d", len(logger.Messages))
+	}
+	if logger.Messages[2].Level != "WARN" {
+		t.Errorf("Expected WARN level, got %s", logger.Messages[2].Level)
+	}
+	if logger.Messages[2].Message != "test warning message" {
+		t.Errorf("Expected 'test warning message', got %s", logger.Messages[2].Message)
+	}
+}
+
+// TestMockWebhookClient_SendCallback tests the SendCallback method
+func TestMockWebhookClient_SendCallback(t *testing.T) {
+	tests := []struct {
+		name       string
+		setupError error
+		url        string
+		payload    map[string]interface{}
+		wantErr    bool
+		wantCount  int
+	}{
+		{
+			name:       "successful callback",
+			setupError: nil,
+			url:        "https://example.com/webhook",
+			payload:    map[string]interface{}{"event": "test", "data": "value"},
+			wantErr:    false,
+			wantCount:  1,
+		},
+		{
+			name:       "callback error",
+			setupError: errors.New("connection refused"),
+			url:        "https://example.com/webhook",
+			payload:    map[string]interface{}{"event": "test"},
+			wantErr:    true,
+			wantCount:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := NewMockWebhookClient()
+			client.Error = tt.setupError
+
+			err := client.SendCallback(tt.url, tt.payload)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("SendCallback() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if len(client.Callbacks) != tt.wantCount {
+				t.Errorf("Callbacks count = %d, want %d", len(client.Callbacks), tt.wantCount)
+			}
+
+			if tt.wantCount > 0 {
+				if client.Callbacks[0].URL != tt.url {
+					t.Errorf("Callback URL = %q, want %q", client.Callbacks[0].URL, tt.url)
+				}
+			}
+		})
+	}
+}
+
+// TestMockWebhookClient_MultipleCallbacks tests multiple callbacks
+func TestMockWebhookClient_MultipleCallbacks(t *testing.T) {
+	client := NewMockWebhookClient()
+
+	// Send multiple callbacks
+	for i := 0; i < 5; i++ {
+		url := "https://example.com/webhook"
+		payload := map[string]interface{}{"index": i}
+		err := client.SendCallback(url, payload)
+		if err != nil {
+			t.Fatalf("SendCallback failed: %v", err)
+		}
+	}
+
+	if len(client.Callbacks) != 5 {
+		t.Errorf("Expected 5 callbacks, got %d", len(client.Callbacks))
+	}
+}

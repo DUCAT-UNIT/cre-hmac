@@ -535,3 +535,178 @@ func BenchmarkValidateDomain(b *testing.B) {
 		ValidateDomain(domain)
 	}
 }
+
+// =============================================================================
+// URL Validation Tests
+// =============================================================================
+
+func TestValidateCallbackURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+		errMsg  string
+	}{
+		// Valid URLs
+		{"empty (optional)", "", false, ""},
+		{"https URL", "https://example.com/webhook", false, ""},
+		{"https with port", "https://example.com:8443/webhook", false, ""},
+		{"localhost http", "http://localhost:8080/callback", false, ""},
+		{"127.0.0.1 http", "http://127.0.0.1:3000/webhook", false, ""},
+		{"localhost https", "https://localhost/callback", false, ""},
+
+		// Invalid URLs
+		{"http non-localhost", "http://example.com/webhook", true, "must use https://"},
+		{"no scheme", "example.com/webhook", true, "must have a scheme"},
+		{"no host", "https:///path", true, "must have a host"},
+		{"ftp scheme", "ftp://example.com/file", true, "must use http:// or https://"},
+		{"ws scheme", "ws://example.com/ws", true, "must use http:// or https://"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCallbackURL(tt.url)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateCallbackURL(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("ValidateCallbackURL(%q) error = %v, want error containing %q", tt.url, err, tt.errMsg)
+			}
+		})
+	}
+}
+
+func TestValidateServiceURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		url         string
+		serviceName string
+		wantErr     bool
+		errMsg      string
+	}{
+		// Valid URLs
+		{"https URL", "https://api.example.com", "data_stream", false, ""},
+		{"wss URL", "wss://relay.example.com", "relay", false, ""},
+		{"localhost http", "http://localhost:8080", "relay", false, ""},
+		{"localhost ws", "ws://localhost:7000", "relay", false, ""},
+		{"127.0.0.1 http", "http://127.0.0.1:3000", "data_stream", false, ""},
+
+		// Invalid URLs
+		{"empty URL", "", "relay", true, "URL is required"},
+		{"http non-localhost", "http://api.example.com", "data_stream", true, "must use TLS"},
+		{"ws non-localhost", "ws://relay.example.com", "relay", true, "must use TLS"},
+		{"no scheme", "example.com", "relay", true, "must have a scheme"},
+		{"no host", "https:///path", "data_stream", true, "must have a host"},
+		{"ftp scheme", "ftp://example.com", "relay", true, "must use http://"},
+		{"invalid scheme", "gopher://example.com", "data_stream", true, "must use http://"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateServiceURL(tt.url, tt.serviceName)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateServiceURL(%q, %q) error = %v, wantErr %v", tt.url, tt.serviceName, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("ValidateServiceURL(%q, %q) error = %v, want error containing %q", tt.url, tt.serviceName, err, tt.errMsg)
+			}
+		})
+	}
+}
+
+// =============================================================================
+// Cron Expression Validation Tests
+// =============================================================================
+
+func TestValidateCronExpression(t *testing.T) {
+	tests := []struct {
+		name    string
+		expr    string
+		wantErr bool
+		errMsg  string
+	}{
+		// Valid expressions
+		{"every minute", "0 * * * * *", false, ""},
+		{"every 5 minutes", "0 */5 * * * *", false, ""},
+		{"every hour", "0 0 * * * *", false, ""},
+		{"specific time", "0 30 9 * * *", false, ""},
+		{"weekday only", "0 0 8 * * 1-5", false, ""},
+		{"list values", "0 0,15,30,45 * * * *", false, ""},
+		{"range values", "0 0 9-17 * * *", false, ""},
+		{"step with range", "0 0-30/5 * * * *", false, ""},
+		{"complex", "30 */15 9-17 * * 1-5", false, ""},
+
+		// Invalid expressions
+		{"empty", "", true, "cannot be empty"},
+		{"too few fields", "0 * * * *", true, "must have 6 fields"},
+		{"too many fields", "0 * * * * * *", true, "must have 6 fields"},
+		{"invalid second", "60 * * * * *", true, "out of bounds"},
+		{"invalid minute", "0 60 * * * *", true, "out of bounds"},
+		{"invalid hour", "0 0 24 * * *", true, "out of bounds"},
+		{"invalid day", "0 0 0 32 * *", true, "out of bounds"},
+		{"invalid month", "0 0 0 1 13 *", true, "out of bounds"},
+		{"invalid weekday", "0 0 0 * * 7", true, "out of bounds"},
+		{"invalid step", "0 */0 * * * *", true, "invalid step"},
+		{"invalid range format", "0 1-2-3 * * * *", true, "invalid range"},
+		{"invalid number", "0 abc * * * *", true, "invalid"},
+		{"negative number", "0 -1 * * * *", true, "invalid range"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCronExpression(tt.expr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateCronExpression(%q) error = %v, wantErr %v", tt.expr, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("ValidateCronExpression(%q) error = %v, want error containing %q", tt.expr, err, tt.errMsg)
+			}
+		})
+	}
+}
+
+func TestValidateCronField(t *testing.T) {
+	// Test the internal validateCronField function through ValidateCronExpression
+	// This tests edge cases not covered by the main tests
+
+	tests := []struct {
+		name    string
+		expr    string
+		wantErr bool
+		errMsg  string
+	}{
+		// Step edge cases
+		{"step with invalid base", "0 abc/5 * * * *", true, "invalid"},
+		{"step with zero", "0 */0 * * * *", true, "invalid step"},
+		{"step with negative", "0 */-1 * * * *", true, "invalid step"},
+
+		// Range edge cases
+		{"range reversed", "0 30-10 * * * *", true, "range start"},
+		{"range start invalid", "0 abc-10 * * * *", true, "invalid range start"},
+		{"range end invalid", "0 10-abc * * * *", true, "invalid range end"},
+
+		// List edge cases
+		{"list with invalid", "0 1,abc,3 * * * *", true, "invalid"},
+		{"list with out of bounds", "0 1,2,100 * * * *", true, "out of bounds"},
+
+		// Boundary values
+		{"day min boundary", "0 0 0 0 * *", true, "out of bounds"},
+		{"month min boundary", "0 0 0 1 0 *", true, "out of bounds"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCronExpression(tt.expr)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateCronExpression(%q) error = %v, wantErr %v", tt.expr, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+				t.Errorf("ValidateCronExpression(%q) error = %v, want error containing %q", tt.expr, err, tt.errMsg)
+			}
+		})
+	}
+}

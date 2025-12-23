@@ -525,9 +525,13 @@ type QuoteResult struct {
 
 // generateQuotesParallel auto-generates price quotes in parallel
 // generateQuotesParallel generates threshold quotes across the specified rate range, publishes each as a Nostr threshold-commitment event in parallel, and returns a summary of the successfully created quotes.
-// 
+//
+// RATE LIMITING: Before generating, checks the relay for the most recent quote timestamp.
+// If a quote was generated within MinCronIntervalSeconds, skips generation to prevent
+// excessive relay writes and potential DoS from misconfigured cron schedules.
+//
 // The function obtains the current reference price, creates and signs price contracts for each rate step, publishes the signed Nostr events concurrently, and aggregates the created threshold hashes and counts. If a gateway callback URL is configured, a best-effort batch callback is sent after publishing.
-// 
+//
 // It returns a GenerateQuotesResponse containing counts, generated thold hashes, the base price and timestamp, and an error if a fatal step (such as price fetch or key derivation) fails.
 func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData *GenerateQuotesRequest) (*GenerateQuotesResponse, error) {
 	logger := runtime.Logger()
@@ -541,8 +545,44 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 	// SECURITY: Zero private key bytes after handler completes
 	defer keys.Zero()
 
-	// Fetch current BTC/USD price with consensus
+	// RATE LIMITING: Check if we've generated quotes recently
+	// This prevents excessive relay writes if cron fires too frequently
 	client := &http.Client{}
+	minInterval := wc.Config.GetMinCronInterval()
+	if minInterval > 0 {
+		latestPromise := http.SendRequest(wc, runtime, client,
+			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (int64, error) {
+				return fetchLatestQuoteTimestamp(wc.Config, log, sr, keys.SchnorrPubkey)
+			},
+			cre.ConsensusAggregationFromTags[int64](),
+		)
+		latestTimestamp, err := latestPromise.Await()
+		if err != nil {
+			logger.Warn("Failed to check rate limit (proceeding with generation)", "error", err)
+		} else if latestTimestamp > 0 {
+			// Check if enough time has passed since last generation
+			currentTime := runtime.Time().Unix()
+			elapsed := currentTime - latestTimestamp
+			if elapsed < minInterval {
+				logger.Info("Rate limit: skipping generation, last batch too recent",
+					"lastBatchAge", elapsed,
+					"minInterval", minInterval,
+					"secondsUntilAllowed", minInterval-elapsed,
+				)
+				return &GenerateQuotesResponse{
+					QuotesCreated: 0,
+					CurrentPrice:  0,
+					TholdHashes:   []string{},
+					GeneratedAt:   runtime.Time().Unix(),
+					Skipped:       true,
+					SkipReason:    fmt.Sprintf("rate limited: last batch %ds ago, min interval %ds", elapsed, minInterval),
+				}, nil
+			}
+			logger.Info("Rate limit check passed", "lastBatchAge", elapsed, "minInterval", minInterval)
+		}
+	}
+
+	// Fetch current BTC/USD price with consensus
 	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
 	priceData, err := priceDataPromise.Await()
 	if err != nil {

@@ -736,3 +736,368 @@ func BenchmarkPriceEventValidate(b *testing.B) {
 		event.Validate()
 	}
 }
+
+// TestGenerateQuotesResponseRateLimiting tests rate limiting fields in GenerateQuotesResponse
+func TestGenerateQuotesResponseRateLimiting(t *testing.T) {
+	tests := []struct {
+		name       string
+		response   GenerateQuotesResponse
+		wantJSON   bool
+		checkSkip  bool
+		skipReason string
+	}{
+		{
+			name: "normal response without skip",
+			response: GenerateQuotesResponse{
+				QuotesCreated: 366,
+				CurrentPrice:  100000.0,
+				TholdHashes:   []string{"abc123"},
+				GeneratedAt:   1700000000,
+				Skipped:       false,
+				SkipReason:    "",
+			},
+			wantJSON:  true,
+			checkSkip: false,
+		},
+		{
+			name: "rate limited response",
+			response: GenerateQuotesResponse{
+				QuotesCreated: 0,
+				CurrentPrice:  0,
+				TholdHashes:   []string{},
+				GeneratedAt:   1700000000,
+				Skipped:       true,
+				SkipReason:    "rate limited: last batch 30s ago, min interval 60s",
+			},
+			wantJSON:   true,
+			checkSkip:  true,
+			skipReason: "rate limited: last batch 30s ago, min interval 60s",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Verify JSON marshaling
+			data, err := json.Marshal(tt.response)
+			if (err == nil) != tt.wantJSON {
+				t.Errorf("JSON marshal error = %v, wantJSON %v", err, tt.wantJSON)
+			}
+
+			// Check skipped state
+			if tt.response.Skipped != tt.checkSkip {
+				t.Errorf("Skipped = %v, want %v", tt.response.Skipped, tt.checkSkip)
+			}
+
+			// Check skip reason if expected
+			if tt.checkSkip && tt.response.SkipReason != tt.skipReason {
+				t.Errorf("SkipReason = %q, want %q", tt.response.SkipReason, tt.skipReason)
+			}
+
+			// Verify omitempty behavior
+			if !tt.checkSkip {
+				// When not skipped, these fields should be omitted from JSON
+				jsonStr := string(data)
+				if strings.Contains(jsonStr, "skipped") {
+					// Note: with omitempty, false should be omitted
+					t.Log("Note: Skipped=false is omitted from JSON (omitempty)")
+				}
+			}
+		})
+	}
+}
+
+// TestGetMaxQuoteAge tests the max quote age getter
+func TestGetMaxQuoteAge(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   Config
+		expected int64
+	}{
+		{
+			name:     "default value when not set",
+			config:   Config{},
+			expected: MaxQuoteAge, // Default from constants
+		},
+		{
+			name:     "custom age 30 seconds",
+			config:   Config{MaxQuoteAge: 30},
+			expected: 30,
+		},
+		{
+			name:     "custom age 120 seconds",
+			config:   Config{MaxQuoteAge: 120},
+			expected: 120,
+		},
+		{
+			name:     "custom age 300 seconds",
+			config:   Config{MaxQuoteAge: 300},
+			expected: 300,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.config.GetMaxQuoteAge()
+			if result != tt.expected {
+				t.Errorf("GetMaxQuoteAge() = %d, want %d", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestGetMinCronInterval tests the rate limiting interval getter
+func TestGetMinCronInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   Config
+		expected int64
+	}{
+		{
+			name:     "default value when not set",
+			config:   Config{},
+			expected: 60, // Default 60 seconds
+		},
+		{
+			name:     "custom interval",
+			config:   Config{MinCronIntervalSeconds: 120},
+			expected: 120,
+		},
+		{
+			name:     "low value uses configured value",
+			config:   Config{MinCronIntervalSeconds: 10},
+			expected: 10, // Returns configured value as-is
+		},
+		{
+			name:     "high value uses configured value",
+			config:   Config{MinCronIntervalSeconds: 5000},
+			expected: 5000, // Returns configured value as-is
+		},
+		{
+			name:     "30 second interval",
+			config:   Config{MinCronIntervalSeconds: 30},
+			expected: 30,
+		},
+		{
+			name:     "1 hour interval",
+			config:   Config{MinCronIntervalSeconds: 3600},
+			expected: 3600,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := tt.config.GetMinCronInterval()
+			if result != tt.expected {
+				t.Errorf("GetMinCronInterval() = %d, want %d", result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestEvaluateQuotesResponseComputeSummary tests the ComputeSummary method
+func TestEvaluateQuotesResponseComputeSummary(t *testing.T) {
+	errMsg1 := "error fetching quote"
+	errMsg2 := "signature verification failed"
+
+	tests := []struct {
+		name            string
+		response        EvaluateQuotesResponse
+		expectedTotal   int
+		expectedBreached int
+		expectedActive  int
+		expectedErrors  int
+		expectedMsgs    []string
+	}{
+		{
+			name: "mixed results",
+			response: EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{
+					{Status: "breached", TholdHash: "hash1"},
+					{Status: "breached", TholdHash: "hash2"},
+					{Status: "active", TholdHash: "hash3"},
+					{Status: "error", TholdHash: "hash4", Error: &errMsg1},
+				},
+			},
+			expectedTotal:    4,
+			expectedBreached: 2,
+			expectedActive:   1,
+			expectedErrors:   1,
+			expectedMsgs:     []string{errMsg1},
+		},
+		{
+			name: "all breached",
+			response: EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{
+					{Status: "breached", TholdHash: "hash1"},
+					{Status: "breached", TholdHash: "hash2"},
+					{Status: "breached", TholdHash: "hash3"},
+				},
+			},
+			expectedTotal:    3,
+			expectedBreached: 3,
+			expectedActive:   0,
+			expectedErrors:   0,
+			expectedMsgs:     nil,
+		},
+		{
+			name: "multiple errors",
+			response: EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{
+					{Status: "error", TholdHash: "hash1", Error: &errMsg1},
+					{Status: "error", TholdHash: "hash2", Error: &errMsg2},
+					{Status: "active", TholdHash: "hash3"},
+				},
+			},
+			expectedTotal:    3,
+			expectedBreached: 0,
+			expectedActive:   1,
+			expectedErrors:   2,
+			expectedMsgs:     []string{errMsg1, errMsg2},
+		},
+		{
+			name: "empty results",
+			response: EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{},
+			},
+			expectedTotal:    0,
+			expectedBreached: 0,
+			expectedActive:   0,
+			expectedErrors:   0,
+			expectedMsgs:     nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.response.ComputeSummary()
+
+			if tt.response.Summary == nil {
+				t.Fatal("ComputeSummary() did not set Summary")
+			}
+			if tt.response.Summary.Total != tt.expectedTotal {
+				t.Errorf("Total = %d, want %d", tt.response.Summary.Total, tt.expectedTotal)
+			}
+			if tt.response.Summary.Breached != tt.expectedBreached {
+				t.Errorf("Breached = %d, want %d", tt.response.Summary.Breached, tt.expectedBreached)
+			}
+			if tt.response.Summary.Active != tt.expectedActive {
+				t.Errorf("Active = %d, want %d", tt.response.Summary.Active, tt.expectedActive)
+			}
+			if tt.response.Summary.Errors != tt.expectedErrors {
+				t.Errorf("Errors = %d, want %d", tt.response.Summary.Errors, tt.expectedErrors)
+			}
+			if len(tt.response.Summary.ErrorMsgs) != len(tt.expectedMsgs) {
+				t.Errorf("ErrorMsgs length = %d, want %d", len(tt.response.Summary.ErrorMsgs), len(tt.expectedMsgs))
+			}
+		})
+	}
+}
+
+// TestEvaluateQuotesResponseGetErrors tests the GetErrors method
+func TestEvaluateQuotesResponseGetErrors(t *testing.T) {
+	errMsg1 := "error 1"
+	errMsg2 := "error 2"
+
+	tests := []struct {
+		name         string
+		response     EvaluateQuotesResponse
+		expectedErrs []string
+	}{
+		{
+			name: "has errors",
+			response: EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{
+					{Status: "error", Error: &errMsg1},
+					{Status: "active"},
+					{Status: "error", Error: &errMsg2},
+				},
+			},
+			expectedErrs: []string{errMsg1, errMsg2},
+		},
+		{
+			name: "no errors",
+			response: EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{
+					{Status: "breached"},
+					{Status: "active"},
+				},
+			},
+			expectedErrs: nil,
+		},
+		{
+			name: "error without message",
+			response: EvaluateQuotesResponse{
+				Results: []QuoteEvaluationResult{
+					{Status: "error", Error: nil}, // error status but no message
+					{Status: "error", Error: &errMsg1},
+				},
+			},
+			expectedErrs: []string{errMsg1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			errors := tt.response.GetErrors()
+
+			if len(errors) != len(tt.expectedErrs) {
+				t.Errorf("GetErrors() length = %d, want %d", len(errors), len(tt.expectedErrs))
+				return
+			}
+			for i, err := range errors {
+				if err != tt.expectedErrs[i] {
+					t.Errorf("GetErrors()[%d] = %q, want %q", i, err, tt.expectedErrs[i])
+				}
+			}
+		})
+	}
+}
+
+// TestNormalizeHex tests the NormalizeHex function
+func TestNormalizeHex(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "uppercase to lowercase",
+			input:    "ABCDEF123456",
+			expected: "abcdef123456",
+		},
+		{
+			name:     "mixed case",
+			input:    "AbCdEf123456",
+			expected: "abcdef123456",
+		},
+		{
+			name:     "already lowercase",
+			input:    "abcdef123456",
+			expected: "abcdef123456",
+		},
+		{
+			name:     "empty string",
+			input:    "",
+			expected: "",
+		},
+		{
+			name:     "64 char hex (commit hash)",
+			input:    "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890",
+			expected: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		},
+		{
+			name:     "40 char hex (thold hash)",
+			input:    "ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+			expected: "abcdef1234567890abcdef1234567890abcdef12",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := NormalizeHex(tt.input)
+			if result != tt.expected {
+				t.Errorf("NormalizeHex(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}

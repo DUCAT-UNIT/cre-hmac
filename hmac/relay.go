@@ -206,6 +206,65 @@ func fetchEvent(config *Config, logger *slog.Logger, sendRequester *http.SendReq
 	return &event, nil
 }
 
+// fetchLatestQuoteTimestamp retrieves the timestamp of the most recent quote from the relay.
+// Used for rate limiting - ensures we don't generate quotes too frequently.
+// Returns 0 if no quotes exist or on error (allows generation to proceed).
+func fetchLatestQuoteTimestamp(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, oraclePubkey string) (int64, error) {
+	// Validate inputs
+	if config == nil {
+		return 0, fmt.Errorf("config cannot be nil")
+	}
+	if oraclePubkey == "" {
+		return 0, fmt.Errorf("oracle pubkey cannot be empty")
+	}
+
+	// Convert WebSocket URL to HTTP API URL
+	apiURL := strings.Replace(config.RelayURL, "ws://", "http://", 1)
+	apiURL = strings.Replace(apiURL, "wss://", "https://", 1)
+	// Query for most recent event by this oracle, limit 1
+	apiURL = fmt.Sprintf("%s/api/quotes/latest?pubkey=%s", apiURL, oraclePubkey)
+
+	logger.Info("Fetching latest quote timestamp", "url", apiURL)
+
+	// GET from relay API
+	resp, err := sendRequester.SendRequest(&http.Request{
+		Method: "GET",
+		Url:    apiURL,
+	}).Await()
+
+	if err != nil {
+		logger.Warn("Failed to fetch latest quote (proceeding with generation)", "error", err)
+		return 0, nil // Allow generation on network error
+	}
+
+	// 404 means no quotes exist yet - allow generation
+	if resp.StatusCode == 404 {
+		logger.Info("No existing quotes found, allowing generation")
+		return 0, nil
+	}
+
+	if resp.StatusCode != 200 {
+		logger.Warn("Non-200 status fetching latest quote (proceeding with generation)", "status", resp.StatusCode)
+		return 0, nil // Allow generation on error
+	}
+
+	// Parse response - expecting {"created_at": <timestamp>} or full event
+	var result struct {
+		CreatedAt int64 `json:"created_at"`
+	}
+	if err := json.Unmarshal(resp.Body, &result); err != nil {
+		// Try parsing as full NostrEvent
+		var event NostrEvent
+		if err := json.Unmarshal(resp.Body, &event); err != nil {
+			logger.Warn("Failed to parse latest quote response (proceeding with generation)", "error", err)
+			return 0, nil
+		}
+		return event.CreatedAt, nil
+	}
+
+	return result.CreatedAt, nil
+}
+
 // fetchEventByDTag retrieves quote by threshold hash (d tag)
 // Primary method for checking breach status
 func fetchEventByDTag(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, dTag string) (*NostrEvent, error) {

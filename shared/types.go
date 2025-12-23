@@ -529,6 +529,9 @@ type GenerateQuotesResponse struct {
 	} `json:"range"`
 	TholdHashes []string `json:"thold_hashes"`
 	GeneratedAt int64    `json:"generated_at"`
+	// Rate limiting fields
+	Skipped    bool   `json:"skipped,omitempty"`     // True if generation was skipped
+	SkipReason string `json:"skip_reason,omitempty"` // Reason for skipping (e.g., rate limited)
 }
 
 // PriceEvent represents a price threshold event

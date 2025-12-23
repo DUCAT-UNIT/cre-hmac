@@ -67,11 +67,13 @@ type MockPriceData struct {
 
 // MockRelayClient simulates Nostr relay operations
 type MockRelayClient struct {
-	PublishedEvents []*shared.NostrEvent
-	StoredEvents    map[string]*shared.NostrEvent // keyed by d-tag (thold_hash)
-	PublishError    error
-	FetchError      error
-	mu              sync.Mutex
+	PublishedEvents        []*shared.NostrEvent
+	StoredEvents           map[string]*shared.NostrEvent // keyed by d-tag (thold_hash)
+	PublishError           error
+	FetchError             error
+	LatestQuoteTimestamp   int64 // Simulated latest quote timestamp for rate limiting
+	LatestTimestampError   error // Error to return from GetLatestQuoteTimestamp
+	mu                     sync.Mutex
 }
 
 // NewMockRelayClient returns a MockRelayClient initialized for testing.
@@ -120,6 +122,31 @@ func (m *MockRelayClient) FetchByDTag(dTag string) (*shared.NostrEvent, error) {
 	}
 
 	return event, nil
+}
+
+// GetLatestQuoteTimestamp simulates fetching the latest quote timestamp for rate limiting
+func (m *MockRelayClient) GetLatestQuoteTimestamp(oraclePubkey string) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.LatestTimestampError != nil {
+		return 0, m.LatestTimestampError
+	}
+
+	// If LatestQuoteTimestamp is set, return it
+	if m.LatestQuoteTimestamp > 0 {
+		return m.LatestQuoteTimestamp, nil
+	}
+
+	// Otherwise, find the most recent event by this pubkey
+	var latest int64
+	for _, event := range m.StoredEvents {
+		if event.PubKey == oraclePubkey && event.CreatedAt > latest {
+			latest = event.CreatedAt
+		}
+	}
+
+	return latest, nil
 }
 
 // MockPriceClient simulates price data fetching

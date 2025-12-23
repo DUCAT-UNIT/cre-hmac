@@ -1297,3 +1297,67 @@ func BenchmarkBatchContractCreation(b *testing.B) {
 		}
 	}
 }
+
+// TestKeyDerivationZero tests that Zero() properly zeroes private key material
+func TestKeyDerivationZero(t *testing.T) {
+	kd, err := DeriveKeys(testPrivateKey)
+	if err != nil {
+		t.Fatalf("DeriveKeys failed: %v", err)
+	}
+
+	// Verify private key is non-zero initially
+	allZero := true
+	for _, b := range kd.PrivateKey {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("Private key should not be all zeros before Zero()")
+	}
+
+	// Call Zero
+	kd.Zero()
+
+	// Verify private key is now zeroed
+	for i, b := range kd.PrivateKey {
+		if b != 0 {
+			t.Errorf("Private key byte %d not zeroed: got %02x", i, b)
+		}
+	}
+}
+
+// TestKeyDerivationZeroNil tests Zero() on nil KeyDerivation
+func TestKeyDerivationZeroNil(t *testing.T) {
+	// Should not panic
+	var kd *KeyDerivation
+	kd.Zero() // Should be safe
+
+	// Also test with nil PrivateKey
+	kd2 := &KeyDerivation{
+		PrivateKey:    nil,
+		SchnorrPubkey: "test",
+	}
+	kd2.Zero() // Should be safe
+}
+
+// TestKeyDerivationZeroIdempotent tests that Zero() can be called multiple times
+func TestKeyDerivationZeroIdempotent(t *testing.T) {
+	kd, err := DeriveKeys(testPrivateKey)
+	if err != nil {
+		t.Fatalf("DeriveKeys failed: %v", err)
+	}
+
+	// Call Zero multiple times - should not panic
+	kd.Zero()
+	kd.Zero()
+	kd.Zero()
+
+	// Verify still zeroed
+	for i, b := range kd.PrivateKey {
+		if b != 0 {
+			t.Errorf("Private key byte %d not zeroed after multiple Zero() calls: got %02x", i, b)
+		}
+	}
+}
