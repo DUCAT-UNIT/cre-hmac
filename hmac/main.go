@@ -24,12 +24,11 @@ const (
 )
 
 // WorkflowConfig holds both config and secrets (fetched at runtime)
-// SECURITY: Secrets are stored as []byte to enable proper zeroing after use
+// SECURITY: Secrets are stored ONLY as []byte to enable proper zeroing after use.
+// String representations are intentionally avoided to prevent secret leakage.
 type WorkflowConfig struct {
-	Config           *Config
-	PrivateKey       string // Hex-encoded private key (for compatibility with existing code)
-	PrivateKeyBytes  []byte // Raw private key bytes - ZERO AFTER USE
-	ClientSecret     string // Client secret for API auth
+	Config            *Config
+	PrivateKeyBytes   []byte // Raw private key bytes - ZERO AFTER USE
 	ClientSecretBytes []byte // Raw client secret bytes - ZERO AFTER USE
 }
 
@@ -174,7 +173,8 @@ func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (
 // private_key and client_secret. An error is returned if a secret cannot be fetched,
 // if private_key is not exactly 64 characters, or if client_secret is empty.
 // SECURITY: The returned WorkflowConfig contains raw secret bytes - caller MUST call
-// ZeroSecrets() when done with cryptographic operations.
+// ZeroSecrets() when done with cryptographic operations. String representations are
+// intentionally not stored to enable proper secret zeroing.
 func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, error) {
 	logger := runtime.Logger()
 
@@ -190,7 +190,7 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 		return nil, ErrValidationFailed("private_key")
 	}
 
-	// Decode private key to bytes immediately
+	// Decode private key to bytes immediately - don't store the hex string
 	privateKeyBytes, err := hex.DecodeString(privateKeySecret.Value)
 	if err != nil {
 		logger.Error("Invalid private_key hex format", "error", err)
@@ -218,9 +218,7 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 
 	return &WorkflowConfig{
 		Config:            config,
-		PrivateKey:        privateKeySecret.Value,
 		PrivateKeyBytes:   privateKeyBytes,
-		ClientSecret:      clientSecretSecret.Value,
 		ClientSecretBytes: []byte(clientSecretSecret.Value),
 	}, nil
 }

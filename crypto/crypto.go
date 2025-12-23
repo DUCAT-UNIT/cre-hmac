@@ -112,17 +112,28 @@ func GetPublicKey(privateKey []byte) []byte {
 //   - Key is zero (invalid)
 //   - Key is >= curve order (invalid for secp256k1)
 func DeriveKeys(privateKeyHex string) (result *KeyDerivation, err error) {
+	privKeyBytes, err := hex.DecodeString(privateKeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid private key hex encoding: %w", err)
+	}
+	return DeriveKeysFromBytes(privKeyBytes)
+}
+
+// DeriveKeysFromBytes derives ECDSA and Schnorr public keys from raw secp256k1 private key bytes.
+//
+// privKeyBytes must be exactly 32 bytes. On success it returns a KeyDerivation
+// containing the raw private key bytes and the serialized Schnorr public key as a hex string.
+//
+// SECURITY: This function copies the input bytes to avoid aliasing issues. The returned
+// KeyDerivation.PrivateKey is a separate copy that can be safely zeroed by the caller.
+// Includes panic recovery to gracefully handle unexpected btcec library panics.
+func DeriveKeysFromBytes(privKeyBytes []byte) (result *KeyDerivation, err error) {
 	// Panic recovery for external library calls
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic in key derivation: %v", r)
 		}
 	}()
-
-	privKeyBytes, err := hex.DecodeString(privateKeyHex)
-	if err != nil {
-		return nil, fmt.Errorf("invalid private key hex encoding: %w", err)
-	}
 
 	if len(privKeyBytes) != 32 {
 		return nil, fmt.Errorf("invalid private key length: expected 32 bytes, got %d", len(privKeyBytes))
@@ -141,11 +152,15 @@ func DeriveKeys(privateKeyHex string) (result *KeyDerivation, err error) {
 		return nil, fmt.Errorf("invalid private key: key must be less than secp256k1 curve order")
 	}
 
-	_, pubKey := btcec.PrivKeyFromBytes(privKeyBytes)
+	// Copy private key bytes to avoid aliasing
+	privKeyCopy := make([]byte, 32)
+	copy(privKeyCopy, privKeyBytes)
+
+	_, pubKey := btcec.PrivKeyFromBytes(privKeyCopy)
 	schnorrPubkey := hex.EncodeToString(schnorr.SerializePubKey(pubKey))
 
 	return &KeyDerivation{
-		PrivateKey:    privKeyBytes,
+		PrivateKey:    privKeyCopy,
 		SchnorrPubkey: schnorrPubkey,
 	}, nil
 }
@@ -225,8 +240,16 @@ func GetTholdKey(oracleSeckey string, commitHash string) (string, error) {
 	}
 	defer zeroBytes(seckeyBytes) // Zero secret key after use
 
-	if len(seckeyBytes) != 32 {
-		return "", fmt.Errorf("invalid oracle seckey length: expected 32 bytes, got %d", len(seckeyBytes))
+	return GetTholdKeyFromBytes(seckeyBytes, commitHash)
+}
+
+// GetTholdKeyFromBytes generates threshold key from oracle secret key bytes and commit hash.
+// oracleSeckeyBytes must be exactly 32 bytes. commitHash must be a 64-character hex string (32 bytes).
+// It returns the hex-encoded HMAC-SHA256 value or an error if inputs are invalid.
+// SECURITY: The caller is responsible for zeroing oracleSeckeyBytes after use.
+func GetTholdKeyFromBytes(oracleSeckeyBytes []byte, commitHash string) (string, error) {
+	if len(oracleSeckeyBytes) != 32 {
+		return "", fmt.Errorf("invalid oracle seckey length: expected 32 bytes, got %d", len(oracleSeckeyBytes))
 	}
 
 	commitBytes, err := hex.DecodeString(commitHash)
@@ -237,7 +260,7 @@ func GetTholdKey(oracleSeckey string, commitHash string) (string, error) {
 		return "", fmt.Errorf("invalid commit hash length: expected 32 bytes, got %d", len(commitBytes))
 	}
 
-	h := hmac.New(sha256.New, seckeyBytes)
+	h := hmac.New(sha256.New, oracleSeckeyBytes)
 	h.Write(commitBytes)
 	result := h.Sum(nil)
 	defer zeroBytes(result) // Zero derived key after encoding
@@ -278,15 +301,33 @@ func GetPriceContractID(commitHash string, tholdHash string) (string, error) {
 
 // CreatePriceContract creates a complete signed price contract
 // CreatePriceContract constructs a signed PriceContract from an oracle secret key, a price observation, and a threshold price.
-// 
+//
 // It computes the price commit hash from the observation and threshold, derives a threshold key as HMAC-SHA256(oracleSeckey, commitHash),
 // computes the threshold hash as RIPEMD160(SHA256(tholdKey)), derives the contract ID from the commit and threshold hashes,
 // and signs the contract ID with the oracle secret key using a Schnorr signature. The returned PriceContract has TholdKey set to the
 // hex-encoded threshold key (revealed); callers may nil this field when publishing a sealed contract.
-// 
+//
 // oracleSeckey must be the hex-encoded 32-byte oracle secret key. obs supplies the oracle public key, chain/network, base price and stamp.
 // On success returns a fully populated *PriceContract; on failure returns a non-nil error explaining the failure.
 func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice uint32) (*PriceContract, error) {
+	seckeyBytes, err := hex.DecodeString(oracleSeckey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid oracle seckey hex: %w", err)
+	}
+	defer zeroBytes(seckeyBytes) // Zero secret key after use
+	return CreatePriceContractFromBytes(seckeyBytes, obs, tholdPrice)
+}
+
+// CreatePriceContractFromBytes creates a complete signed price contract from raw private key bytes.
+//
+// oracleSeckeyBytes must be exactly 32 bytes. obs supplies the oracle public key, chain/network, base price and stamp.
+// SECURITY: The caller is responsible for zeroing oracleSeckeyBytes after use.
+// On success returns a fully populated *PriceContract; on failure returns a non-nil error explaining the failure.
+func CreatePriceContractFromBytes(oracleSeckeyBytes []byte, obs PriceObservation, tholdPrice uint32) (*PriceContract, error) {
+	if len(oracleSeckeyBytes) != 32 {
+		return nil, fmt.Errorf("invalid oracle seckey length: expected 32 bytes, got %d", len(oracleSeckeyBytes))
+	}
+
 	// Compute commit hash
 	commitHash, err := GetPriceCommitHash(obs, tholdPrice)
 	if err != nil {
@@ -294,7 +335,7 @@ func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice u
 	}
 
 	// Compute threshold key: HMAC(oracle_seckey, commit_hash)
-	tholdKey, err := GetTholdKey(oracleSeckey, commitHash)
+	tholdKey, err := GetTholdKeyFromBytes(oracleSeckeyBytes, commitHash)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compute thold key: %w", err)
 	}
@@ -319,13 +360,7 @@ func CreatePriceContract(oracleSeckey string, obs PriceObservation, tholdPrice u
 	}
 
 	// Sign contract ID with oracle secret key
-	seckeyBytes, err := hex.DecodeString(oracleSeckey)
-	if err != nil {
-		return nil, fmt.Errorf("invalid oracle seckey hex: %w", err)
-	}
-	defer zeroBytes(seckeyBytes) // Zero secret key after use
-
-	oracleSig, err := SignSchnorr(seckeyBytes, contractID)
+	oracleSig, err := SignSchnorr(oracleSeckeyBytes, contractID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign contract: %w", err)
 	}

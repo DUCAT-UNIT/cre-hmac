@@ -33,12 +33,12 @@ func TestConfigValidate(t *testing.T) {
 		{"valid config", &validConfig, false, ""},
 		{"nil config", nil, true, "config is nil"},
 		{"missing client_id", &Config{DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "client_id required"},
-		{"missing data_stream_url", &Config{ClientID: "id", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "data_stream_url required"},
-		{"missing relay_url", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", Network: "net", AuthorizedKey: validAuthKey}, true, "relay_url required"},
+		{"missing data_stream_url", &Config{ClientID: "id", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "data_stream URL is required"},
+		{"missing relay_url", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", Network: "net", AuthorizedKey: validAuthKey}, true, "relay URL is required"},
 		{"missing feed_id", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "feed_id required"},
 		{"missing network", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", AuthorizedKey: validAuthKey}, true, "network required"},
-		// TLS validation
-		{"data_stream_url no TLS", &Config{ClientID: "id", DataStreamURL: "http://external.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "must use https://"},
+		// TLS validation (M-4 fix uses proper URL parsing now)
+		{"data_stream_url no TLS", &Config{ClientID: "id", DataStreamURL: "http://external.example.com", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "must use TLS"},
 		{"data_stream_url localhost allowed", &Config{ClientID: "id", DataStreamURL: "http://localhost:8080", FeedID: "feed", RelayURL: "wss://relay.example.com", Network: "net", AuthorizedKey: validAuthKey}, false, ""},
 		{"relay_url no TLS", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "ws://external.example.com", Network: "net", AuthorizedKey: validAuthKey}, true, "must use TLS"},
 		{"relay_url localhost allowed", &Config{ClientID: "id", DataStreamURL: "https://data.example.com", FeedID: "feed", RelayURL: "ws://localhost:7000", Network: "net", AuthorizedKey: validAuthKey}, false, ""},

@@ -83,6 +83,18 @@ type Config struct {
 	// Optional - if empty, no callback is sent.
 	// Example: "https://gateway.ducat.network/webhook/batch"
 	GatewayCallbackURL string `json:"gateway_callback_url,omitempty"`
+
+	// MaxQuoteAge is the maximum age in seconds for a quote to be valid for evaluation.
+	// Quotes older than this are rejected to prevent stale price data attacks.
+	// Default: 60 seconds if not set. Range: 30-300 seconds.
+	// Example: 120 (2 minutes)
+	MaxQuoteAge int64 `json:"max_quote_age,omitempty"`
+
+	// MinCronIntervalSeconds is the minimum interval between cron-triggered quote generations.
+	// Prevents excessive quote generation if cron fires too frequently.
+	// Default: 60 seconds if not set. Range: 30-3600 seconds.
+	// Example: 90 (1.5 minutes between batches)
+	MinCronIntervalSeconds int64 `json:"min_cron_interval_seconds,omitempty"`
 }
 
 // Validate validates the configuration
@@ -93,44 +105,17 @@ func (c *Config) Validate() error {
 	if c.ClientID == "" {
 		return fmt.Errorf("client_id required")
 	}
-	if c.DataStreamURL == "" {
-		return fmt.Errorf("data_stream_url required")
+
+	// SECURITY: Validate data stream URL using proper URL parsing (M-4 fix)
+	if err := ValidateServiceURL(c.DataStreamURL, "data_stream"); err != nil {
+		return err
 	}
-	// SECURITY: Require TLS for data stream (Chainlink) connections
-	if len(c.DataStreamURL) < 8 || c.DataStreamURL[:8] != "https://" {
-		// Allow http:// only for localhost development
-		if len(c.DataStreamURL) >= 7 && c.DataStreamURL[:7] == "http://" {
-			isLocalhost := len(c.DataStreamURL) > 16 && (c.DataStreamURL[7:16] == "localhost" || c.DataStreamURL[7:16] == "127.0.0.1")
-			if !isLocalhost {
-				return fmt.Errorf("data_stream_url must use https:// for non-localhost connections")
-			}
-		} else {
-			return fmt.Errorf("data_stream_url must start with https://")
-		}
+
+	// SECURITY: Validate relay URL using proper URL parsing (M-4 fix)
+	if err := ValidateServiceURL(c.RelayURL, "relay"); err != nil {
+		return err
 	}
-	if c.RelayURL == "" {
-		return fmt.Errorf("relay_url required")
-	}
-	// SECURITY: Require TLS for relay connections in production
-	// wss:// ensures encrypted WebSocket, https:// for HTTP API fallback
-	if c.RelayURL[:6] != "wss://" && c.RelayURL[:8] != "https://" {
-		// Allow ws:// and http:// only for localhost development
-		if c.RelayURL[:5] == "ws://" || c.RelayURL[:7] == "http://" {
-			// Check if it's localhost
-			isLocalhost := false
-			if len(c.RelayURL) > 12 && (c.RelayURL[5:14] == "localhost" || c.RelayURL[7:16] == "localhost") {
-				isLocalhost = true
-			}
-			if len(c.RelayURL) > 14 && (c.RelayURL[5:14] == "127.0.0.1" || c.RelayURL[7:16] == "127.0.0.1") {
-				isLocalhost = true
-			}
-			if !isLocalhost {
-				return fmt.Errorf("relay_url must use TLS (wss:// or https://) for non-localhost connections")
-			}
-		} else {
-			return fmt.Errorf("relay_url must start with wss://, https://, ws://, or http://")
-		}
-	}
+
 	if c.FeedID == "" {
 		return fmt.Errorf("feed_id required")
 	}
@@ -156,6 +141,31 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// SECURITY: Validate gateway callback URL if set (H-2 fix)
+	if err := ValidateCallbackURL(c.GatewayCallbackURL); err != nil {
+		return fmt.Errorf("gateway_callback_url: %w", err)
+	}
+
+	// Validate MaxQuoteAge if set (M-2 fix)
+	if c.MaxQuoteAge != 0 {
+		if c.MaxQuoteAge < 30 {
+			return fmt.Errorf("max_quote_age must be at least 30 seconds, got %d", c.MaxQuoteAge)
+		}
+		if c.MaxQuoteAge > 300 {
+			return fmt.Errorf("max_quote_age must not exceed 300 seconds, got %d", c.MaxQuoteAge)
+		}
+	}
+
+	// Validate MinCronIntervalSeconds if set (M-3 fix)
+	if c.MinCronIntervalSeconds != 0 {
+		if c.MinCronIntervalSeconds < 30 {
+			return fmt.Errorf("min_cron_interval_seconds must be at least 30 seconds, got %d", c.MinCronIntervalSeconds)
+		}
+		if c.MinCronIntervalSeconds > 3600 {
+			return fmt.Errorf("min_cron_interval_seconds must not exceed 3600 seconds (1 hour), got %d", c.MinCronIntervalSeconds)
+		}
+	}
+
 	// Validate cron-related fields if any are set
 	if c.CronSchedule != "" || c.RateMin != 0 || c.RateMax != 0 || c.StepSize != 0 {
 		if err := c.ValidateCronConfig(); err != nil {
@@ -164,6 +174,22 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// GetMaxQuoteAge returns the configured max quote age or the default (60 seconds).
+func (c *Config) GetMaxQuoteAge() int64 {
+	if c.MaxQuoteAge == 0 {
+		return MaxQuoteAge // Use default from constants
+	}
+	return c.MaxQuoteAge
+}
+
+// GetMinCronInterval returns the configured min cron interval or the default (60 seconds).
+func (c *Config) GetMinCronInterval() int64 {
+	if c.MinCronIntervalSeconds == 0 {
+		return 60 // Default 60 seconds
+	}
+	return c.MinCronIntervalSeconds
 }
 
 // ValidateCronConfig validates cron-related configuration fields
@@ -212,6 +238,13 @@ func (r *HttpRequestData) Validate() error {
 	// Domain validation
 	if err := ValidateDomain(r.Domain); err != nil {
 		return err
+	}
+
+	// SECURITY: Validate callback URL if provided (H-2 fix)
+	if r.CallbackURL != nil {
+		if err := ValidateCallbackURL(*r.CallbackURL); err != nil {
+			return fmt.Errorf("callback_url: %w", err)
+		}
 	}
 
 	// Request type validation
@@ -290,6 +323,12 @@ func (r *EvaluateQuotesRequest) Validate() error {
 		}
 		if !IsValidHex(hash) {
 			return fmt.Errorf("invalid thold_hash format at index %d: must be lowercase hex", i)
+		}
+	}
+	// SECURITY: Validate callback URL if provided (H-2 fix)
+	if r.CallbackURL != nil {
+		if err := ValidateCallbackURL(*r.CallbackURL); err != nil {
+			return fmt.Errorf("callback_url: %w", err)
 		}
 	}
 	return nil

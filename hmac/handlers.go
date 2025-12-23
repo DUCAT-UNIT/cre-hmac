@@ -33,8 +33,8 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	logger := runtime.Logger()
 	logger.Info("Creating new quote", "domain", requestData.Domain, "tholdPrice", *requestData.TholdPrice)
 
-	// Derive keys from private key (from secrets)
-	keys, err := deriveKeys(wc.PrivateKey)
+	// Derive keys from private key bytes (from secrets)
+	keys, err := deriveKeysFromBytes(wc.PrivateKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
@@ -81,8 +81,8 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 
 	// Create price contract using new core-ts aligned crypto
 	// This computes: commit_hash, thold_key, thold_hash, contract_id, oracle_sig
-	contract, err := createPriceContract(
-		wc.PrivateKey,
+	contract, err := createPriceContractFromBytes(
+		wc.PrivateKeyBytes,
 		keys.SchnorrPubkey,
 		wc.Config.Network,
 		uint32(currentPrice),
@@ -188,8 +188,8 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 	logger := runtime.Logger()
 	logger.Info("Evaluating quotes batch (parallel)", "count", len(requestData.TholdHashes))
 
-	// Derive keys (from secrets)
-	keys, err := deriveKeys(wc.PrivateKey)
+	// Derive keys from private key bytes (from secrets)
+	keys, err := deriveKeysFromBytes(wc.PrivateKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
@@ -284,7 +284,9 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 
 		// SECURITY: Validate quote age before evaluating
 		// Prevents replay attacks with stale price data
-		if err := validateQuoteAge(int64(originalData.BaseStamp), currentStamp); err != nil {
+		// Uses configurable max age (M-2 fix)
+		maxAge := wc.Config.GetMaxQuoteAge()
+		if err := validateQuoteAge(int64(originalData.BaseStamp), currentStamp, maxAge); err != nil {
 			errMsg := fmt.Sprintf("quote age validation failed: %v", err)
 			result.Error = &errMsg
 			result.Status = "error"
@@ -331,8 +333,8 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 			continue
 		}
 
-		// Regenerate threshold secret
-		tholdSecret, err := getTholdKey(wc.PrivateKey, commitHash)
+		// Regenerate threshold secret using private key bytes
+		tholdSecret, err := getTholdKeyFromBytes(wc.PrivateKeyBytes, commitHash)
 		if err != nil {
 			errMsg := fmt.Sprintf("threshold key regeneration failed: %v", err)
 			result.Error = &errMsg
@@ -531,8 +533,8 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 	logger := runtime.Logger()
 	logger.Info("Generating quotes (parallel)", "rateMin", requestData.RateMin, "rateMax", requestData.RateMax, "stepSize", requestData.StepSize)
 
-	// Derive keys from private key
-	keys, err := deriveKeys(wc.PrivateKey)
+	// Derive keys from private key bytes
+	keys, err := deriveKeysFromBytes(wc.PrivateKeyBytes)
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
@@ -603,9 +605,9 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 	var signedEvents []SignedEvent
 
 	for _, job := range jobs {
-		// Create price contract
-		contract, err := createPriceContract(
-			wc.PrivateKey,
+		// Create price contract - this already signs the contract (OracleSig is populated)
+		contract, err := createPriceContractFromBytes(
+			wc.PrivateKeyBytes,
 			keys.SchnorrPubkey,
 			wc.Config.Network,
 			uint32(currentPrice),
@@ -617,14 +619,8 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 			continue
 		}
 
-		// Sign contract ID with Schnorr
-		oracleSig, err := signSchnorr(keys.PrivateKey, contract.ContractID)
-		if err != nil {
-			logger.Warn("Failed to sign contract", "rate", job.Rate, "error", err)
-			continue
-		}
-
 		// Build PriceContractResponse - matches core-ts PriceContract schema exactly
+		// NOTE: Use contract.OracleSig from createPriceContractFromBytes - no need to sign again
 		eventData := PriceContractResponse{
 			ChainNetwork: wc.Config.Network,
 			OraclePubkey: keys.SchnorrPubkey,
@@ -632,7 +628,7 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 			BaseStamp:    quoteStamp,
 			CommitHash:   contract.CommitHash,
 			ContractID:   contract.ContractID,
-			OracleSig:    oracleSig,
+			OracleSig:    contract.OracleSig, // Use signature from contract creation (M-1 fix)
 			TholdHash:    contract.TholdHash,
 			TholdKey:     nil, // Secret NOT revealed for active quotes
 			TholdPrice:   int64(job.TholdPrice),

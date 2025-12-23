@@ -18,8 +18,22 @@ import (
 
 // deriveKeys derives an ECDSA private key and a BIP-340 Schnorr public key from a secp256k1 private key hex string.
 // It returns a KeyDerivation containing the private key bytes and Schnorr public key, or an error if derivation fails.
+// DEPRECATED: Use deriveKeysFromBytes for better secret handling.
 func deriveKeys(privateKeyHex string) (*KeyDerivation, error) {
 	kd, err := crypto.DeriveKeys(privateKeyHex)
+	if err != nil {
+		return nil, err
+	}
+	return &KeyDerivation{
+		PrivateKey:    kd.PrivateKey,
+		SchnorrPubkey: kd.SchnorrPubkey,
+	}, nil
+}
+
+// deriveKeysFromBytes derives keys from raw private key bytes.
+// SECURITY: This is the preferred method as it avoids hex string intermediate representation.
+func deriveKeysFromBytes(privateKeyBytes []byte) (*KeyDerivation, error) {
+	kd, err := crypto.DeriveKeysFromBytes(privateKeyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -46,8 +60,15 @@ func getPriceCommitHash(oraclePubkey, chainNetwork string, basePrice, baseStamp,
 // getTholdKey computes a threshold key from an oracle secret and a commitment hash.
 // The threshold key is produced as HMAC-SHA256 keyed by the oracle secret over the commit hash and returned as a hex string.
 // It returns the hex-encoded threshold key or an error from the crypto layer.
+// DEPRECATED: Use getTholdKeyFromBytes for better secret handling.
 func getTholdKey(oracleSeckey, commitHash string) (string, error) {
 	return crypto.GetTholdKey(oracleSeckey, commitHash)
+}
+
+// getTholdKeyFromBytes generates threshold key from oracle secret key bytes and commit hash.
+// SECURITY: This is the preferred method as it avoids hex string intermediate representation.
+func getTholdKeyFromBytes(oracleSeckeyBytes []byte, commitHash string) (string, error) {
+	return crypto.GetTholdKeyFromBytes(oracleSeckeyBytes, commitHash)
 }
 
 // getPriceContractID computes the contract ID from commit hash and thold hash
@@ -59,6 +80,7 @@ func getPriceContractID(commitHash, tholdHash string) (string, error) {
 
 // createPriceContract creates a signed price contract using the oracle secret key and the provided observation fields.
 // It returns the constructed *crypto.PriceContract on success, or an error if contract creation fails.
+// DEPRECATED: Use createPriceContractFromBytes for better secret handling.
 func createPriceContract(oracleSeckey string, oraclePubkey, chainNetwork string, basePrice, baseStamp, tholdPrice uint32) (*crypto.PriceContract, error) {
 	obs := crypto.PriceObservation{
 		OraclePubkey: oraclePubkey,
@@ -67,6 +89,18 @@ func createPriceContract(oracleSeckey string, oraclePubkey, chainNetwork string,
 		BaseStamp:    baseStamp,
 	}
 	return crypto.CreatePriceContract(oracleSeckey, obs, tholdPrice)
+}
+
+// createPriceContractFromBytes creates a signed price contract using raw oracle secret key bytes.
+// SECURITY: This is the preferred method as it avoids hex string intermediate representation.
+func createPriceContractFromBytes(oracleSeckeyBytes []byte, oraclePubkey, chainNetwork string, basePrice, baseStamp, tholdPrice uint32) (*crypto.PriceContract, error) {
+	obs := crypto.PriceObservation{
+		OraclePubkey: oraclePubkey,
+		ChainNetwork: chainNetwork,
+		BasePrice:    basePrice,
+		BaseStamp:    baseStamp,
+	}
+	return crypto.CreatePriceContractFromBytes(oracleSeckeyBytes, obs, tholdPrice)
 }
 
 // verifyPriceContract verifies the integrity and authenticity of a PriceContract.
@@ -164,6 +198,6 @@ func serializeNostrEvent(event *NostrEvent) string {
 }
 
 // validateQuoteAge validates quote timestamp freshness
-func validateQuoteAge(quoteStamp, currentTime int64) error {
-	return shared.ValidateQuoteAge(quoteStamp, currentTime, MaxQuoteAge)
+func validateQuoteAge(quoteStamp, currentTime, maxAge int64) error {
+	return shared.ValidateQuoteAge(quoteStamp, currentTime, maxAge)
 }

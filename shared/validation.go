@@ -3,6 +3,7 @@ package shared
 import (
 	"fmt"
 	"math"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -224,6 +225,88 @@ func MustTruncatePriceToUint32(price float64) uint32 {
 		panic(fmt.Sprintf("MustTruncatePriceToUint32: %v", err))
 	}
 	return result
+}
+
+// ValidateCallbackURL validates a callback URL for webhook notifications.
+// SECURITY: Requires HTTPS to prevent man-in-the-middle attacks on callback data.
+// Localhost URLs (http://localhost or http://127.0.0.1) are allowed for development.
+// Returns an error if the URL is malformed, uses an unsafe scheme, or has no host.
+func ValidateCallbackURL(callbackURL string) error {
+	if callbackURL == "" {
+		return nil // Empty is valid (optional callback)
+	}
+
+	parsed, err := url.Parse(callbackURL)
+	if err != nil {
+		return fmt.Errorf("invalid callback URL: %w", err)
+	}
+
+	// Must have a scheme
+	if parsed.Scheme == "" {
+		return fmt.Errorf("callback URL must have a scheme (https://)")
+	}
+
+	// Must have a host
+	if parsed.Host == "" {
+		return fmt.Errorf("callback URL must have a host")
+	}
+
+	// Extract hostname (without port)
+	hostname := parsed.Hostname()
+
+	// Check scheme - require HTTPS except for localhost
+	isLocalhost := hostname == "localhost" || hostname == "127.0.0.1"
+	if parsed.Scheme == "http" && !isLocalhost {
+		return fmt.Errorf("callback URL must use https:// for non-localhost URLs")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("callback URL must use http:// or https:// scheme")
+	}
+
+	return nil
+}
+
+// ValidateServiceURL validates a service URL (relay, data stream, etc.).
+// SECURITY: Requires TLS (https:// or wss://) for non-localhost connections.
+// Localhost URLs are allowed with http:// or ws:// for development.
+// Returns an error if the URL is malformed, uses an unsafe scheme, or has no host.
+func ValidateServiceURL(serviceURL string, serviceName string) error {
+	if serviceURL == "" {
+		return fmt.Errorf("%s URL is required", serviceName)
+	}
+
+	parsed, err := url.Parse(serviceURL)
+	if err != nil {
+		return fmt.Errorf("invalid %s URL: %w", serviceName, err)
+	}
+
+	// Must have a scheme
+	if parsed.Scheme == "" {
+		return fmt.Errorf("%s URL must have a scheme", serviceName)
+	}
+
+	// Must have a host
+	if parsed.Host == "" {
+		return fmt.Errorf("%s URL must have a host", serviceName)
+	}
+
+	// Extract hostname (without port)
+	hostname := parsed.Hostname()
+	isLocalhost := hostname == "localhost" || hostname == "127.0.0.1"
+
+	// Validate scheme based on whether it's localhost
+	switch parsed.Scheme {
+	case "https", "wss":
+		// Always allowed
+	case "http", "ws":
+		if !isLocalhost {
+			return fmt.Errorf("%s URL must use TLS (https:// or wss://) for non-localhost connections", serviceName)
+		}
+	default:
+		return fmt.Errorf("%s URL must use http://, https://, ws://, or wss:// scheme", serviceName)
+	}
+
+	return nil
 }
 
 // ValidateCronExpression validates a 6-field cron expression.
