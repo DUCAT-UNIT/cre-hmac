@@ -516,7 +516,7 @@ func TestHandleStatus(t *testing.T) {
 					CreatedAt: time.Now(),
 					Status:    "completed",
 					Result: &WebhookPayload{
-						Content: `{"quote_price": 100.7, "thold_hash": "abc123"}`,
+						Content: `{"base_price": 100.7, "thold_hash": "abc123"}`,
 					},
 				}
 			},
@@ -526,13 +526,13 @@ func TestHandleStatus(t *testing.T) {
 				if err := json.Unmarshal(body, &result); err != nil {
 					t.Fatalf("failed to parse response: %v", err)
 				}
-				// Check that quote_price was rounded down
-				if quotePrice, ok := result["quote_price"].(float64); ok {
-					if quotePrice != 100.0 {
-						t.Errorf("quote_price = %f, want 100.0 (rounded down)", quotePrice)
+				// Check that base_price was rounded down (v3 PriceContract schema)
+				if basePrice, ok := result["base_price"].(float64); ok {
+					if basePrice != 100.0 {
+						t.Errorf("base_price = %f, want 100.0 (rounded down)", basePrice)
 					}
 				} else {
-					t.Error("quote_price not found in response")
+					t.Error("base_price not found in response")
 				}
 			},
 		},
@@ -1317,7 +1317,7 @@ func TestHandleCheckSuccess(t *testing.T) {
 			payload := &WebhookPayload{
 				EventType: "check_no_breach",
 				EventID:   "check-event-123",
-				Content:   `{"latest_price": 150.7, "thold_price": 100.0, "quote_price": 95.8}`,
+				Content:   `{"base_price": 150.7, "thold_price": 100.0}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1337,16 +1337,10 @@ func TestHandleCheckSuccess(t *testing.T) {
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 
-	// Verify prices were rounded down
-	if quotePrice, ok := result["quote_price"].(float64); ok {
-		if quotePrice != 95.0 {
-			t.Errorf("quote_price = %f, want 95.0 (rounded down)", quotePrice)
-		}
-	}
-
-	if latestPrice, ok := result["latest_price"].(float64); ok {
-		if latestPrice != 150.0 {
-			t.Errorf("latest_price = %f, want 150.0 (rounded down)", latestPrice)
+	// Verify base_price was rounded down (v3 PriceContract schema)
+	if basePrice, ok := result["base_price"].(float64); ok {
+		if basePrice != 150.0 {
+			t.Errorf("base_price = %f, want 150.0 (rounded down)", basePrice)
 		}
 	}
 }
@@ -1629,7 +1623,7 @@ func TestHandleCreateSuccess(t *testing.T) {
 				EventType: "create",
 				EventID:   "create-event-123",
 				Tags:      [][]string{{"domain", domain}},
-				Content:   `{"thold_price": 100.5, "thold_hash": "abc123", "quote_price": 99.8, "latest_price": 105.3}`,
+				Content:   `{"thold_price": 100.5, "thold_hash": "abc123", "base_price": 99.8}`,
 			}
 			select {
 			case pending.ResultChan <- payload:
@@ -1649,16 +1643,10 @@ func TestHandleCreateSuccess(t *testing.T) {
 	var result map[string]interface{}
 	json.NewDecoder(resp.Body).Decode(&result)
 
-	// Verify prices were rounded down
-	if quotePrice, ok := result["quote_price"].(float64); ok {
-		if quotePrice != 99.0 {
-			t.Errorf("quote_price = %f, want 99.0 (rounded down)", quotePrice)
-		}
-	}
-
-	if latestPrice, ok := result["latest_price"].(float64); ok {
-		if latestPrice != 105.0 {
-			t.Errorf("latest_price = %f, want 105.0 (rounded down)", latestPrice)
+	// Verify base_price was rounded down (v3 PriceContract schema)
+	if basePrice, ok := result["base_price"].(float64); ok {
+		if basePrice != 99.0 {
+			t.Errorf("base_price = %f, want 99.0 (rounded down)", basePrice)
 		}
 	}
 }

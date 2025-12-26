@@ -87,52 +87,49 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		return nil, fmt.Errorf("hash160 failed: %w", err)
 	}
 
-	// Build PriceEvent template (active quote with hidden secret)
-	// Event fields are nil for active quotes (not breached yet)
-	// This matches price-oracle's EventActiveQuote structure
-	eventTemplate := PriceEvent{
-		EventOrigin:  nil,               // No breach yet (null for active)
-		EventPrice:   nil,               // No breach yet (null for active)
-		EventStamp:   nil,               // No breach yet (null for active)
-		EventType:    EventTypeActive,   // "active"
-		LatestOrigin: priceData.Origin,  // current price origin
-		LatestPrice:  currentPrice,      // current price
-		LatestStamp:  priceData.Stamp,   // current timestamp
-		QuoteOrigin:  priceData.Origin,  // quote creation origin
-		QuotePrice:   currentPrice,      // quote creation price
-		QuoteStamp:   quoteStamp,             // quote creation timestamp
-		IsExpired:    false,                  // not expired (active quote)
-		SrvNetwork:   wc.Config.Network,      // Bitcoin network
-		SrvPubkey:    keys.SchnorrPubkey, // Server Schnorr public key
-		TholdHash:    tholdHash,         // Hash160 commitment
-		TholdKey:     nil,               // Secret is NOT revealed (null for active)
-		TholdPrice:   tholdPrice,        // Threshold price
-		ReqID:        "",                // Will be computed next
-		ReqSig:       "",                // Will be computed next
+	// Build v3 PriceContract template (active quote with hidden secret)
+	// Uses simpler core-ts PriceContract schema
+	contractTemplate := PriceContract{
+		// PriceOracleConfig
+		ChainNetwork: wc.Config.Network,     // Bitcoin network
+		OraclePubkey: keys.SchnorrPubkey,    // Server Schnorr public key
+		// PriceObservation
+		BasePrice:    currentPrice,          // Quote creation price
+		BaseStamp:    quoteStamp,            // Quote creation timestamp
+		// PriceContract specific
+		CommitHash:   "",                    // Will be computed next
+		ContractID:   "",                    // Will be computed next
+		OracleSig:    "",                    // Will be computed next
+		TholdHash:    tholdHash,             // Hash160 commitment
+		TholdKey:     nil,                   // Secret is NOT revealed (null for active)
+		TholdPrice:   tholdPrice,            // Threshold price
 	}
 
-	// Compute deterministic request ID from complete template
-	// This matches price-oracle's get_event_quote_request_id
-	reqID, err := computeRequestID(requestData.Domain, &eventTemplate)
+	// Compute deterministic commit hash (hash340 of preimage)
+	commitHash, err := computeCommitHash(requestData.Domain, &contractTemplate)
 	if err != nil {
-		return nil, fmt.Errorf("request ID computation failed: %w", err)
+		return nil, fmt.Errorf("commit hash computation failed: %w", err)
 	}
 
-	// Sign request ID with Schnorr
-	reqSig, err := signSchnorr(keys.PrivateKey, reqID)
+	// Compute contract ID (hash340 of commit||thold)
+	contractID := commitHash // For now use commit hash as contract ID
+
+	// Sign commit hash with Schnorr
+	oracleSig, err := signSchnorr(keys.PrivateKey, commitHash)
 	if err != nil {
-		return nil, fmt.Errorf("request signing failed: %w", err)
+		return nil, fmt.Errorf("signature failed: %w", err)
 	}
 
-	// Update template with req_id and req_sig
-	eventTemplate.ReqID = reqID
-	eventTemplate.ReqSig = reqSig
-	eventData := eventTemplate
+	// Update template with computed values
+	contractTemplate.CommitHash = commitHash
+	contractTemplate.ContractID = contractID
+	contractTemplate.OracleSig = oracleSig
+	contractData := contractTemplate
 
 	// Marshal to JSON for Nostr event content
-	eventJSON, err := json.Marshal(eventData)
+	contractJSON, err := json.Marshal(contractData)
 	if err != nil {
-		return nil, fmt.Errorf("event marshaling failed: %w", err)
+		return nil, fmt.Errorf("contract marshaling failed: %w", err)
 	}
 
 	// Create Nostr event
@@ -143,10 +140,9 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		Tags: [][]string{
 			{"d", tholdHash}, // NIP-33 replaceable event identifier
 			{"domain", requestData.Domain},
-			{"event_type", EventTypeActive},
 			{"thold_price", fmt.Sprintf("%.8f", tholdPrice)},
 		},
-		Content: string(eventJSON),
+		Content: string(contractJSON),
 	}
 
 	// Sign Nostr event
@@ -222,18 +218,13 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 		return nil, fmt.Errorf("failed to fetch original event: %w", err)
 	}
 
-	// Parse original event content
-	var originalData PriceEvent
+	// Parse original event content as v3 PriceContract
+	var originalData PriceContract
 	if err := json.Unmarshal([]byte(originalEvent.Content), &originalData); err != nil {
 		return nil, fmt.Errorf("failed to parse original event: %w", err)
 	}
 
-	logger.Info("Fetched original quote", "quotePrice", originalData.QuotePrice, "tholdPrice", originalData.TholdPrice, "tholdHash", originalData.TholdHash)
-
-	// Validate quote age (using latest stamp from data)
-	if err := validateQuoteAge(originalData.QuoteStamp, originalData.LatestStamp); err != nil {
-		return nil, fmt.Errorf("quote validation failed: %w", err)
-	}
+	logger.Info("Fetched original quote", "basePrice", originalData.BasePrice, "tholdPrice", originalData.TholdPrice, "tholdHash", originalData.TholdHash)
 
 	// Fetch current BTC/USD price with consensus
 	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
@@ -245,6 +236,11 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 	currentPrice, _ := priceData.Price.Float64()
 	currentStamp := priceData.Stamp
 	logger.Info("Fetched current price", "currentPrice", currentPrice, "tholdPrice", originalData.TholdPrice)
+
+	// Validate quote age
+	if err := validateQuoteAge(originalData.BaseStamp, currentStamp); err != nil {
+		return nil, fmt.Errorf("quote validation failed: %w", err)
+	}
 
 	// Check if threshold breached (price fell below threshold)
 	if currentPrice >= originalData.TholdPrice {
@@ -279,8 +275,8 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 	tholdSecret, err := getThresholdKey(
 		serverHMAC,
 		requestData.Domain,
-		originalData.QuotePrice,
-		originalData.QuoteStamp,
+		originalData.BasePrice,
+		originalData.BaseStamp,
 		originalData.TholdPrice,
 	)
 	if err != nil {
@@ -295,45 +291,39 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 
 	logger.Info("Commitment verified successfully")
 
-	// Build breach PriceEvent template with REVEALED secret
-	// Event fields are now populated with breach data
-	// This matches price-oracle's EventExpiredQuote structure
-	breachTemplate := PriceEvent{
-		EventOrigin:  &priceData.Origin,         // Breach origin (populated for expired)
-		EventPrice:   &currentPrice,             // Breach price (populated for expired)
-		EventStamp:   &currentStamp,             // Breach timestamp (populated for expired)
-		EventType:    EventTypeBreach,           // "breach"
-		LatestOrigin: priceData.Origin,          // current price origin
-		LatestPrice:  currentPrice,              // current price
-		LatestStamp:  currentStamp,              // current timestamp
-		QuoteOrigin:  originalData.QuoteOrigin,  // quote creation origin
-		QuotePrice:   originalData.QuotePrice,   // quote creation price
-		QuoteStamp:   originalData.QuoteStamp,   // quote creation timestamp
-		IsExpired:    true,                      // expired (breached quote)
-		SrvNetwork:   originalData.SrvNetwork,   // Bitcoin network
-		SrvPubkey:    originalData.SrvPubkey,    // Server Schnorr public key
-		TholdHash:    originalData.TholdHash,    // Hash160 commitment
-		TholdKey:     &tholdSecret,              // SECRET IS NOW REVEALED (pointer to string)
-		TholdPrice:   originalData.TholdPrice,   // Threshold price
-		ReqID:        "",                        // Will be computed next
-		ReqSig:       "",                        // Will be computed next
+	// Build v3 breach PriceContract template with REVEALED secret
+	breachTemplate := PriceContract{
+		// PriceOracleConfig
+		ChainNetwork: originalData.ChainNetwork,  // Bitcoin network
+		OraclePubkey: originalData.OraclePubkey,  // Server Schnorr public key
+		// PriceObservation
+		BasePrice:    originalData.BasePrice,     // Quote creation price
+		BaseStamp:    originalData.BaseStamp,     // Quote creation timestamp
+		// PriceContract specific
+		CommitHash:   "",                         // Will be computed next
+		ContractID:   "",                         // Will be computed next
+		OracleSig:    "",                         // Will be computed next
+		TholdHash:    originalData.TholdHash,     // Hash160 commitment
+		TholdKey:     &tholdSecret,               // SECRET IS NOW REVEALED
+		TholdPrice:   originalData.TholdPrice,    // Threshold price
 	}
 
-	// Compute deterministic request ID from complete template
-	reqID, err := computeRequestID(requestData.Domain, &breachTemplate)
+	// Compute deterministic commit hash
+	breachCommitHash, err := computeCommitHash(requestData.Domain, &breachTemplate)
 	if err != nil {
-		return nil, fmt.Errorf("request ID computation failed: %w", err)
+		return nil, fmt.Errorf("commit hash computation failed: %w", err)
 	}
 
-	// Sign request ID with Schnorr
-	reqSig, err := signSchnorr(keys.PrivateKey, reqID)
+	// Sign commit hash with Schnorr
+	breachOracleSig, err := signSchnorr(keys.PrivateKey, breachCommitHash)
 	if err != nil {
-		return nil, fmt.Errorf("request signing failed: %w", err)
+		return nil, fmt.Errorf("signature failed: %w", err)
 	}
 
-	// Update template with req_id and req_sig
-	breachTemplate.ReqID = reqID
-	breachTemplate.ReqSig = reqSig
+	// Update template with computed values
+	breachTemplate.CommitHash = breachCommitHash
+	breachTemplate.ContractID = breachCommitHash // Use commit hash as contract ID
+	breachTemplate.OracleSig = breachOracleSig
 	breachData := breachTemplate
 
 	// Marshal to JSON
@@ -350,7 +340,6 @@ func checkQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 		Tags: [][]string{
 			{"d", originalData.TholdHash}, // Same d tag as original - replaces it
 			{"domain", requestData.Domain},
-			{"event_type", EventTypeBreach},
 			{"original_event", originalEvent.ID},
 			{"thold_price", fmt.Sprintf("%.8f", originalData.TholdPrice)},
 			{"breach_price", fmt.Sprintf("%.8f", currentPrice)},

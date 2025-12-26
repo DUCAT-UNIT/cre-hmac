@@ -60,35 +60,27 @@ func getPublicKey(privateKey []byte) []byte {
 	return crypto.GetPublicKey(privateKey)
 }
 
-// computeRequestID computes deterministic request ID
-// Matches price-oracle EventQuotePreimage structure for cross-implementation compatibility
-func computeRequestID(domain string, template *PriceEvent) (string, error) {
+// computeCommitHash computes deterministic commit hash for v3 PriceContract
+// This is the hash340(tag, preimage) used for contract identification
+func computeCommitHash(domain string, contract *PriceContract) (string, error) {
 	// Validate inputs
 	if domain == "" {
 		return "", fmt.Errorf("domain cannot be empty")
 	}
-	if template == nil {
-		return "", fmt.Errorf("template cannot be nil")
+	if contract == nil {
+		return "", fmt.Errorf("contract cannot be nil")
 	}
 
-	// Build preimage array matching price-oracle's EventQuotePreimage structure
+	// Build preimage array for v3 PriceContract
 	preimage := []interface{}{
 		domain,
-		template.SrvNetwork,
-		template.SrvPubkey,
-		template.QuoteOrigin,
-		template.QuotePrice,
-		template.QuoteStamp,
-		template.LatestOrigin,
-		template.LatestPrice,
-		template.LatestStamp,
-		template.EventOrigin,
-		template.EventPrice,
-		template.EventStamp,
-		template.EventType,
-		template.TholdHash,
-		template.TholdKey,
-		template.TholdPrice,
+		contract.ChainNetwork,
+		contract.OraclePubkey,
+		contract.BasePrice,
+		contract.BaseStamp,
+		contract.TholdHash,
+		contract.TholdKey,
+		contract.TholdPrice,
 	}
 
 	return crypto.ComputeRequestID(preimage)

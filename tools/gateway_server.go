@@ -154,25 +154,24 @@ type WebhookPayload struct {
 	NostrEvent map[string]interface{} `json:"nostr_event"`
 }
 
-type PriceEvent struct {
-	EventOrigin  interface{} `json:"event_origin"`
-	EventPrice   interface{} `json:"event_price"`
-	EventStamp   interface{} `json:"event_stamp"`
-	EventType    string      `json:"event_type"`
-	LatestOrigin string      `json:"latest_origin"`
-	LatestPrice  float64     `json:"latest_price"`
-	LatestStamp  int64       `json:"latest_stamp"`
-	QuoteOrigin  string      `json:"quote_origin"`
-	QuotePrice   float64     `json:"quote_price"`
-	QuoteStamp   int64       `json:"quote_stamp"`
-	IsExpired    bool        `json:"is_expired"`
-	SrvNetwork   string      `json:"srv_network"`
-	SrvPubkey    string      `json:"srv_pubkey"`
-	TholdHash    string      `json:"thold_hash"`
-	TholdKey     string      `json:"thold_key"`
-	TholdPrice   float64     `json:"thold_price"`
-	ReqID        string      `json:"req_id"`
-	ReqSig       string      `json:"req_sig"`
+// PriceContract represents a v3 price contract (from core-ts)
+// PriceContract extends PriceObservation extends PriceOracleConfig
+type PriceContract struct {
+	// PriceOracleConfig
+	ChainNetwork string `json:"chain_network"`
+	OraclePubkey string `json:"oracle_pubkey"`
+
+	// PriceObservation
+	BasePrice float64 `json:"base_price"`
+	BaseStamp int64   `json:"base_stamp"`
+
+	// PriceContract specific
+	CommitHash string  `json:"commit_hash"`
+	ContractID string  `json:"contract_id"`
+	OracleSig  string  `json:"oracle_sig"`
+	TholdHash  string  `json:"thold_hash"`
+	TholdKey   *string `json:"thold_key"`
+	TholdPrice float64 `json:"thold_price"`
 }
 
 // Response types
@@ -499,12 +498,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 			contentData = map[string]interface{}{"raw": result.Content}
 		}
 
-		// Round down quote_price and latest_price to whole numbers
-		if quotePrice, ok := contentData["quote_price"].(float64); ok {
-			contentData["quote_price"] = float64(int64(quotePrice))
-		}
-		if latestPrice, ok := contentData["latest_price"].(float64); ok {
-			contentData["latest_price"] = float64(int64(latestPrice))
+		// Round down base_price to whole number (v3 PriceContract schema)
+		if basePrice, ok := contentData["base_price"].(float64); ok {
+			contentData["base_price"] = float64(int64(basePrice))
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -609,12 +605,9 @@ func handleCheck(w http.ResponseWriter, r *http.Request) {
 			contentData = map[string]interface{}{"raw": result.Content}
 		}
 
-		// Round down quote_price and latest_price to whole numbers
-		if quotePrice, ok := contentData["quote_price"].(float64); ok {
-			contentData["quote_price"] = float64(int64(quotePrice))
-		}
-		if latestPrice, ok := contentData["latest_price"].(float64); ok {
-			contentData["latest_price"] = float64(int64(latestPrice))
+		// Round down base_price to whole number (v3 PriceContract schema)
+		if basePrice, ok := contentData["base_price"].(float64); ok {
+			contentData["base_price"] = float64(int64(basePrice))
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -733,13 +726,13 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If completed, parse and round down quote_price
+	// If completed, parse and round down base_price (v3 PriceContract schema)
 	if pending.Status == "completed" && pending.Result != nil {
 		var contentData map[string]interface{}
 		if err := json.Unmarshal([]byte(pending.Result.Content), &contentData); err == nil {
-			// Round down quote_price to whole number
-			if quotePrice, ok := contentData["quote_price"].(float64); ok {
-				contentData["quote_price"] = float64(int64(quotePrice))
+			// Round down base_price to whole number
+			if basePrice, ok := contentData["base_price"].(float64); ok {
+				contentData["base_price"] = float64(int64(basePrice))
 			}
 
 			// Return modified content data directly
@@ -1243,9 +1236,9 @@ func getTag(tags [][]string, key string) string {
 }
 
 func getTholdHash(payload *WebhookPayload) string {
-	var priceEvent PriceEvent
-	json.Unmarshal([]byte(payload.Content), &priceEvent)
-	return priceEvent.TholdHash
+	var contract PriceContract
+	json.Unmarshal([]byte(payload.Content), &contract)
+	return contract.TholdHash
 }
 
 // Cleanup old completed/timed-out requests to prevent memory leak

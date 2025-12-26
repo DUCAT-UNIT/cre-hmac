@@ -119,30 +119,24 @@ func isValidHex(s string) bool {
 	return validHex.MatchString(s)
 }
 
-// PriceEvent represents a price threshold event (matches price-oracle structure)
-// Core price-oracle fields with DUCAT cryptographic extensions
-type PriceEvent struct {
-	// Core price event fields (from price-oracle PriceEvent)
-	EventOrigin  *string  `json:"event_origin"`   // nullable - null if not breached
-	EventPrice   *float64 `json:"event_price"`    // nullable - null if not breached
-	EventStamp   *int64   `json:"event_stamp"`    // nullable - null if not breached
-	EventType    string   `json:"event_type"`     // "active" or "breach"
-	LatestOrigin string   `json:"latest_origin"`  // current price origin
-	LatestPrice  float64  `json:"latest_price"`   // current price
-	LatestStamp  int64    `json:"latest_stamp"`   // current timestamp
-	QuoteOrigin  string   `json:"quote_origin"`   // quote creation origin
-	QuotePrice   float64  `json:"quote_price"`    // quote creation price
-	QuoteStamp   int64    `json:"quote_stamp"`    // quote creation timestamp
+// PriceContract represents a v3 price contract (extends PriceObservation extends PriceOracleConfig)
+// This is the core-ts PriceContract schema used in v3 branch
+type PriceContract struct {
+	// PriceOracleConfig
+	ChainNetwork string `json:"chain_network"` // Bitcoin network (main/test/mutiny)
+	OraclePubkey string `json:"oracle_pubkey"` // Server Schnorr public key (32 bytes hex)
 
-	// DUCAT cryptographic extensions (from price-oracle EventQuoteTemplate)
-	IsExpired  bool     `json:"is_expired"`  // true if threshold breached
-	SrvNetwork string   `json:"srv_network"` // Bitcoin network (Mainnet/Testnet/Mutinynet)
-	SrvPubkey  string   `json:"srv_pubkey"`  // Server Schnorr public key
-	TholdHash  string   `json:"thold_hash"`  // Hash160 commitment
-	TholdKey   *string  `json:"thold_key"`   // Secret (null if not breached, populated if breached)
-	TholdPrice float64  `json:"thold_price"` // Threshold price
-	ReqID      string   `json:"req_id"`      // Deterministic request ID
-	ReqSig     string   `json:"req_sig"`     // Schnorr signature of request ID
+	// PriceObservation
+	BasePrice float64 `json:"base_price"` // Quote creation price
+	BaseStamp int64   `json:"base_stamp"` // Quote creation timestamp
+
+	// PriceContract specific
+	CommitHash string  `json:"commit_hash"` // hash340(tag, preimage) - 32 bytes hex
+	ContractID string  `json:"contract_id"` // hash340(tag, commit||thold) - 32 bytes hex
+	OracleSig  string  `json:"oracle_sig"`  // Schnorr signature - 64 bytes hex
+	TholdHash  string  `json:"thold_hash"`  // Hash160 commitment - 20 bytes hex
+	TholdKey   *string `json:"thold_key"`   // Secret (null if sealed) - 32 bytes hex
+	TholdPrice float64 `json:"thold_price"` // Threshold price
 }
 
 // NostrEvent represents a Nostr NIP-01 event
