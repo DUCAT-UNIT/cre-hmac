@@ -357,14 +357,19 @@ Bottlenecks:
 }
 ```
 
-### CREATE Response
+### CREATE Response (PriceContract schema)
 ```json
 {
-  "quote_price": 106919.82,
+  "chain_network": "mutinynet",
+  "oracle_pubkey": "6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621",
+  "base_price": 106919.82,
+  "base_stamp": 1703289600,
+  "commit_hash": "a1b2c3d4e5f6...",
+  "contract_id": "contract-123",
+  "oracle_sig": "schnorr-signature-hex",
   "thold_hash": "fc176ec8edc32092ab1d19178eb3d117a6d6b114",
-  "thold_price": 94000.00,
-  "event_type": "active",
-  "is_expired": false
+  "thold_key": null,
+  "thold_price": 94000.00
 }
 ```
 
@@ -376,13 +381,36 @@ Bottlenecks:
 }
 ```
 
-### CHECK Response (breached)
+### CHECK Response (breached - reveals thold_key)
 ```json
 {
-  "event_type": "breach",
-  "is_expired": true,
-  "thold_key": "7ab425a0e38e8c2b...",
-  "current_price": 93500.50
+  "chain_network": "mutinynet",
+  "oracle_pubkey": "6b5008a293291c14effeb0e8b7c56a80ecb5ca7b801768e17ec93092be6c0621",
+  "base_price": 106919.82,
+  "base_stamp": 1703289600,
+  "commit_hash": "a1b2c3d4e5f6...",
+  "contract_id": "contract-123",
+  "oracle_sig": "schnorr-signature-hex",
+  "thold_hash": "fc176ec8edc32092ab1d19178eb3d117a6d6b114",
+  "thold_key": "7ab425a0e38e8c2b1d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c",
+  "thold_price": 94000.00
+}
+```
+
+### Type Schema (v3 PriceContract)
+
+```go
+type PriceContract struct {
+    ChainNetwork string  `json:"chain_network"` // "mutinynet" | "mainnet"
+    OraclePubkey string  `json:"oracle_pubkey"` // Oracle public key (hex)
+    BasePrice    float64 `json:"base_price"`    // BTC/USD at commitment
+    BaseStamp    int64   `json:"base_stamp"`    // Unix timestamp
+    CommitHash   string  `json:"commit_hash"`   // BIP-340 tagged hash
+    ContractID   string  `json:"contract_id"`   // Unique contract ID
+    OracleSig    string  `json:"oracle_sig"`    // Schnorr signature
+    TholdHash    string  `json:"thold_hash"`    // Hash160 commitment
+    TholdKey     *string `json:"thold_key"`     // Revealed on breach
+    TholdPrice   float64 `json:"thold_price"`   // Threshold price
 }
 ```
 
