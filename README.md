@@ -8,6 +8,38 @@ Creates Hash160 commitments to price thresholds that reveal their secret only wh
 
 **Example**: "If BTC drops below $94k, reveal secret X" - the threshold stays hidden until the price crosses it.
 
+## System Integration
+
+The CRE is a **reactive WASM module** - it responds to HTTP triggers from the Gateway/Regulator.
+
+### Endpoints (HTTP Triggers)
+
+| Trigger | Input | Action | Frequency |
+|---------|-------|--------|-----------|
+| **CREATE** | `{domain, thold_price}` | Create new threshold commitment | On-demand |
+| **CHECK** | `{domain, thold_hash}` | Check if price breached threshold | Every 90s (liquidation poll) |
+| **Cron** | (scheduled) | Generate batch quotes at all collateral levels | Every 1.5min |
+
+### Type Schema (v2.5 - matches client-sdk)
+
+All prices are `float64` because HMAC computation uses `%.8f` formatting. Timestamps are `int64`.
+
+```go
+type PriceEvent struct {
+    QuotePrice float64  `json:"quote_price"`   // BTC/USD at quote creation
+    QuoteStamp int64    `json:"quote_stamp"`   // Unix timestamp
+    OraclePK   string   `json:"oracle_pk"`     // Oracle public key
+    ReqID      string   `json:"req_id"`        // Request ID hash
+    ReqSig     string   `json:"req_sig"`       // Schnorr signature
+    TholdHash  string   `json:"thold_hash"`    // Hash160 commitment
+    TholdPrice float64  `json:"thold_price"`   // Threshold price
+    IsExpired  bool     `json:"is_expired"`    // True if breached
+    EvalPrice  *float64 `json:"eval_price"`    // Price at breach (null if active)
+    EvalStamp  *int64   `json:"eval_stamp"`    // Timestamp at breach (null if active)
+    TholdKey   *string  `json:"thold_key"`     // Secret (null until breached)
+}
+```
+
 ## Architecture
 
 ```
