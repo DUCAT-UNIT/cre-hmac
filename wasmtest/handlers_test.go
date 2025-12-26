@@ -127,18 +127,21 @@ func TestSimulateCreateQuote(t *testing.T) {
 				t.Error("TholdKey should be nil for active quote")
 			}
 
-			// Verify crypto fields
+			// Verify v2.5 fields
 			if !shared.IsValidTholdHash(priceEvent.TholdHash) {
 				t.Errorf("Invalid TholdHash: %s", priceEvent.TholdHash)
 			}
-			if !shared.IsValidCommitHash(priceEvent.CommitHash) {
-				t.Errorf("Invalid CommitHash: %s", priceEvent.CommitHash)
+			if priceEvent.ReqID == "" {
+				t.Error("ReqID should not be empty")
 			}
-			if !shared.IsValidContractID(priceEvent.ContractID) {
-				t.Errorf("Invalid ContractID: %s", priceEvent.ContractID)
+			if !shared.IsValidOracleSig(priceEvent.ReqSig) {
+				t.Errorf("Invalid ReqSig: %s", priceEvent.ReqSig)
 			}
-			if !shared.IsValidOracleSig(priceEvent.OracleSig) {
-				t.Errorf("Invalid OracleSig: %s", priceEvent.OracleSig)
+			if priceEvent.SrvNetwork != "main" && priceEvent.SrvNetwork != "test" {
+				t.Errorf("Invalid SrvNetwork: %s", priceEvent.SrvNetwork)
+			}
+			if !shared.IsValidSchnorrPubkey(priceEvent.SrvPubkey) {
+				t.Errorf("Invalid SrvPubkey: %s", priceEvent.SrvPubkey)
 			}
 		})
 	}

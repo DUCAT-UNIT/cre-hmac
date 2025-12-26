@@ -90,8 +90,10 @@ type BatchGeneratedInfo struct {
 	BaseStamp int64 `json:"base_stamp"` // Timestamp when batch was generated
 }
 
-// PriceContractResponse matches core-ts PriceContract schema exactly
-// This is the format sent to the gateway - no transformation needed
+// PriceContractResponse is the INTERNAL format for Nostr event storage.
+// Contains fields needed for cryptographic verification (commit_hash, contract_id, etc).
+// For v2.5 branch: Convert to shared.PriceEvent before sending to gateway/clients.
+// For v3 branch: Send directly as the API response format.
 type PriceContractResponse struct {
 	// PriceObservation fields (from core-ts)
 	ChainNetwork string `json:"chain_network"` // Bitcoin network
@@ -108,18 +110,39 @@ type PriceContractResponse struct {
 	TholdPrice int64   `json:"thold_price"` // Threshold price
 }
 
-// ToPriceContractResponse converts PriceEvent to PriceContractResponse
-func ToPriceContractResponse(p *PriceEvent) *PriceContractResponse {
-	return &PriceContractResponse{
-		ChainNetwork: p.ChainNetwork,
-		OraclePubkey: p.OraclePubkey,
-		BasePrice:    p.BasePrice,
-		BaseStamp:    p.BaseStamp,
-		CommitHash:   p.CommitHash,
-		ContractID:   p.ContractID,
-		OracleSig:    p.OracleSig,
-		TholdHash:    p.TholdHash,
-		TholdKey:     p.TholdKey,
-		TholdPrice:   int64(p.TholdPrice),
+// ToPriceEvent converts PriceContractResponse to v2.5 PriceEvent format.
+// Used on main/v2.5 branch for gateway webhook responses.
+func (p *PriceContractResponse) ToPriceEvent(network string) *shared.PriceEvent {
+	origin := "cre" // Origin is always "cre" for CRE-generated quotes
+	return &shared.PriceEvent{
+		// Server identity
+		SrvNetwork: network,
+		SrvPubkey:  p.OraclePubkey,
+
+		// Quote price (at commitment creation)
+		QuoteOrigin: origin,
+		QuotePrice:  float64(p.BasePrice),
+		QuoteStamp:  p.BaseStamp,
+
+		// Latest price (same as quote for new quotes)
+		LatestOrigin: origin,
+		LatestPrice:  float64(p.BasePrice),
+		LatestStamp:  p.BaseStamp,
+
+		// Event (null for active quotes)
+		EventOrigin: nil,
+		EventPrice:  nil,
+		EventStamp:  nil,
+		EventType:   "active",
+
+		// Threshold commitment
+		TholdHash:  p.TholdHash,
+		TholdKey:   p.TholdKey,
+		TholdPrice: float64(p.TholdPrice),
+
+		// State & signatures
+		IsExpired: p.TholdKey != nil, // Expired if thold_key is revealed
+		ReqID:     p.CommitHash,      // Use commit_hash as request ID
+		ReqSig:    p.OracleSig,       // Use oracle_sig as request signature
 	}
 }

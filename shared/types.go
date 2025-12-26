@@ -430,46 +430,45 @@ type GenerateQuotesResponse struct {
 	GeneratedAt int64    `json:"generated_at"`
 }
 
-// PriceEvent represents a price threshold event
-// Aligned with core-ts PriceContract schema for client-sdk compatibility.
+// PriceEvent represents a price threshold event (v2.5 schema)
+// Aligned with client-sdk@0.7.23 QuoteTemplate schema.
 //
 // Price Truncation Behavior:
-// Prices are stored as int64 (BasePrice) for consistency with TypeScript's number type
-// and for deterministic hashing. Float64 prices like 100234.56 are truncated to 100234
-// when converted to uint32 for cryptographic operations (hash preimages, signatures).
+// Prices are stored as float64 for consistency with TypeScript's number type.
+// Float64 prices like 100234.56 are truncated to 100234 when converted to
+// uint32 for cryptographic operations (hash preimages, signatures).
 // This matches the TypeScript core-ts implementation which uses Buff.num(value, 4) for
 // 4-byte big-endian encoding. Fractional cents are intentionally discarded.
 type PriceEvent struct {
-	// Core price event fields
-	EventOrigin  *string  `json:"event_origin"`
-	EventPrice   *float64 `json:"event_price"`
-	EventStamp   *int64   `json:"event_stamp"`
-	EventType    string   `json:"event_type"`
-	LatestOrigin string   `json:"latest_origin"`
-	LatestPrice  float64  `json:"latest_price"`
-	LatestStamp  int64    `json:"latest_stamp"`
-	QuoteOrigin  string   `json:"quote_origin"`
-	QuotePrice   float64  `json:"quote_price"`
-	QuoteStamp   int64    `json:"quote_stamp"`
+	// Server identity
+	SrvNetwork string `json:"srv_network"` // "main" | "test"
+	SrvPubkey  string `json:"srv_pubkey"`  // Oracle public key (hex)
 
-	// Core-ts PriceContract fields (for client-sdk compatibility)
-	ChainNetwork string  `json:"chain_network"`
-	OraclePubkey string  `json:"oracle_pubkey"`
-	BasePrice    int64   `json:"base_price"`
-	BaseStamp    int64   `json:"base_stamp"`
-	CommitHash   string  `json:"commit_hash"`
-	ContractID   string  `json:"contract_id"`
-	OracleSig    string  `json:"oracle_sig"`
-	TholdHash    string  `json:"thold_hash"`
-	TholdKey     *string `json:"thold_key"`
-	TholdPrice   float64 `json:"thold_price"`
+	// Quote price (at commitment creation)
+	QuoteOrigin string  `json:"quote_origin"` // "link" | "nostr" | "cre"
+	QuotePrice  float64 `json:"quote_price"`  // BTC/USD price
+	QuoteStamp  int64   `json:"quote_stamp"`  // Unix timestamp
 
-	// Legacy fields (kept for backwards compatibility during transition)
-	IsExpired  bool   `json:"is_expired"`
-	SrvNetwork string `json:"srv_network"`
-	SrvPubkey  string `json:"srv_pubkey"`
-	ReqID      string `json:"req_id"`
-	ReqSig     string `json:"req_sig"`
+	// Latest price (most recent observation)
+	LatestOrigin string  `json:"latest_origin"`
+	LatestPrice  float64 `json:"latest_price"`
+	LatestStamp  int64   `json:"latest_stamp"`
+
+	// Event price (at breach, if any)
+	EventOrigin *string  `json:"event_origin"`
+	EventPrice  *float64 `json:"event_price"`
+	EventStamp  *int64   `json:"event_stamp"`
+	EventType   string   `json:"event_type"` // "active" | "breach"
+
+	// Threshold commitment
+	TholdHash  string  `json:"thold_hash"`  // Hash160 (20 bytes hex)
+	TholdKey   *string `json:"thold_key"`   // Revealed on breach
+	TholdPrice float64 `json:"thold_price"` // Threshold price
+
+	// State & signatures
+	IsExpired bool   `json:"is_expired"`
+	ReqID     string `json:"req_id"` // Request ID hash
+	ReqSig    string `json:"req_sig"` // Schnorr signature
 }
 
 // IsBreached returns true if the price event represents a breach
@@ -482,7 +481,7 @@ func (p *PriceEvent) IsActive() bool {
 	return p.EventType == EventTypeActive
 }
 
-// Validate validates the price event fields
+// Validate validates the price event fields (v2.5 schema)
 func (p *PriceEvent) Validate() error {
 	if p == nil {
 		return fmt.Errorf("price event is nil")
@@ -493,17 +492,17 @@ func (p *PriceEvent) Validate() error {
 	if !IsValidTholdHash(p.TholdHash) {
 		return fmt.Errorf("invalid thold_hash: %s", p.TholdHash)
 	}
-	if !IsValidCommitHash(p.CommitHash) {
-		return fmt.Errorf("invalid commit_hash: %s", p.CommitHash)
+	if !IsValidSchnorrPubkey(p.SrvPubkey) {
+		return fmt.Errorf("invalid srv_pubkey: %s", p.SrvPubkey)
 	}
-	if !IsValidContractID(p.ContractID) {
-		return fmt.Errorf("invalid contract_id: %s", p.ContractID)
+	if p.SrvNetwork != "main" && p.SrvNetwork != "test" {
+		return fmt.Errorf("invalid srv_network: %s (must be 'main' or 'test')", p.SrvNetwork)
 	}
-	if !IsValidOracleSig(p.OracleSig) {
-		return fmt.Errorf("invalid oracle_sig: %s", p.OracleSig)
+	if p.ReqID == "" {
+		return fmt.Errorf("req_id required")
 	}
-	if !IsValidSchnorrPubkey(p.OraclePubkey) {
-		return fmt.Errorf("invalid oracle_pubkey: %s", p.OraclePubkey)
+	if !IsValidOracleSig(p.ReqSig) {
+		return fmt.Errorf("invalid req_sig: %s", p.ReqSig)
 	}
 	if p.IsBreached() && p.TholdKey == nil {
 		return fmt.Errorf("breached event must have thold_key")

@@ -266,30 +266,43 @@ func (w *WorkflowSimulator) SimulateCreateQuote(domain string, tholdPrice float6
 		return nil, fmt.Errorf("signing failed: %w", err)
 	}
 
-	// Build PriceEvent
+	// Map network to srv_network
+	srvNetwork := "main"
+	if w.Config.Network == "mutiny" || w.Config.Network == "testnet" || w.Config.Network == "signet" {
+		srvNetwork = "test"
+	}
+
+	// Build PriceEvent (v2.5 format)
 	eventData := shared.PriceEvent{
-		EventType:    shared.EventTypeActive,
+		// Server identity
+		SrvNetwork: srvNetwork,
+		SrvPubkey:  kd.SchnorrPubkey,
+
+		// Quote price
+		QuoteOrigin: priceData.Origin,
+		QuotePrice:  currentPrice,
+		QuoteStamp:  priceData.Stamp,
+
+		// Latest price
 		LatestOrigin: priceData.Origin,
 		LatestPrice:  currentPrice,
 		LatestStamp:  priceData.Stamp,
-		QuoteOrigin:  priceData.Origin,
-		QuotePrice:   currentPrice,
-		QuoteStamp:   priceData.Stamp,
-		ChainNetwork: w.Config.Network,
-		OraclePubkey: kd.SchnorrPubkey,
-		BasePrice:    int64(currentPrice),
-		BaseStamp:    priceData.Stamp,
-		CommitHash:   contract.CommitHash,
-		ContractID:   contract.ContractID,
-		OracleSig:    oracleSig,
-		TholdHash:    contract.TholdHash,
-		TholdKey:     nil,
-		TholdPrice:   tholdPrice,
-		IsExpired:    false,
-		SrvNetwork:   w.Config.Network,
-		SrvPubkey:    kd.SchnorrPubkey,
-		ReqID:        contract.ContractID,
-		ReqSig:       oracleSig,
+
+		// Event (null for active)
+		EventOrigin: nil,
+		EventPrice:  nil,
+		EventStamp:  nil,
+		EventType:   shared.EventTypeActive,
+
+		// Threshold commitment
+		TholdHash:  contract.TholdHash,
+		TholdKey:   nil,
+		TholdPrice: tholdPrice,
+
+		// State & signatures
+		IsExpired: false,
+		ReqID:     contract.CommitHash,
+		ReqSig:    oracleSig,
 	}
 
 	eventJSON, _ := json.Marshal(eventData)
@@ -391,33 +404,37 @@ func (w *WorkflowSimulator) SimulateCheckQuote(domain string, tholdHash string) 
 		return nil, fmt.Errorf("signing failed: %w", err)
 	}
 
-	// Build breach event
+	// Build breach event (v2.5 format)
 	breachData := shared.PriceEvent{
-		EventOrigin:  &priceData.Origin,
-		EventPrice:   &currentPrice,
-		EventStamp:   &priceData.Stamp,
-		EventType:    shared.EventTypeBreach,
+		// Server identity
+		SrvNetwork: originalData.SrvNetwork,
+		SrvPubkey:  originalData.SrvPubkey,
+
+		// Quote price (original)
+		QuoteOrigin: originalData.QuoteOrigin,
+		QuotePrice:  originalData.QuotePrice,
+		QuoteStamp:  originalData.QuoteStamp,
+
+		// Latest price
 		LatestOrigin: priceData.Origin,
 		LatestPrice:  currentPrice,
 		LatestStamp:  priceData.Stamp,
-		QuoteOrigin:  originalData.QuoteOrigin,
-		QuotePrice:   originalData.QuotePrice,
-		QuoteStamp:   originalData.QuoteStamp,
-		ChainNetwork: originalData.ChainNetwork,
-		OraclePubkey: originalData.OraclePubkey,
-		BasePrice:    originalData.BasePrice,
-		BaseStamp:    originalData.BaseStamp,
-		CommitHash:   commitHash,
-		ContractID:   contractID,
-		OracleSig:    oracleSig,
-		TholdHash:    originalData.TholdHash,
-		TholdKey:     &tholdSecret,
-		TholdPrice:   originalData.TholdPrice,
-		IsExpired:    true,
-		SrvNetwork:   originalData.SrvNetwork,
-		SrvPubkey:    originalData.SrvPubkey,
-		ReqID:        contractID,
-		ReqSig:       oracleSig,
+
+		// Event (breach)
+		EventOrigin: &priceData.Origin,
+		EventPrice:  &currentPrice,
+		EventStamp:  &priceData.Stamp,
+		EventType:   shared.EventTypeBreach,
+
+		// Threshold commitment
+		TholdHash:  originalData.TholdHash,
+		TholdKey:   &tholdSecret,
+		TholdPrice: originalData.TholdPrice,
+
+		// State & signatures
+		IsExpired: true,
+		ReqID:     commitHash,
+		ReqSig:    oracleSig,
 	}
 
 	breachJSON, _ := json.Marshal(breachData)
@@ -553,33 +570,37 @@ func (w *WorkflowSimulator) SimulateEvaluateQuotes(tholdHashes []string) (*share
 			continue
 		}
 
-		// Build and publish breach event
+		// Build and publish breach event (v2.5 format)
 		breachData := shared.PriceEvent{
-			EventOrigin:  &priceData.Origin,
-			EventPrice:   &currentPrice,
-			EventStamp:   &currentStamp,
-			EventType:    shared.EventTypeBreach,
+			// Server identity
+			SrvNetwork: originalData.SrvNetwork,
+			SrvPubkey:  originalData.SrvPubkey,
+
+			// Quote price (original)
+			QuoteOrigin: originalData.QuoteOrigin,
+			QuotePrice:  originalData.QuotePrice,
+			QuoteStamp:  originalData.QuoteStamp,
+
+			// Latest price
 			LatestOrigin: priceData.Origin,
 			LatestPrice:  currentPrice,
 			LatestStamp:  currentStamp,
-			QuoteOrigin:  originalData.QuoteOrigin,
-			QuotePrice:   originalData.QuotePrice,
-			QuoteStamp:   originalData.QuoteStamp,
-			ChainNetwork: originalData.ChainNetwork,
-			OraclePubkey: originalData.OraclePubkey,
-			BasePrice:    originalData.BasePrice,
-			BaseStamp:    originalData.BaseStamp,
-			CommitHash:   commitHash,
-			ContractID:   contractID,
-			OracleSig:    oracleSig,
-			TholdHash:    originalData.TholdHash,
-			TholdKey:     &tholdSecret,
-			TholdPrice:   originalData.TholdPrice,
-			IsExpired:    true,
-			SrvNetwork:   originalData.SrvNetwork,
-			SrvPubkey:    originalData.SrvPubkey,
-			ReqID:        contractID,
-			ReqSig:       oracleSig,
+
+			// Event (breach)
+			EventOrigin: &priceData.Origin,
+			EventPrice:  &currentPrice,
+			EventStamp:  &currentStamp,
+			EventType:   shared.EventTypeBreach,
+
+			// Threshold commitment
+			TholdHash:  originalData.TholdHash,
+			TholdKey:   &tholdSecret,
+			TholdPrice: originalData.TholdPrice,
+
+			// State & signatures
+			IsExpired: true,
+			ReqID:     commitHash,
+			ReqSig:    oracleSig,
 		}
 
 		breachJSON, _ := json.Marshal(breachData)
@@ -665,28 +686,43 @@ func (w *WorkflowSimulator) SimulateGenerateQuotes(req *shared.GenerateQuotesReq
 			continue
 		}
 
+		// Map network to srv_network
+		srvNetwork := "main"
+		if w.Config.Network == "mutiny" || w.Config.Network == "testnet" || w.Config.Network == "signet" {
+			srvNetwork = "test"
+		}
+
+		// Build PriceEvent (v2.5 format)
 		eventData := shared.PriceEvent{
-			EventType:    shared.EventTypeActive,
+			// Server identity
+			SrvNetwork: srvNetwork,
+			SrvPubkey:  kd.SchnorrPubkey,
+
+			// Quote price
+			QuoteOrigin: priceData.Origin,
+			QuotePrice:  currentPrice,
+			QuoteStamp:  quoteStamp,
+
+			// Latest price
 			LatestOrigin: priceData.Origin,
 			LatestPrice:  currentPrice,
 			LatestStamp:  priceData.Stamp,
-			QuoteOrigin:  priceData.Origin,
-			QuotePrice:   currentPrice,
-			QuoteStamp:   quoteStamp,
-			ChainNetwork: w.Config.Network,
-			OraclePubkey: kd.SchnorrPubkey,
-			BasePrice:    int64(currentPrice),
-			BaseStamp:    quoteStamp,
-			CommitHash:   contract.CommitHash,
-			ContractID:   contract.ContractID,
-			OracleSig:    oracleSig,
-			TholdHash:    contract.TholdHash,
-			TholdPrice:   tholdPrice,
-			IsExpired:    false,
-			SrvNetwork:   w.Config.Network,
-			SrvPubkey:    kd.SchnorrPubkey,
-			ReqID:        contract.ContractID,
-			ReqSig:       oracleSig,
+
+			// Event (null for active)
+			EventOrigin: nil,
+			EventPrice:  nil,
+			EventStamp:  nil,
+			EventType:   shared.EventTypeActive,
+
+			// Threshold commitment
+			TholdHash:  contract.TholdHash,
+			TholdKey:   nil,
+			TholdPrice: tholdPrice,
+
+			// State & signatures
+			IsExpired: false,
+			ReqID:     contract.CommitHash,
+			ReqSig:    oracleSig,
 		}
 
 		eventJSON, _ := json.Marshal(eventData)

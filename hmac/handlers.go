@@ -921,13 +921,21 @@ func generateQuotesParallel(wc *WorkflowConfig, runtime cre.Runtime, requestData
 func sendWebhookCallback(config *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, event *NostrEvent, priceContract *PriceContractResponse, eventType string) {
 	logger.Info("Sending webhook callback", "url", callbackURL, "eventType", eventType)
 
-	// Prepare callback payload with price_contract at top level
+	// Convert to v2.5 PriceEvent format for gateway
+	// Map network to srv_network: "mutiny" -> "test", others -> "main"
+	srvNetwork := "main"
+	if config.Network == "mutiny" || config.Network == "testnet" || config.Network == "signet" {
+		srvNetwork = "test"
+	}
+	priceEvent := priceContract.ToPriceEvent(srvNetwork)
+
+	// Prepare callback payload with v2.5 price_event at top level
 	callbackPayload := map[string]interface{}{
-		"event_type":     eventType,
-		"event_id":       event.ID,
-		"domain":         getDomainFromTags(event.Tags),
-		"thold_hash":     priceContract.TholdHash,
-		"price_contract": priceContract,
+		"event_type":  eventType,
+		"event_id":    event.ID,
+		"domain":      getDomainFromTags(event.Tags),
+		"thold_hash":  priceContract.TholdHash,
+		"price_event": priceEvent, // v2.5 format
 	}
 
 	callbackJSON, err := json.Marshal(callbackPayload)

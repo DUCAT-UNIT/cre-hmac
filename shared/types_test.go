@@ -477,13 +477,14 @@ func TestEvaluateQuotesResponseMethods(t *testing.T) {
 func TestPriceEventValidate(t *testing.T) {
 	validKey := strings.Repeat("a", 64)
 	validEvent := PriceEvent{
-		EventType:    EventTypeBreach,
-		TholdHash:    strings.Repeat("b", 40),
-		CommitHash:   strings.Repeat("c", 64),
-		ContractID:   strings.Repeat("d", 64),
-		OracleSig:    strings.Repeat("e", 128),
-		OraclePubkey: strings.Repeat("f", 64),
-		TholdKey:     &validKey,
+		// v2.5 fields
+		SrvNetwork: "main",
+		SrvPubkey:  strings.Repeat("f", 64),
+		EventType:  EventTypeBreach,
+		TholdHash:  strings.Repeat("b", 40),
+		ReqID:      strings.Repeat("c", 64),
+		ReqSig:     strings.Repeat("e", 128),
+		TholdKey:   &validKey,
 	}
 
 	tests := []struct {
@@ -503,10 +504,10 @@ func TestPriceEventValidate(t *testing.T) {
 		{"nil event", nil, true, "is nil"},
 		{"invalid event_type", func() *PriceEvent { e := validEvent; e.EventType = "invalid"; return &e }(), true, "invalid event_type"},
 		{"invalid thold_hash", func() *PriceEvent { e := validEvent; e.TholdHash = "bad"; return &e }(), true, "invalid thold_hash"},
-		{"invalid commit_hash", func() *PriceEvent { e := validEvent; e.CommitHash = "bad"; return &e }(), true, "invalid commit_hash"},
-		{"invalid contract_id", func() *PriceEvent { e := validEvent; e.ContractID = "bad"; return &e }(), true, "invalid contract_id"},
-		{"invalid oracle_sig", func() *PriceEvent { e := validEvent; e.OracleSig = "bad"; return &e }(), true, "invalid oracle_sig"},
-		{"invalid oracle_pubkey", func() *PriceEvent { e := validEvent; e.OraclePubkey = "bad"; return &e }(), true, "invalid oracle_pubkey"},
+		{"invalid srv_pubkey", func() *PriceEvent { e := validEvent; e.SrvPubkey = "bad"; return &e }(), true, "invalid srv_pubkey"},
+		{"invalid srv_network", func() *PriceEvent { e := validEvent; e.SrvNetwork = "invalid"; return &e }(), true, "invalid srv_network"},
+		{"missing req_id", func() *PriceEvent { e := validEvent; e.ReqID = ""; return &e }(), true, "req_id required"},
+		{"invalid req_sig", func() *PriceEvent { e := validEvent; e.ReqSig = "bad"; return &e }(), true, "invalid req_sig"},
 		{"breach without key", func() *PriceEvent { e := validEvent; e.TholdKey = nil; return &e }(), true, "must have thold_key"},
 		{"invalid thold_key", func() *PriceEvent {
 			e := validEvent
@@ -723,13 +724,14 @@ func BenchmarkGenerateQuotesRequestValidate(b *testing.B) {
 func BenchmarkPriceEventValidate(b *testing.B) {
 	key := strings.Repeat("a", 64)
 	event := PriceEvent{
-		EventType:    EventTypeBreach,
-		TholdHash:    strings.Repeat("b", 40),
-		CommitHash:   strings.Repeat("c", 64),
-		ContractID:   strings.Repeat("d", 64),
-		OracleSig:    strings.Repeat("e", 128),
-		OraclePubkey: strings.Repeat("f", 64),
-		TholdKey:     &key,
+		// v2.5 fields
+		SrvNetwork: "main",
+		SrvPubkey:  strings.Repeat("f", 64),
+		EventType:  EventTypeBreach,
+		TholdHash:  strings.Repeat("b", 40),
+		ReqID:      strings.Repeat("c", 64),
+		ReqSig:     strings.Repeat("e", 128),
+		TholdKey:   &key,
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
