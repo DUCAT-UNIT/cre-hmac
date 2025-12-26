@@ -20,23 +20,41 @@ The CRE is a **reactive WASM module** - it responds to HTTP triggers from the Ga
 | **CHECK** | `{domain, thold_hash}` | Check if price breached threshold | Every 90s (liquidation poll) |
 | **Cron** | (scheduled) | Generate batch quotes at all collateral levels | Every 1.5min |
 
-### Type Schema (v2.5 - matches client-sdk)
+### Type Schema (v2.5 PriceQuote)
 
 All prices are `float64` because HMAC computation uses `%.8f` formatting. Timestamps are `int64`.
 
 ```go
-type PriceEvent struct {
-    QuotePrice float64  `json:"quote_price"`   // BTC/USD at quote creation
-    QuoteStamp int64    `json:"quote_stamp"`   // Unix timestamp
-    OraclePK   string   `json:"oracle_pk"`     // Oracle public key
-    ReqID      string   `json:"req_id"`        // Request ID hash
-    ReqSig     string   `json:"req_sig"`       // Schnorr signature
-    TholdHash  string   `json:"thold_hash"`    // Hash160 commitment
-    TholdPrice float64  `json:"thold_price"`   // Threshold price
-    IsExpired  bool     `json:"is_expired"`    // True if breached
-    EvalPrice  *float64 `json:"eval_price"`    // Price at breach (null if active)
-    EvalStamp  *int64   `json:"eval_stamp"`    // Timestamp at breach (null if active)
-    TholdKey   *string  `json:"thold_key"`     // Secret (null until breached)
+type PriceQuote struct {
+    // Server identity
+    SrvNetwork   string   `json:"srv_network"`   // "main" | "test"
+    SrvPubkey    string   `json:"srv_pubkey"`    // Oracle public key (hex)
+
+    // Quote price (at commitment creation)
+    QuoteOrigin  string   `json:"quote_origin"`  // "link" | "nostr" | "cre"
+    QuotePrice   float64  `json:"quote_price"`   // BTC/USD price
+    QuoteStamp   int64    `json:"quote_stamp"`   // Unix timestamp
+
+    // Latest price (most recent observation)
+    LatestOrigin string   `json:"latest_origin"`
+    LatestPrice  float64  `json:"latest_price"`
+    LatestStamp  int64    `json:"latest_stamp"`
+
+    // Event price (at breach, if any)
+    EventOrigin  *string  `json:"event_origin"`
+    EventPrice   *float64 `json:"event_price"`
+    EventStamp   *int64   `json:"event_stamp"`
+    EventType    string   `json:"event_type"`    // "active" | "breach"
+
+    // Threshold commitment
+    TholdHash    string   `json:"thold_hash"`    // Hash160 (20 bytes hex)
+    TholdKey     *string  `json:"thold_key"`     // Revealed on breach
+    TholdPrice   float64  `json:"thold_price"`
+
+    // State & signatures
+    IsExpired    bool     `json:"is_expired"`
+    ReqID        string   `json:"req_id"`        // Request ID hash
+    ReqSig       string   `json:"req_sig"`       // Schnorr signature
 }
 ```
 
