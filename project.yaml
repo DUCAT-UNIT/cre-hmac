@@ -36,7 +36,7 @@ production-testnet:
   cre-cli:
     don-family: "zone-a"
   account:
-    workflow-owner-address: "0x531c76d8c5ed926d0d735605481289393fb41397"
+    workflow-owner-address: "0x8b9eDA4BC340cD9daF11641C8162ec28f155D837"
   rpcs:
     - chain-name: ethereum-testnet-sepolia
       url: https://ethereum-sepolia-rpc.publicnode.com

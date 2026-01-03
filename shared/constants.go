@@ -14,9 +14,9 @@ const (
 
 	// Batch processing limits
 	// MaxBatchSize limits the number of quotes that can be evaluated or generated in a single request.
-	// This prevents excessive parallel HTTP requests to external services.
-	// Note: The CRE SDK manages actual concurrency; this is a request-level limit.
-	MaxBatchSize = 100
+	// CRE has a 30KB max request size. Each thold_hash is ~45 bytes, so max ~650 per request.
+	// Using 500 for safety margin with JSON-RPC wrapper overhead.
+	MaxBatchSize = 500
 
 	// MaxParallelRequests is the recommended limit for concurrent HTTP requests within a single
 	// workflow execution. The CRE runtime may enforce its own limits, but handlers should

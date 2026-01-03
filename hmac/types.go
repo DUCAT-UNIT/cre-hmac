@@ -42,8 +42,12 @@ type PriceEvent = shared.PriceEvent
 // NostrEvent is an alias for shared.NostrEvent
 type NostrEvent = shared.NostrEvent
 
-// RelayResponse is an alias for shared.RelayResponse
-type RelayResponse = shared.RelayResponse
+// RelayResponse is WASM-specific with consensus_aggregation tags
+// This replaces the shared.RelayResponse alias to support CRE consensus
+type RelayResponse struct {
+	Success bool   `json:"success" consensus_aggregation:"identical"`
+	Message string `json:"message" consensus_aggregation:"identical"`
+}
 
 // =============================================================================
 // Validation Function Aliases
