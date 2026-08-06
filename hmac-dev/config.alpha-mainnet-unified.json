@@ -1,0 +1,23 @@
+{
+  "client_id": "49f249ad-788f-4297-890e-7f5522036c6d",
+  "data_stream_url": "https://api.testnet-dataengine.chain.link",
+  "feed_id": "0x00039289090691a1df986e2e2e96670f6435b9a1f913d2306973842db65a9722",
+  "relay_url": "https://relay-mainnet.alpha.ducatprotocol.com",
+  "network": "alpha-mainnet",
+  "authorized_key": "0x8b9eDA4BC340cD9daF11641C8162ec28f155D837",
+  "cron_schedule": "0 * * * * *",
+  "rate_min": 1.36,
+  "rate_max": 10.00,
+  "step_size": 0.01,
+  "liquidation_thold": 1.35,
+  "quote_domain": "mainnet-alpha-rate-1.36-10.00-v1",
+  "deployment_nonce": "alpha-2026-07-02-verified-btc-feed-v1",
+  "report_signers": [
+    "0x6b23132dece4da06571ba9149e2986549cb5fb30",
+    "0x72cce7298ae2f6e516be2f2343ebedf863548d12",
+    "0x87abf51625b8587a8b331b305d026bb48772a20c",
+    "0xdd3210a31d062cada9f37c69305032b7e5594e25"
+  ],
+  "report_signer_threshold": 2,
+  "require_report_verification": true
+}

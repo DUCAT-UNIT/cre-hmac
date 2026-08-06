@@ -1,0 +1,23 @@
+# CRE H1-TESTER workflow.
+#
+# A MINIMAL tester that fetches ONE real Chainlink Data Streams report (using the
+# same HMAC-SHA256-authenticated fetch as hmac-dev/price.go), decodes it with the
+# new ducat/datastream H1 verification code, and LOGS the decoded price + each
+# recovered DON signer address (prefixed "H1-TESTER") so the operator can compare
+# them against the on-chain Verifier signer set.
+#
+# Run it with:
+#   cre workflow simulate cre-tester -T local-simulation \
+#     --trigger-index 0 --http-payload '{}'
+#
+# It uses a SINGLE HTTP trigger. The payload is ignored — any trivial input fires
+# the test. This diagnostic never needs the oracle signing key, so its dedicated
+# secrets file requests only client_secret from the CRE vault.
+
+local-simulation:
+  user-workflow:
+    workflow-name: "h1-tester"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.tester.json"
+    secrets-path: "./secrets.yaml"

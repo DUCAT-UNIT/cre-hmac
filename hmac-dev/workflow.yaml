@@ -1,0 +1,53 @@
+# DUCAT DEV CRE Workflow Configuration (unified)
+#
+# One workflow does everything per cron tick:
+#   1. fetch BTC/USD from Chainlink Data Streams
+#   2. apply any active price adjustment
+#   3. publish kind-10001 pending snapshot
+#   4. publish full kind-30000 ladder (chunked)
+#   5. publish kind-10000 current snapshot
+#
+# HTTP trigger actions (unchanged from the 3-workflow split):
+#   thold_price present  → create new quote
+#   action=evaluate      → batch evaluate quotes
+#   action=adjust        → set price adjustment (pct + duration)
+#   action=clear_adjust  → clear active adjustment immediately
+#   action=status        → check current adjustment state
+
+local-simulation:
+  user-workflow:
+    workflow-name: "mutinynet"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.dev-unified.json"
+    secrets-path: "../secrets.yaml"
+
+
+mutiny:
+  user-workflow:
+    workflow-name: "mutinynet"
+    deployment-registry: "onchain:ethereum-mainnet"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.dev-unified.json"
+    secrets-path: "../secrets.yaml"
+
+
+testnet4:
+  user-workflow:
+    workflow-name: "testnet4"
+    deployment-registry: "onchain:ethereum-mainnet"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.testnet4-unified.json"
+    secrets-path: "../secrets.yaml"
+
+
+alpha-mainnet:
+  user-workflow:
+    workflow-name: "alpha"
+    deployment-registry: "onchain:ethereum-mainnet"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.alpha-mainnet-unified.json"
+    secrets-path: "../secrets.yaml"

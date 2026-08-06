@@ -1,0 +1,43 @@
+name: Security checks
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  go-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Test, including credential-literal regression gate
+        run: go test -count=1 ./...
+
+      - name: Race test
+        run: go test -race -count=1 ./...
+
+      - name: Vet host code
+        run: go vet ./...
+
+      - name: Vet and build deployable WASM workflows
+        run: |
+          GOOS=wasip1 GOARCH=wasm go vet ./hmac-dev ./hmac ./cre-tester
+          GOOS=wasip1 GOARCH=wasm go build -o /tmp/hmac-dev.wasm ./hmac-dev
+          GOOS=wasip1 GOARCH=wasm go build -o /tmp/hmac.wasm ./hmac
+          GOOS=wasip1 GOARCH=wasm go build -o /tmp/cre-tester.wasm ./cre-tester

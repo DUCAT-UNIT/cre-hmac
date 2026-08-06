@@ -1,0 +1,39 @@
+# DUCAT CRE Workflow Configuration
+#
+# Handlers:
+# - createQuote: Create new price threshold commitment (HTTP trigger)
+# - evaluateQuotes: Batch evaluate multiple quotes for breach (HTTP trigger)
+# - generateQuotesParallel: Auto-generate quotes at price intervals (Cron trigger)
+#
+# HTTP Trigger Actions:
+# - thold_price present: Create new quote
+# - action=evaluate + thold_hashes[]: Batch evaluate quotes
+#
+# Cron Schedule (in config.json):
+# - "0 */2 * * * *": Every 2 minutes at second 0
+# - "0 */5 * * * *": Every 5 minutes at second 0
+# - "0 0 * * * *": Every hour
+
+local-simulation:
+  user-workflow:
+    workflow-name: "hmac"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.json"
+    secrets-path: "../secrets.yaml"
+
+staging:
+  user-workflow:
+    workflow-name: "hmac"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.json"
+    secrets-path: "../secrets.yaml"
+
+production-testnet:
+  user-workflow:
+    workflow-name: "hmac"
+  workflow-artifacts:
+    workflow-path: "."
+    config-path: "./config.json"
+    secrets-path: "../secrets.yaml"

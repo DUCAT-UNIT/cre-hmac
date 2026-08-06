@@ -1,0 +1,37 @@
+# Environment
+.env
+.env.local
+.env.*.local
+.env.*
+!.env.example
+secrets.local.yaml
+**/secrets.local.yaml
+*.pem
+*.key
+.claude/settings.local.json
+
+# Build artifacts (CRE compiles from source via workflow-path: ".")
+*.wasm
+*.wasm.br
+*.wasm.br.b64
+
+# Go
+*.exe
+*.test
+*.out
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+*.log
+*.tmp
