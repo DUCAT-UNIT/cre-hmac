@@ -11,6 +11,7 @@
   "rate_max": 4.00,
   "step_size": 0.01,
   "liquidation_thold": 1.35,
+  "enable_price_adjustment": true,
   "quote_domain": "dev-rate-1.36-4.00",
   "workflow_mode": "ladder",
   "report_signers": [

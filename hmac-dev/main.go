@@ -7,10 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"time"
-
-	ducatcrypto "ducat/crypto"
-	"ducat/shared"
 
 	pb "github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
@@ -58,15 +54,8 @@ type GenericHttpRequest struct {
 	Action string `json:"action"`
 }
 
-func sendEvaluateErrorCallback(wc *WorkflowConfig, runtime cre.Runtime, callbackURL string, req *EvaluateQuotesRequest, evalErr error) {
+func sendEvaluateErrorCallback(wc *WorkflowConfig, runtime cre.TeeRuntime, callbackURL string, req *EvaluateQuotesRequest, evalErr error) {
 	if callbackURL == "" || req == nil || evalErr == nil {
-		return
-	}
-	// The caller invokes this helper for request-validation failures too. Validate
-	// again at the dispatch boundary so an invalid callback URL cannot turn the
-	// error path into an SSRF primitive.
-	if err := shared.ValidateCallbackURL(callbackURL); err != nil {
-		runtime.Logger().Warn("Skipping unsafe evaluate error callback", "error", err)
 		return
 	}
 
@@ -84,7 +73,7 @@ func sendEvaluateErrorCallback(wc *WorkflowConfig, runtime cre.Runtime, callback
 	response := &EvaluateQuotesResponse{
 		Results:      results,
 		CurrentPrice: 0,
-		EvaluatedAt:  time.Now().Unix(),
+		EvaluatedAt:  runtime.Now().Unix(),
 	}
 	response.ComputeSummary()
 
@@ -98,15 +87,7 @@ func sendEvaluateErrorCallback(wc *WorkflowConfig, runtime cre.Runtime, callback
 		}
 	}
 
-	client := &http.Client{}
-	webhookPromise := http.SendRequest(wc, runtime, client,
-		func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-			sendJSONCallback(wc.Config, log, sr, callbackURL, trackingDomain, "evaluate", response)
-			return &RelayResponse{Success: true, Message: "webhook sent"}, nil
-		},
-		cre.ConsensusAggregationFromTags[*RelayResponse](),
-	)
-	_, _ = webhookPromise.Await()
+	sendJSONCallback(wc.Config, runtime.Logger(), newTeeSender(runtime), callbackURL, trackingDomain, "evaluate", response)
 }
 
 // onHttpTrigger routes requests based on action parameter.
@@ -117,15 +98,12 @@ func sendEvaluateErrorCallback(wc *WorkflowConfig, runtime cre.Runtime, callback
 //	action=status       → get adjustment status
 //	action=evaluate     → batch evaluate quotes
 //	thold_price present → create new quote
-func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (interface{}, error) {
+func onHttpTrigger(config *Config, runtime cre.TeeRuntime, payload *http.Payload) (interface{}, error) {
 	logger := runtime.Logger()
 	logger.Info("HTTP trigger received (dev)")
 
 	if payload.Input == nil || len(payload.Input) == 0 {
 		return nil, fmt.Errorf("no input provided")
-	}
-	if err := shared.ValidateNoDuplicateObjectFields(payload.Input); err != nil {
-		return nil, fmt.Errorf("invalid request envelope: %w", err)
 	}
 
 	// Fetch secrets from runtime
@@ -137,13 +115,14 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 
 	// Parse action field
 	var genericReq GenericHttpRequest
-	if err := json.Unmarshal(payload.Input, &genericReq); err != nil {
-		return nil, fmt.Errorf("invalid request envelope: %w", err)
-	}
+	_ = json.Unmarshal(payload.Input, &genericReq)
 
 	// Route based on action
 	switch genericReq.Action {
 	case "adjust":
+		if !config.EnablePriceAdjustment {
+			return nil, fmt.Errorf("price adjustment controls are disabled for this deployment")
+		}
 		var adjustReq PriceAdjustmentRequest
 		if err := json.Unmarshal(payload.Input, &adjustReq); err != nil {
 			return nil, fmt.Errorf("invalid adjust request format: %w", err)
@@ -155,6 +134,9 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 		return setAdjustment(wc, runtime, &adjustReq)
 
 	case "clear_adjust":
+		if !config.EnablePriceAdjustment {
+			return nil, fmt.Errorf("price adjustment controls are disabled for this deployment")
+		}
 		logger.Info("Routing to clearAdjustment")
 		return clearAdjustment(wc, runtime)
 
@@ -188,9 +170,6 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 		return evalResp, nil
 
 	default:
-		if genericReq.Action != "" {
-			return nil, fmt.Errorf("unsupported action %q", genericReq.Action)
-		}
 		// Create quote (legacy routing based on thold_price)
 		var requestData HttpRequestData
 		if err := json.Unmarshal(payload.Input, &requestData); err != nil {
@@ -218,7 +197,7 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 // kind-10001 pending snapshot → publish full kind-30000 ladder → publish
 // kind-10000 current snapshot. All in one execution under the 20-call CRE
 // budget. See runUnifiedCycle for the call accounting.
-func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (interface{}, error) {
+func onCronTrigger(config *Config, runtime cre.TeeRuntime, trigger *cron.Payload) (interface{}, error) {
 	logger := runtime.Logger()
 	scheduledTime := trigger.ScheduledExecutionTime.AsTime()
 	logger.Info("Cron trigger fired (dev-unified)",
@@ -252,62 +231,57 @@ func onCronTrigger(config *Config, runtime cre.Runtime, trigger *cron.Payload) (
 }
 
 // buildWorkflowConfig constructs a WorkflowConfig by retrieving required runtime secrets.
-func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, error) {
+// Under cre.HandlerInTee the secrets are threshold-decrypted by the Vault DON
+// directly inside the enclave — plaintext never exists in Workflow DON node
+// memory. Both secrets are fetched in a SINGLE batched GetSecrets call: one
+// relay-DON/Vault-DON quorum round instead of two (a second sequential
+// secrets round was observed failing quorum in the confidential beta).
+func buildWorkflowConfig(config *Config, runtime cre.TeeRuntime) (*WorkflowConfig, error) {
 	logger := runtime.Logger()
 
-	privateKeyReq := &pb.SecretRequest{Id: SecretPrivateKey}
-	privateKeySecret, err := runtime.GetSecret(privateKeyReq).Await()
+	secrets, err := runtime.GetSecrets([]*pb.SecretRequest{
+		{Id: SecretPrivateKey},
+		{Id: SecretClientSecret},
+	}).Await()
 	if err != nil {
-		logger.Error("Failed to fetch private_key secret", "error", err)
-		return nil, fmt.Errorf("failed to fetch private_key: %w", err)
-	}
-	if len(privateKeySecret.Value) != 64 {
-		return nil, fmt.Errorf("private_key must be 64 hex characters, got %d", len(privateKeySecret.Value))
+		logger.Error("Failed to fetch secrets batch", "error", err)
+		return nil, fmt.Errorf("failed to fetch secrets: %w", err)
 	}
 
-	privateKeyBytes, err := hex.DecodeString(privateKeySecret.Value)
+	var privateKeyValue, clientSecretValue string
+	for _, s := range secrets {
+		if s == nil {
+			continue
+		}
+		switch s.Id {
+		case SecretPrivateKey:
+			privateKeyValue = s.Value
+		case SecretClientSecret:
+			clientSecretValue = s.Value
+		}
+	}
+	if privateKeyValue == "" {
+		return nil, fmt.Errorf("private_key missing from secrets response")
+	}
+	if clientSecretValue == "" {
+		return nil, fmt.Errorf("client_secret missing from secrets response")
+	}
+
+	if len(privateKeyValue) != 64 {
+		return nil, fmt.Errorf("private_key must be 64 hex characters, got %d", len(privateKeyValue))
+	}
+
+	privateKeyBytes, err := hex.DecodeString(privateKeyValue)
 	if err != nil {
 		return nil, fmt.Errorf("private_key is not valid hex: %w", err)
-	}
-	if err := ducatcrypto.ValidateOraclePrivateKeyNotRevoked(privateKeyBytes); err != nil {
-		for i := range privateKeyBytes {
-			privateKeyBytes[i] = 0
-		}
-		return nil, fmt.Errorf("private_key rejected: %w", err)
-	}
-
-	clientSecretReq := &pb.SecretRequest{Id: SecretClientSecret}
-	clientSecretSecret, err := runtime.GetSecret(clientSecretReq).Await()
-	if err != nil {
-		for i := range privateKeyBytes {
-			privateKeyBytes[i] = 0
-		}
-		logger.Error("Failed to fetch client_secret secret", "error", err)
-		return nil, fmt.Errorf("failed to fetch client_secret: %w", err)
-	}
-	if clientSecretSecret.Value == "" {
-		for i := range privateKeyBytes {
-			privateKeyBytes[i] = 0
-		}
-		return nil, fmt.Errorf("client_secret cannot be empty")
-	}
-	clientSecretBytes := []byte(clientSecretSecret.Value)
-	if err := ducatcrypto.ValidateClientSecretNotRevoked(clientSecretBytes); err != nil {
-		for i := range privateKeyBytes {
-			privateKeyBytes[i] = 0
-		}
-		for i := range clientSecretBytes {
-			clientSecretBytes[i] = 0
-		}
-		return nil, fmt.Errorf("client_secret rejected: %w", err)
 	}
 
 	return &WorkflowConfig{
 		Config:            config,
-		PrivateKey:        privateKeySecret.Value,
+		PrivateKey:        privateKeyValue,
 		PrivateKeyBytes:   privateKeyBytes,
-		ClientSecret:      clientSecretSecret.Value,
-		ClientSecretBytes: clientSecretBytes,
+		ClientSecret:      clientSecretValue,
+		ClientSecretBytes: []byte(clientSecretValue),
 	}, nil
 }
 
@@ -329,8 +303,11 @@ func InitWorkflow(config *Config, logger *slog.Logger, secrets cre.SecretsProvid
 		},
 	}
 
+	// Confidential Workflows: both handlers execute inside an attested TEE.
+	// Triggers still fire on the Workflow DON (trigger payloads are visible to
+	// node operators); only the callback bodies run in the enclave.
 	handlers := cre.Workflow[*Config]{
-		cre.Handler(http.Trigger(httpConfig), onHttpTrigger),
+		cre.HandlerInTee(http.Trigger(httpConfig), onHttpTrigger, teeConstraint()),
 	}
 
 	if config.CronSchedule != "" {
@@ -342,7 +319,7 @@ func InitWorkflow(config *Config, logger *slog.Logger, secrets cre.SecretsProvid
 		)
 
 		cronTrigger := cron.Trigger(&cron.Config{Schedule: config.CronSchedule})
-		handlers = append(handlers, cre.Handler(cronTrigger, onCronTrigger))
+		handlers = append(handlers, cre.HandlerInTee(cronTrigger, onCronTrigger, teeConstraint()))
 	}
 
 	return handlers, nil

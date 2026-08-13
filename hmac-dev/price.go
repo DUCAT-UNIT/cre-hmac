@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
-	"time"
 
 	"ducat/datastream"
 
@@ -23,12 +22,11 @@ import (
 
 // Chainlink Data Streams price fetching with HMAC-SHA256 auth
 
-// fetchPriceMaxAttempts caps how many times each DON node will retry the
-// Chainlink fetch before reporting failure to consensus. The retry happens
-// per-node so a single transient timeout doesn't fail the whole DON round.
-// One attempt is one signed Chainlink request. Older builds first sent an
-// intentionally invalid request to scrape Chainlink server time, but that extra
-// gateway call was the dominant timeout source under CRE consensus.
+// fetchPriceMaxAttempts caps how many times the enclave will retry the
+// Chainlink fetch before reporting failure. One attempt is one signed
+// Chainlink request, sent exactly once from the TEE (not once per DON node).
+// Older builds first sent an intentionally invalid request to scrape Chainlink
+// server time, but that extra gateway call was the dominant timeout source.
 const fetchPriceMaxAttempts = 3
 
 type nonRetryablePriceError struct {
@@ -48,13 +46,12 @@ func isNonRetryablePriceError(err error) bool {
 	return errors.As(err, &nonRetryable)
 }
 
-// fetchPrice wraps fetchPriceOnce in a per-node retry loop. CRE's consensus
-// aggregation runs *after* this returns, so retries are local to each DON
-// node — they don't multiply HTTP calls across the DON or trigger extra
-// consensus rounds. Drift caused by Chainlink hiccups (Cloudflare 502,
+// fetchPrice wraps fetchPriceOnce in a retry loop that runs entirely inside
+// the enclave — each attempt is one real outbound HTTP call (counted by the
+// teeSender). Drift caused by Chainlink hiccups (Cloudflare 502,
 // connection-reset) is the dominant failure mode in dev; one quick retry
 // recovers ~all of them.
-func fetchPrice(wc *WorkflowConfig, logger *slog.Logger, requester *http.SendRequester) (*PriceData, error) {
+func fetchPrice(wc *WorkflowConfig, logger *slog.Logger, requester httpSender) (*PriceData, error) {
 	var lastErr error
 	for attempt := 1; attempt <= fetchPriceMaxAttempts; attempt++ {
 		data, err := fetchPriceOnce(wc, logger, requester)
@@ -78,7 +75,7 @@ func fetchPrice(wc *WorkflowConfig, logger *slog.Logger, requester *http.SendReq
 
 // fetchPriceOnce performs a single Chainlink Data Streams fetch. Caller wraps
 // this in retry.
-func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.SendRequester) (*PriceData, error) {
+func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester httpSender) (*PriceData, error) {
 	if wc == nil || wc.Config == nil {
 		return nil, fmt.Errorf("config cannot be nil")
 	}
@@ -98,7 +95,10 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 	path := "/api/v1/reports/latest?feedID=" + wc.Config.FeedID
 	url := wc.Config.DataStreamURL + path
 
-	requestTimeMs := time.Now().UnixMilli()
+	// Use the SDK runtime clock (env.now host import), not stdlib time.Now():
+	// inside a production enclave the WASI guest clock is not SDK-guaranteed,
+	// and a skewed timestamp here fails the Chainlink HMAC tolerance window.
+	requestTimeMs := requester.Now().UnixMilli()
 	timestamp := strconv.FormatInt(requestTimeMs, 10)
 	bodyHash := hex.EncodeToString(sha256.New().Sum(nil))
 	message := fmt.Sprintf("GET %s %s %s %s", path, bodyHash, wc.Config.ClientID, timestamp)
@@ -133,7 +133,8 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 
 	var report struct {
 		Report struct {
-			FullReport string `json:"fullReport"`
+			ObservationsTimestamp int64  `json:"observationsTimestamp"`
+			FullReport            string `json:"fullReport"`
 		} `json:"report"`
 	}
 	if err := json.Unmarshal(resp.Body, &report); err != nil {
@@ -147,7 +148,7 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 	// SECURITY (H1): Decode + cryptographically verify the Chainlink report.
 	// Replaces the old brute-force offset scan; reads the SIGNED int192 price at
 	// offset 192 and (when configured) verifies the DON signatures fail-closed.
-	price, observationsTimestamp, err := decodeAndVerifyReport(report.Report.FullReport, wc.Config, logger)
+	price, err := decodeAndVerifyReport(report.Report.FullReport, wc.Config, logger)
 	if err != nil {
 		return nil, fmt.Errorf("price decode/verify failed: %w", err)
 	}
@@ -156,6 +157,7 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 		return nil, fmt.Errorf("invalid price received: %w", err)
 	}
 
+	observationsTimestamp := report.Report.ObservationsTimestamp
 	priceStamp := observationsTimestamp
 
 	if priceStamp < 946684800 {
@@ -168,8 +170,11 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 	// SECURITY (H3): staleness check against the report's SIGNED observations
 	// timestamp. The DON signs observationsTimestamp, so it is the trustworthy
 	// clock; reject (do not merely warn) when the signed timestamp is too far
-	// from server time, and require it to be present — a report we cannot
-	// staleness-check (or one that is stale/replayed) must not drive liquidations.
+	// from the runtime clock, and require it to be present — a report we cannot
+	// staleness-check (or one that is stale/replayed) must not drive
+	// liquidations. The reference clock is the SDK runtime clock; a 200 from
+	// Chainlink additionally proves that clock sat within the (much tighter)
+	// HMAC auth tolerance of server time when the request was signed.
 	if observationsTimestamp <= 0 {
 		return nil, fmt.Errorf("report missing observations timestamp; cannot verify price freshness")
 	}
@@ -192,52 +197,52 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 }
 
 // decodeAndVerifyReport decodes the Chainlink Data Streams fullReport, reads the
-// price as a SIGNED int192 at the correct offset 192, returns the SIGNED
-// observations timestamp from the same report blob, and (when configured)
+// price as a SIGNED int192 at the correct offset 192, and (when configured)
 // cryptographically verifies the DON signatures.
 //
 // SECURITY (H1): Money-path code that FAILS CLOSED. The price is returned only
 // if the ABI envelope decodes, the v3 blob decodes, the decoded feedId matches
 // cfg.FeedID, and — when cfg.RequireReportVerification is true — at least
 // EffectiveReportSignerThreshold() distinct DON signers (all in
-// cfg.ReportSigners) signed the report. Config validation permits disabled
-// verification only with a loopback Data Streams endpoint.
-func decodeAndVerifyReport(reportHex string, cfg *Config, logger *slog.Logger) (float64, int64, error) {
+// cfg.ReportSigners) signed the report. When verification is disabled, a LOUD
+// warning is logged each fetch and the correctly-decoded price is still returned
+// (rollout escape hatch only).
+func decodeAndVerifyReport(reportHex string, cfg *Config, logger *slog.Logger) (float64, error) {
 	if reportHex == "" {
-		return 0, 0, fmt.Errorf("report hex cannot be empty")
+		return 0, fmt.Errorf("report hex cannot be empty")
 	}
 
 	reportBytes, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(reportHex, "0x"), "0X"))
 	if err != nil {
-		return 0, 0, fmt.Errorf("hex decode failed: %w", err)
+		return 0, fmt.Errorf("hex decode failed: %w", err)
 	}
 
 	reportContext, reportBlob, rs, ss, vs, err := datastream.DecodeFullReport(reportBytes)
 	if err != nil {
-		return 0, 0, fmt.Errorf("fullReport decode failed: %w", err)
+		return 0, fmt.Errorf("fullReport decode failed: %w", err)
 	}
 
-	feedID, priceInt, signedObservationsTimestamp, err := datastream.DecodeV3Price(reportBlob)
+	feedID, priceInt, _, err := datastream.DecodeV3Price(reportBlob)
 	if err != nil {
-		return 0, 0, fmt.Errorf("v3 report decode failed: %w", err)
+		return 0, fmt.Errorf("v3 report decode failed: %w", err)
 	}
 
 	if !datastream.FeedIDMatches(feedID, cfg.FeedID) {
-		return 0, 0, fmt.Errorf("report feedId 0x%x does not match configured feed_id %s", feedID, cfg.FeedID)
+		return 0, fmt.Errorf("report feedId 0x%x does not match configured feed_id %s", feedID, cfg.FeedID)
 	}
 
 	if priceInt.Sign() <= 0 {
-		return 0, 0, fmt.Errorf("decoded price is non-positive: %s", priceInt.String())
+		return 0, fmt.Errorf("decoded price is non-positive: %s", priceInt.String())
 	}
 
 	if cfg.RequireReportVerification {
 		authorized, err := datastream.BuildAuthorizedSignerSet(cfg.ReportSigners)
 		if err != nil {
-			return 0, 0, fmt.Errorf("invalid report_signers config: %w", err)
+			return 0, fmt.Errorf("invalid report_signers config: %w", err)
 		}
 		threshold := cfg.EffectiveReportSignerThreshold()
 		if err := datastream.VerifyReportSigners(reportContext, reportBlob, rs, ss, vs, authorized, threshold); err != nil {
-			return 0, 0, fmt.Errorf("DON signature verification failed: %w", err)
+			return 0, fmt.Errorf("DON signature verification failed: %w", err)
 		}
 		logger.Debug("Chainlink report DON signatures verified",
 			"signatures", len(rs),
@@ -261,7 +266,7 @@ func decodeAndVerifyReport(reportHex string, cfg *Config, logger *slog.Logger) (
 		"verified", cfg.RequireReportVerification,
 	)
 
-	return price, int64(signedObservationsTimestamp), nil
+	return price, nil
 }
 
 // validatePriceForEncoding validates price bounds

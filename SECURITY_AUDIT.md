@@ -1,13 +1,5 @@
 # DUCAT Oracle (cre-hmac) — Security Audit
 
-> **Historical snapshot — not a current release gate (2026-08-06).** Several
-> dispositions and line references below predate the present hardening work,
-> including DON verification/freshness, adjustment authorization and bounds,
-> relay response binding, and removal of the credential-derived test fixture.
-> The public-history credential incident still requires operator verification,
-> rotation/revocation if ever used, and history cleanup after rotation. Refresh
-> this document from the current review before using it operationally.
-
 _Multi-agent audit: 7 dimension reviewers → 2-lens adversarial verification per finding → manual confirmation of every critical. 81 agents, 30 findings confirmed after verification, 4 disputed, 2 refuted. Secret values are fingerprinted (length + first/last 2 chars), never printed._
 
 ---

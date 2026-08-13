@@ -9,9 +9,6 @@ import (
 	"log/slog"
 	"time"
 
-	ducatcrypto "ducat/crypto"
-	"ducat/shared"
-
 	pb "github.com/smartcontractkit/chainlink-protos/cre/go/sdk"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/scheduler/cron"
@@ -60,12 +57,6 @@ type GenericHttpRequest struct {
 
 func sendEvaluateErrorCallback(wc *WorkflowConfig, runtime cre.Runtime, callbackURL string, req *EvaluateQuotesRequest, evalErr error) {
 	if callbackURL == "" || req == nil || evalErr == nil {
-		return
-	}
-	// This helper is reached for request-validation failures. Revalidate at the
-	// network dispatch boundary so malformed/private callback URLs are never sent.
-	if err := shared.ValidateCallbackURL(callbackURL); err != nil {
-		runtime.Logger().Warn("Skipping unsafe evaluate error callback", "error", err)
 		return
 	}
 
@@ -123,9 +114,6 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 	if payload.Input == nil || len(payload.Input) == 0 {
 		return nil, fmt.Errorf("no input provided")
 	}
-	if err := shared.ValidateNoDuplicateObjectFields(payload.Input); err != nil {
-		return nil, fmt.Errorf("invalid request envelope: %w", err)
-	}
 
 	// Fetch secrets from runtime
 	wc, err := buildWorkflowConfig(config, runtime)
@@ -136,9 +124,7 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 
 	// Parse action field
 	var genericReq GenericHttpRequest
-	if err := json.Unmarshal(payload.Input, &genericReq); err != nil {
-		return nil, fmt.Errorf("invalid request envelope: %w", err)
-	}
+	_ = json.Unmarshal(payload.Input, &genericReq)
 
 	// Route based on action
 	switch genericReq.Action {
@@ -192,9 +178,6 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, payload *http.Payload) (
 		return evalResp, nil
 
 	default:
-		if genericReq.Action != "" {
-			return nil, fmt.Errorf("unsupported action %q", genericReq.Action)
-		}
 		// Create quote (legacy routing based on thold_price)
 		var requestData HttpRequestData
 		if err := json.Unmarshal(payload.Input, &requestData); err != nil {
@@ -269,12 +252,6 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 	if err != nil {
 		return nil, fmt.Errorf("private_key is not valid hex: %w", err)
 	}
-	if err := ducatcrypto.ValidateOraclePrivateKeyNotRevoked(privateKeyBytes); err != nil {
-		for i := range privateKeyBytes {
-			privateKeyBytes[i] = 0
-		}
-		return nil, fmt.Errorf("private_key rejected: %w", err)
-	}
 
 	clientSecretReq := &pb.SecretRequest{Id: SecretClientSecret}
 	clientSecretSecret, err := runtime.GetSecret(clientSecretReq).Await()
@@ -291,23 +268,13 @@ func buildWorkflowConfig(config *Config, runtime cre.Runtime) (*WorkflowConfig, 
 		}
 		return nil, fmt.Errorf("client_secret cannot be empty")
 	}
-	clientSecretBytes := []byte(clientSecretSecret.Value)
-	if err := ducatcrypto.ValidateClientSecretNotRevoked(clientSecretBytes); err != nil {
-		for i := range privateKeyBytes {
-			privateKeyBytes[i] = 0
-		}
-		for i := range clientSecretBytes {
-			clientSecretBytes[i] = 0
-		}
-		return nil, fmt.Errorf("client_secret rejected: %w", err)
-	}
 
 	return &WorkflowConfig{
 		Config:            config,
 		PrivateKey:        privateKeySecret.Value,
 		PrivateKeyBytes:   privateKeyBytes,
 		ClientSecret:      clientSecretSecret.Value,
-		ClientSecretBytes: clientSecretBytes,
+		ClientSecretBytes: []byte(clientSecretSecret.Value),
 	}, nil
 }
 

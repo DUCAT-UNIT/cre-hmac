@@ -13,7 +13,6 @@ const (
 	MaxPriceStalenessSec              = shared.MaxPriceStalenessSec
 	MaxAdjustmentPct                  = shared.MaxAdjustmentPct
 	MinAdjustmentPct                  = shared.MinAdjustmentPct
-	MaxAdjustmentDurationMin          = shared.MaxAdjustmentDurationMin
 	NostrEventKindThresholdCommitment = shared.NostrEventKindThresholdCommitment
 	OriginChainlinkDataStream         = shared.OriginChainlinkDataStream
 	EventTypeActive                   = shared.EventTypeActive

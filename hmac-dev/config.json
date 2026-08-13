@@ -11,6 +11,7 @@
   "rate_max": 5.00,
   "step_size": 0.01,
   "liquidation_thold": 1.35,
+  "enable_price_adjustment": true,
   "quote_domain": "auto-dev",
   "report_signers": [
     "0x6b23132dece4da06571ba9149e2986549cb5fb30",

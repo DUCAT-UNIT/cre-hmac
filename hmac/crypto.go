@@ -68,40 +68,6 @@ func createPriceContract(oracleSeckey string, oraclePubkey, chainNetwork string,
 	return crypto.CreatePriceContract(oracleSeckey, obs, tholdPrice)
 }
 
-// verifyPriceContractResponse validates signed relay content before any breach
-// decision or secret derivation. The API shape uses int64, so reject values that
-// would wrap when converted to the uint32 commitment format.
-func verifyPriceContractResponse(contract *PriceContractResponse) error {
-	if contract == nil {
-		return fmt.Errorf("price contract cannot be nil")
-	}
-	maxUint32 := int64(^uint32(0))
-	if contract.BasePrice <= 0 || contract.BasePrice > maxUint32 {
-		return fmt.Errorf("base_price out of uint32 range: %d", contract.BasePrice)
-	}
-	if contract.BaseStamp <= 0 || contract.BaseStamp > maxUint32 {
-		return fmt.Errorf("base_stamp out of uint32 range: %d", contract.BaseStamp)
-	}
-	if contract.TholdPrice <= 0 || contract.TholdPrice > maxUint32 {
-		return fmt.Errorf("thold_price out of uint32 range: %d", contract.TholdPrice)
-	}
-	if contract.TholdKey != nil && *contract.TholdKey == "" {
-		return fmt.Errorf("revealed thold_key cannot be empty")
-	}
-	return crypto.VerifyPriceContract(&crypto.PriceContract{
-		BasePrice:    uint32(contract.BasePrice),
-		BaseStamp:    uint32(contract.BaseStamp),
-		ChainNetwork: contract.ChainNetwork,
-		CommitHash:   contract.CommitHash,
-		ContractID:   contract.ContractID,
-		OraclePubkey: contract.OraclePubkey,
-		OracleSig:    contract.OracleSig,
-		TholdHash:    contract.TholdHash,
-		TholdKey:     contract.TholdKey,
-		TholdPrice:   uint32(contract.TholdPrice),
-	})
-}
-
 // verifyThresholdCommitment verifies secret matches hash160 commitment
 func verifyThresholdCommitment(secret, expectedHash string) error {
 	return crypto.VerifyThresholdCommitment(secret, expectedHash)

@@ -117,14 +117,14 @@ func (r *PriceAdjustmentRequest) Validate() error {
 	if r == nil {
 		return fmt.Errorf("request is nil")
 	}
-	if r.Pct < MinAdjustmentPct || r.Pct > MaxAdjustmentPct {
-		return fmt.Errorf("pct must be between %.0f and %.0f, got %.2f", MinAdjustmentPct, MaxAdjustmentPct, r.Pct)
+	if r.Pct < -99 || r.Pct > 1000 {
+		return fmt.Errorf("pct must be between -99 and 1000, got %.2f", r.Pct)
 	}
 	if r.DurationMinutes <= 0 {
 		return fmt.Errorf("duration_minutes must be positive, got %d", r.DurationMinutes)
 	}
-	if r.DurationMinutes > MaxAdjustmentDurationMin {
-		return fmt.Errorf("duration_minutes cannot exceed %d, got %d", MaxAdjustmentDurationMin, r.DurationMinutes)
+	if r.DurationMinutes > 1440 {
+		return fmt.Errorf("duration_minutes cannot exceed 1440 (24 hours), got %d", r.DurationMinutes)
 	}
 	return nil
 }

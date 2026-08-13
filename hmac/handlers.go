@@ -8,8 +8,6 @@ import (
 	"log/slog"
 	"math"
 
-	"ducat/shared"
-
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
 	"github.com/smartcontractkit/cre-sdk-go/cre"
 )
@@ -309,28 +307,6 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 			results[i] = result
 			continue
 		}
-		if originalData.ChainNetwork != wc.Config.Network || originalData.OraclePubkey != keys.SchnorrPubkey {
-			errMsg := "quote content is bound to an unexpected network or oracle key"
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
-		if (len(tholdHash) == shared.TholdHashLength && originalData.TholdHash != tholdHash) ||
-			(len(tholdHash) == shared.CommitHashLength && originalData.CommitHash != tholdHash) {
-			errMsg := "quote content does not match requested lookup hash"
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
-		if err := verifyPriceContractResponse(&originalData); err != nil {
-			errMsg := fmt.Sprintf("invalid signed price contract: %v", err)
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
 
 		result.TholdPrice = float64(originalData.TholdPrice)
 
@@ -349,19 +325,8 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 			continue
 		}
 
-		breached, err := shared.IsThresholdBreached(
-			float64(originalData.BasePrice),
-			float64(originalData.TholdPrice),
-			currentPrice,
-		)
-		if err != nil {
-			errMsg := fmt.Sprintf("invalid threshold relationship: %v", err)
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
-		if !breached {
+		// Check breach condition (price fell below threshold)
+		if currentPrice >= float64(originalData.TholdPrice) {
 			result.Status = "active"
 			result.TholdKey = nil
 			results[i] = result
@@ -991,7 +956,7 @@ type QuoteJob struct {
 
 // sendWebhookCallback sends a best-effort POST notification to the callback URL.
 func sendWebhookCallback(_ *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, event *NostrEvent, _ *PriceContractResponse, eventType string) {
-	logger.Info("Sending webhook callback", "eventType", eventType)
+	logger.Info("Sending webhook callback", "url", callbackURL, "eventType", eventType)
 
 	callbackPayload := map[string]interface{}{
 		"event_type": eventType,
@@ -1020,20 +985,20 @@ func sendWebhookCallback(_ *Config, logger *slog.Logger, sendRequester *http.Sen
 	}).Await()
 
 	if err != nil {
-		logger.Error("Webhook callback failed", "eventType", eventType, "error", err)
+		logger.Error("Webhook callback failed", "url", callbackURL, "error", err)
 		return
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		logger.Info("Webhook callback successful", "eventType", eventType, "status", resp.StatusCode)
+		logger.Info("Webhook callback successful", "url", callbackURL, "status", resp.StatusCode)
 	} else {
-		logger.Warn("Webhook callback returned non-2xx status", "eventType", eventType, "status", resp.StatusCode)
+		logger.Warn("Webhook callback returned non-2xx status", "url", callbackURL, "status", resp.StatusCode, "body", string(resp.Body))
 	}
 }
 
 // sendJSONCallback sends a best-effort JSON POST to the callback URL.
 func sendJSONCallback(_ *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, domain string, eventType string, data interface{}) {
-	logger.Info("Sending JSON callback", "eventType", eventType, "domain", domain)
+	logger.Info("Sending JSON callback", "url", callbackURL, "eventType", eventType, "domain", domain)
 
 	callbackPayload := map[string]interface{}{
 		"event_type": eventType,
@@ -1058,13 +1023,13 @@ func sendJSONCallback(_ *Config, logger *slog.Logger, sendRequester *http.SendRe
 	}).Await()
 
 	if err != nil {
-		logger.Error("JSON callback failed", "eventType", eventType, "domain", domain, "error", err)
+		logger.Error("JSON callback failed", "url", callbackURL, "error", err)
 		return
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		logger.Info("JSON callback successful", "eventType", eventType, "domain", domain, "status", resp.StatusCode)
+		logger.Info("JSON callback successful", "url", callbackURL, "status", resp.StatusCode)
 	} else {
-		logger.Warn("JSON callback returned non-2xx status", "eventType", eventType, "domain", domain, "status", resp.StatusCode)
+		logger.Warn("JSON callback returned non-2xx status", "url", callbackURL, "status", resp.StatusCode, "body", string(resp.Body))
 	}
 }

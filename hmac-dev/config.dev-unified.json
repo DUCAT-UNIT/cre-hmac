@@ -10,6 +10,7 @@
   "rate_max": 10.00,
   "step_size": 0.01,
   "liquidation_thold": 1.35,
+  "enable_price_adjustment": true,
   "quote_domain": "dev-rate-1.36-10.00-v2",
   "deployment_nonce": "mutinynet-2026-07-02-verified-btc-feed-v1",
   "report_signers": [

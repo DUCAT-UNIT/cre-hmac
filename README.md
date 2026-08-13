@@ -228,7 +228,7 @@ cd ../integration && go test ./...
 From the repo root:
 
 ```bash
-cre workflow deploy ./hmac-dev -T mutiny
+cre workflow deploy ./hmac-dev -T mutiny --yes
 ```
 
 `cre workflow deploy` upserts by name — same name = update, new name =
@@ -307,7 +307,7 @@ config changes. Record the current IDs here after each deploy (from the
 Deploy a specific environment with:
 
 ```bash
-cre workflow deploy ./hmac-dev -T <target>   # e.g. -T testnet4
+cre workflow deploy ./hmac-dev -T <target> --yes   # e.g. -T testnet4
 ```
 
 ### Chainlink Data Streams report verification (H1)
@@ -317,9 +317,9 @@ The price path verifies the DON signatures on each Data Streams report
 
 - `report_signers` — the feed's authorized DON signer addresses
 - `report_signer_threshold` — the `f+1` quorum
-- `require_report_verification` — must be `true` for every non-loopback Data
-  Streams endpoint; an unverified report is rejected. `false` is accepted only
-  for explicit loopback development.
+- `require_report_verification` — when `true`, an unverified report is rejected
+  (fail closed); when `false`, the price is still decoded at the correct offset
+  but a loud warning is logged each fetch.
 
 The signer set is **per feed `configDigest`** and **rotates on-chain**, so it is
 not in the report payload. To (re-)derive it for a feed — e.g. when cutting over
@@ -333,7 +333,7 @@ VerifierProxy.getVerifier(configDigest) -> Verifier
 `cre-tester/` is a diagnostic workflow that fetches one real report and logs the
 decoded price plus the recovered signer addresses, runnable via
 `cre workflow simulate cre-tester -T local-simulation` — use it to discover/verify
-the signer set for a feed before deploying that feed configuration.
+the signer set for a feed before enabling `require_report_verification`.
 
 ---
 
@@ -385,9 +385,35 @@ If you change `rate_min`, `rate_max`, `step_size`, or `liquidation_thold`:
 - **HMAC-SHA256** — deterministic secret derivation from `(client_secret, domain)`
 - **Hash160** — `RIPEMD160(SHA256(secret))`, Bitcoin-compatible
 - **BIP-340 Schnorr** — Nostr event signatures and tagged-hash commitments
-- **DON consensus** — Byzantine-fault-tolerant aggregation across Chainlink Data Streams
+- **DON-signed price reports** — Chainlink Data Streams reports are ABI-decoded
+  and their DON signer signatures verified fail-closed (`report_signers` +
+  threshold) before a price is used
+- **TEE attestation** — `hmac-dev` handlers run inside an attested AWS Nitro
+  enclave (CRE Confidential Workflows); execution completes only after DON
+  consensus verifies the enclave attestation
 
 All in pure Go in `crypto/` so they're testable outside WASM.
+
+---
+
+## Confidential execution (TEE)
+
+`hmac-dev` registers both handlers with `cre.HandlerInTee` (see
+`hmac-dev/tee.go`), pinned to AWS Nitro in `us-west-2`. Consequences:
+
+- `private_key` and `client_secret` are threshold-decrypted by the Vault DON
+  **inside the enclave**; plaintext never reaches Workflow DON node memory.
+  Thold-secret derivation and Schnorr signing happen in-enclave too.
+- Outbound HTTP (Chainlink fetch, relay publishes, webhooks) goes out via
+  `SendRequestInTee` — exactly once per request from the enclave, trusted via
+  attestation instead of per-node consensus. Webhook consumers no longer see
+  one call per DON node.
+- Trigger payloads, the workflow binary, and anything returned from a handler
+  still cross the Workflow DON and are visible to node operators.
+- Deploying confidential workflows requires Confidential Workflows private-beta
+  enrollment (separate from regular CRE deploy access); local simulation works
+  without it but is **not a real TEE**. Requires cre-sdk-go ≥ v1.18.0 and a cre
+  CLI ≥ v1.26.0.
 
 ---
 

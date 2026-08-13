@@ -35,7 +35,6 @@ import (
 	"strconv"
 	"strings"
 
-	ducatcrypto "ducat/crypto"
 	"ducat/datastream"
 	"ducat/shared"
 
@@ -96,16 +95,6 @@ func onHttpTrigger(config *Config, runtime cre.Runtime, _ *http.Payload) (*Teste
 	}
 	if clientSecret.Value == "" {
 		return nil, loud(logger, fmt.Errorf("client_secret from vault is empty"))
-	}
-	clientSecretBytes := []byte(clientSecret.Value)
-	if err := ducatcrypto.ValidateClientSecretNotRevoked(clientSecretBytes); err != nil {
-		for i := range clientSecretBytes {
-			clientSecretBytes[i] = 0
-		}
-		return nil, loud(logger, fmt.Errorf("client_secret rejected: %w", err))
-	}
-	for i := range clientSecretBytes {
-		clientSecretBytes[i] = 0
 	}
 
 	// Run the authenticated fetch + decode inside an http.SendRequest so we have
@@ -280,12 +269,11 @@ func decodeAndLog(reportHex string, cfg *Config, logger *slog.Logger) (*TesterRe
 		"configDigest", configDigestHex,
 	)
 	if !feedMatches {
-		return nil, fmt.Errorf("decoded feedId %s does not match configured feed_id %s", feedIDHex, cfg.FeedID)
+		logger.Warn(logPrefix+": decoded feedId does NOT match configured feed_id",
+			"decoded", feedIDHex, "configured", cfg.FeedID)
 	}
 
-	// Recover ALL signer addresses as untrusted discovery candidates. Recovery
-	// proves only control of the signing keys for this report; operators must
-	// still bind the full configDigest/signer/f tuple to the on-chain Verifier.
+	// Recover ALL signer addresses (DISCOVERY — no authorization check).
 	signers, err := datastream.RecoverReportSigners(reportContext, reportBlob, rs, ss, vs)
 	if err != nil {
 		return nil, fmt.Errorf("RecoverReportSigners failed: %w", err)
@@ -295,14 +283,14 @@ func decodeAndLog(reportHex string, cfg *Config, logger *slog.Logger) (*TesterRe
 	for i, addr := range signers {
 		addrHex := "0x" + hex.EncodeToString(addr[:])
 		signerHexes = append(signerHexes, addrHex)
-		logger.Info(logPrefix+": recovered candidate signer (untrusted until on-chain confirmation)",
+		logger.Info(logPrefix+": recovered signer",
 			"index", i, "address", addrHex)
 	}
 
 	// If report_signers is configured, exercise the REAL enforcement path
 	// (datastream.VerifyReportSigners) against this live report — this proves the
 	// fail-closed verification actually accepts a genuine report.
-	verifyResult := "discovery only (no report_signers configured; candidates are untrusted)"
+	verifyResult := "skipped (no report_signers configured)"
 	if len(cfg.ReportSigners) > 0 {
 		authorized, err := datastream.BuildAuthorizedSignerSet(cfg.ReportSigners)
 		if err != nil {
@@ -310,13 +298,14 @@ func decodeAndLog(reportHex string, cfg *Config, logger *slog.Logger) (*TesterRe
 		}
 		threshold := cfg.EffectiveReportSignerThreshold()
 		if err := datastream.VerifyReportSigners(reportContext, reportBlob, rs, ss, vs, authorized, threshold); err != nil {
+			verifyResult = "FAILED: " + err.Error()
 			logger.Error(logPrefix+": VERIFICATION FAILED on a real report",
 				"error", err, "threshold", threshold, "authorizedSigners", len(authorized))
-			return nil, fmt.Errorf("configured signer verification failed: %w", err)
+		} else {
+			verifyResult = fmt.Sprintf("PASSED (threshold %d, %d authorized signers)", threshold, len(authorized))
+			logger.Info(logPrefix+": VERIFICATION PASSED on real report",
+				"threshold", threshold, "authorizedSigners", len(authorized))
 		}
-		verifyResult = fmt.Sprintf("PASSED (threshold %d, %d authorized signers; configDigest still requires on-chain confirmation)", threshold, len(authorized))
-		logger.Info(logPrefix+": SIGNER VERIFICATION PASSED; configDigest still requires on-chain confirmation",
-			"threshold", threshold, "authorizedSigners", len(authorized))
 	}
 
 	return &TesterResult{

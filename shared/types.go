@@ -37,6 +37,13 @@ type Config struct {
 	QuoteDomain          string  `json:"quote_domain,omitempty"`           // Domain prefix for generated quotes
 	RegulatorCallbackURL string  `json:"regulator_callback_url,omitempty"` // Regulator URL for batch completion notifications
 
+	// EnablePriceAdjustment permits the development-only HTTP actions that
+	// publish a signed price adjustment control event. It is deliberately
+	// default-deny: an authenticated caller must not be able to influence a
+	// liquidation price feed merely because a development workflow is deployed
+	// with a production configuration.
+	EnablePriceAdjustment bool `json:"enable_price_adjustment,omitempty"`
+
 	// WorkflowMode selects what the cron handler does.
 	//   "price_publisher" → fetches Chainlink + publishes shared kind-10000 snapshot, no ladder.
 	//   "ladder" (default, also empty) → reads snapshot from relay + publishes kind-30000 ladder.

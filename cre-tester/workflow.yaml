@@ -11,8 +11,8 @@
 #     --trigger-index 0 --http-payload '{}'
 #
 # It uses a SINGLE HTTP trigger. The payload is ignored — any trivial input fires
-# the test. This diagnostic never needs the oracle signing key, so its dedicated
-# secrets file requests only client_secret from the CRE vault.
+# the test. secrets-path points at the repo-root secrets.yaml so client_secret is
+# resolved from the CRE vault via the owner key (same as hmac-dev).
 
 local-simulation:
   user-workflow:
@@ -20,4 +20,4 @@ local-simulation:
   workflow-artifacts:
     workflow-path: "."
     config-path: "./config.tester.json"
-    secrets-path: "./secrets.yaml"
+    secrets-path: "../secrets.yaml"

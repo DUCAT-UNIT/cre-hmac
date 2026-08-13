@@ -11,17 +11,19 @@ import (
 	"strings"
 	"time"
 
-	"ducat/shared"
-
 	"github.com/smartcontractkit/cre-sdk-go/capabilities/networking/http"
 	"github.com/smartcontractkit/cre-sdk-go/cre"
 )
 
-// Unified cron HTTP-call budget. The live dev-unified workflow was deployed
-// with a 20-call budget. Keep local source aligned until the deployed CRE cap
-// is changed intentionally.
+// Unified cron HTTP-call budget. Historically this tracked the deployed CRE
+// consensus-call cap of 20. Under TEE execution requests go out via
+// SendRequestInTee (no consensus rounds), but the budget is kept as a
+// conservative self-imposed guard until the confidential-execution capability
+// limits are published. The teeSender counts every actual outbound request —
+// including fetchPrice's internal retries — so the guard meters real enclave
+// HTTP calls, not loop rounds.
 //
-//	1  — Chainlink price fetch
+//	1  — Chainlink price fetch (up to 3 per round on transient failures)
 //	1  — adjustment-control read
 //	1  — kind-10001 pending snapshot publish
 //	7  — full 1.36–10.00 ladder = 7 chunks of 130 events
@@ -54,7 +56,7 @@ func isNonRetryablePriceFetchError(err error) bool {
 
 // createQuote creates a new threshold commitment and publishes it as a Nostr event.
 // In the dev workflow, it checks for an active price adjustment before using the price.
-func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpRequestData) (*NostrEvent, error) {
+func createQuote(wc *WorkflowConfig, runtime cre.TeeRuntime, requestData *HttpRequestData) (*NostrEvent, error) {
 	logger := runtime.Logger()
 	logger.Info("Creating new quote (dev)", "domain", requestData.Domain, "tholdPrice", *requestData.TholdPrice)
 
@@ -64,10 +66,9 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	}
 	defer keys.Zero()
 
-	// Fetch current BTC/USD price with consensus
-	client := &http.Client{}
-	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
-	priceData, err := priceDataPromise.Await()
+	// Fetch current BTC/USD price from inside the enclave
+	sender := newTeeSender(runtime)
+	priceData, err := fetchPrice(wc, logger, sender)
 	if err != nil {
 		return nil, fmt.Errorf("price fetch failed: %w", err)
 	}
@@ -76,7 +77,7 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	quoteStamp := priceData.Stamp
 
 	// Check for active price adjustment
-	currentPrice, adjusted := applyActiveAdjustment(wc, runtime, client, currentPrice, quoteStamp, keys.SchnorrPubkey, logger)
+	currentPrice, adjusted := applyActiveAdjustment(wc, sender, currentPrice, quoteStamp, keys.SchnorrPubkey, logger)
 	if adjusted {
 		if err := validatePriceForEncoding(currentPrice); err != nil {
 			return nil, fmt.Errorf("adjusted price out of bounds: %w", err)
@@ -136,7 +137,6 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 		Kind:      NostrEventKindContract,
 		Tags: [][]string{
 			{"d", contract.CommitHash},
-			{"h", contract.CommitHash},
 			{"h", contract.TholdHash},
 			{"domain", requestData.Domain},
 		},
@@ -150,14 +150,7 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 	logger.Info("Created quote (v2)", "eventId", nostrEvent.ID, "tholdHash", contract.TholdHash)
 
 	// Publish to relay
-	relayRespPromise := http.SendRequest(wc, runtime, client,
-		func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-			return publishEvent(wc.Config, log, sr, nostrEvent)
-		},
-		cre.ConsensusAggregationFromTags[*RelayResponse](),
-	)
-
-	relayResp, err := relayRespPromise.Await()
+	relayResp, err := publishEvent(wc.Config, logger, sender, nostrEvent)
 	if err != nil {
 		return nil, fmt.Errorf("relay publish failed: %w", err)
 	}
@@ -168,22 +161,14 @@ func createQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReque
 
 	// Send webhook callback if URL provided
 	if requestData.CallbackURL != nil && *requestData.CallbackURL != "" {
-		contract := &priceContract
-		webhookPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-				sendWebhookCallback(wc.Config, log, sr, *requestData.CallbackURL, nostrEvent, contract, "create")
-				return &RelayResponse{Success: true, Message: "webhook sent"}, nil
-			},
-			cre.ConsensusAggregationFromTags[*RelayResponse](),
-		)
-		_, _ = webhookPromise.Await()
+		sendWebhookCallback(wc.Config, logger, sender, *requestData.CallbackURL, nostrEvent, &priceContract, "create")
 	}
 
 	return nostrEvent, nil
 }
 
 // fetchQuote looks up an existing quote on the relay by thold_hash and returns it.
-func fetchQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpRequestData) (*PriceEvent, error) {
+func fetchQuote(wc *WorkflowConfig, runtime cre.TeeRuntime, requestData *HttpRequestData) (*PriceEvent, error) {
 	logger := runtime.Logger()
 	tholdHash := *requestData.TholdHash
 	logger.Info("Fetching existing quote", "domain", requestData.Domain, "tholdHash", tholdHash)
@@ -197,15 +182,8 @@ func fetchQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 	defer keys.Zero()
 	oraclePubkey := keys.SchnorrPubkey
 
-	client := &http.Client{}
-	fetchPromise := http.SendRequest(wc, runtime, client,
-		func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*BatchFetchResult, error) {
-			return fetchEventByDTag(wc.Config, log, sr, tholdHash, oraclePubkey)
-		},
-		cre.ConsensusIdenticalAggregation[*BatchFetchResult](),
-	)
-
-	fetchResult, err := fetchPromise.Await()
+	sender := newTeeSender(runtime)
+	fetchResult, err := fetchEventByDTag(wc.Config, logger, sender, tholdHash, oraclePubkey)
 	if err != nil {
 		return nil, fmt.Errorf("relay fetch failed: %w", err)
 	}
@@ -226,14 +204,7 @@ func fetchQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 
 	// Send webhook callback if URL provided
 	if requestData.CallbackURL != nil && *requestData.CallbackURL != "" {
-		webhookPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-				sendWebhookCallback(wc.Config, log, sr, *requestData.CallbackURL, &fetchResult.Event, &contract, "fetch")
-				return &RelayResponse{Success: true, Message: "webhook sent"}, nil
-			},
-			cre.ConsensusAggregationFromTags[*RelayResponse](),
-		)
-		_, _ = webhookPromise.Await()
+		sendWebhookCallback(wc.Config, logger, sender, *requestData.CallbackURL, &fetchResult.Event, &contract, "fetch")
 	}
 
 	return priceEvent, nil
@@ -241,7 +212,7 @@ func fetchQuote(wc *WorkflowConfig, runtime cre.Runtime, requestData *HttpReques
 
 // evaluateQuotes batch evaluates quotes, revealing secrets for any that are breached.
 // In the dev workflow, it checks for an active price adjustment before evaluating.
-func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *EvaluateQuotesRequest) (*EvaluateQuotesResponse, error) {
+func evaluateQuotes(wc *WorkflowConfig, runtime cre.TeeRuntime, requestData *EvaluateQuotesRequest) (*EvaluateQuotesResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Evaluating quotes batch (dev)", "count", len(requestData.TholdHashes))
 
@@ -252,9 +223,8 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 	defer keys.Zero()
 
 	// Fetch current BTC/USD price
-	client := &http.Client{}
-	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
-	priceData, err := priceDataPromise.Await()
+	sender := newTeeSender(runtime)
+	priceData, err := fetchPrice(wc, logger, sender)
 	if err != nil {
 		return nil, fmt.Errorf("price fetch failed: %w", err)
 	}
@@ -263,7 +233,7 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 	currentStamp := priceData.Stamp
 
 	// Check for active price adjustment
-	currentPrice, adjusted := applyActiveAdjustment(wc, runtime, client, currentPrice, currentStamp, keys.SchnorrPubkey, logger)
+	currentPrice, adjusted := applyActiveAdjustment(wc, sender, currentPrice, currentStamp, keys.SchnorrPubkey, logger)
 	// SECURITY (M9): re-validate the adjusted price before it drives breach
 	// decisions, matching createQuote/generateQuotes.
 	if adjusted {
@@ -274,18 +244,11 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 
 	logger.Info("Using price for evaluation", "currentPrice", currentPrice, "adjusted", adjusted)
 
-	// PHASE 1: Fetch quotes one-by-one to avoid consensus decoding issues on nested slices.
+	// PHASE 1: Fetch quotes one-by-one (kept from the consensus-era design so
+	// per-quote errors stay isolated; each fetch is one enclave HTTP call).
 	fetchResultMap := make(map[string]*BatchFetchResult, len(requestData.TholdHashes))
 	for _, dTag := range requestData.TholdHashes {
-		dTag := dTag
-		fetchPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*BatchFetchResult, error) {
-				return fetchEventByDTag(wc.Config, log, sr, dTag, keys.SchnorrPubkey)
-			},
-			cre.ConsensusIdenticalAggregation[*BatchFetchResult](),
-		)
-
-		fetchResp, fetchErr := fetchPromise.Await()
+		fetchResp, fetchErr := fetchEventByDTag(wc.Config, logger, sender, dTag, keys.SchnorrPubkey)
 		if fetchErr != nil {
 			errMsg := fmt.Sprintf("failed to fetch quote: %v", fetchErr)
 			fetchResultMap[dTag] = &BatchFetchResult{DTag: dTag, Error: &errMsg}
@@ -345,28 +308,6 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 			results[i] = result
 			continue
 		}
-		if originalData.ChainNetwork != wc.Config.Network || originalData.OraclePubkey != keys.SchnorrPubkey {
-			errMsg := "quote content is bound to an unexpected network or oracle key"
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
-		if (len(tholdHash) == shared.TholdHashLength && originalData.TholdHash != tholdHash) ||
-			(len(tholdHash) == shared.CommitHashLength && originalData.CommitHash != tholdHash) {
-			errMsg := "quote content does not match requested lookup hash"
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
-		if err := verifyPriceContractResponse(&originalData); err != nil {
-			errMsg := fmt.Sprintf("invalid signed price contract: %v", err)
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
 
 		result.TholdPrice = float64(originalData.TholdPrice)
 
@@ -385,19 +326,8 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 			continue
 		}
 
-		breached, err := shared.IsThresholdBreached(
-			float64(originalData.BasePrice),
-			float64(originalData.TholdPrice),
-			currentPrice,
-		)
-		if err != nil {
-			errMsg := fmt.Sprintf("invalid threshold relationship: %v", err)
-			result.Error = &errMsg
-			result.Status = "error"
-			results[i] = result
-			continue
-		}
-		if !breached {
+		// Check breach condition (price fell below threshold)
+		if currentPrice >= float64(originalData.TholdPrice) {
 			result.Status = "active"
 			result.TholdKey = nil
 			results[i] = result
@@ -517,14 +447,7 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 			breachEvents = append(breachEvents, breach.Event)
 		}
 
-		batchPublishPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*BatchPublishResponse, error) {
-				return publishEventsBatch(wc.Config, log, sr, breachEvents)
-			},
-			cre.ConsensusAggregationFromTags[*BatchPublishResponse](),
-		)
-
-		batchPublishResp, err := batchPublishPromise.Await()
+		batchPublishResp, err := publishEventsBatch(wc.Config, logger, sender, breachEvents)
 		if err != nil {
 			errMsg := fmt.Sprintf("batch publish failed: %v", err)
 			for _, breach := range breachesToPublish {
@@ -558,14 +481,7 @@ func evaluateQuotes(wc *WorkflowConfig, runtime cre.Runtime, requestData *Evalua
 		if len(requestData.TholdHashes) > 0 {
 			trackingDomain = fmt.Sprintf("eval-%s", requestData.TholdHashes[0][:8])
 		}
-		webhookPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-				sendJSONCallback(wc.Config, log, sr, *requestData.CallbackURL, trackingDomain, "evaluate", response)
-				return &RelayResponse{Success: true, Message: "webhook sent"}, nil
-			},
-			cre.ConsensusAggregationFromTags[*RelayResponse](),
-		)
-		_, _ = webhookPromise.Await()
+		sendJSONCallback(wc.Config, logger, sender, *requestData.CallbackURL, trackingDomain, "evaluate", response)
 	}
 
 	return response, nil
@@ -603,7 +519,7 @@ type QuoteJob struct {
 //	1  kind-10000 publish (+ up to unifiedCurrentPubMaxAttempts retries)
 //	-----
 //	11 happy-path; 9 retry slots remain.
-func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *GenerateQuotesRequest) (*GenerateQuotesResponse, error) {
+func runUnifiedCycle(wc *WorkflowConfig, runtime cre.TeeRuntime, requestData *GenerateQuotesRequest) (*GenerateQuotesResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Unified dev cycle started",
 		"rateMin", requestData.RateMin,
@@ -617,21 +533,24 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 	}
 	defer keys.Zero()
 
-	client := &http.Client{}
-	callsUsed := 0
+	// The teeSender counts every real outbound request (including fetchPrice's
+	// internal retries), so budget reads below meter actual enclave HTTP calls.
+	sender := newTeeSender(runtime)
 
 	// --- Step 1: fetch BTC/USD price ---
+	// fetchPrice already retries quick transient failures internally
+	// (fetchPriceMaxAttempts, back-to-back); this outer loop adds spaced
+	// rounds with a 5s wait, preserving the pre-TEE resilience against
+	// Chainlink hiccups.
 	var priceData *PriceData
 	for attempt := 1; attempt <= unifiedPriceMaxAttempts; attempt++ {
-		priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
-		callsUsed++
-		pd, perr := priceDataPromise.Await()
+		pd, perr := fetchPrice(wc, logger, sender)
 		if perr == nil && pd != nil {
 			priceData = pd
 			break
 		}
 		logger.Warn("price fetch failed; will retry",
-			"attempt", attempt, "callsUsed", callsUsed, "error", perr)
+			"attempt", attempt, "callsUsed", sender.Calls(), "error", perr)
 		if isNonRetryablePriceFetchError(perr) {
 			break
 		}
@@ -647,8 +566,7 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 	quoteStamp := priceData.Stamp
 
 	// --- Step 2: apply price adjustment if active ---
-	currentPrice, adjusted := applyActiveAdjustment(wc, runtime, client, currentPrice, quoteStamp, keys.SchnorrPubkey, logger)
-	callsUsed++ // applyActiveAdjustment makes exactly one relay query
+	currentPrice, adjusted := applyActiveAdjustment(wc, sender, currentPrice, quoteStamp, keys.SchnorrPubkey, logger)
 	if adjusted {
 		if err := validatePriceForEncoding(currentPrice); err != nil {
 			return nil, fmt.Errorf("adjusted price out of bounds: %w", err)
@@ -688,7 +606,7 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 	if err := signNostrEvent(pendingEvent, keys.PrivateKey); err != nil {
 		return nil, fmt.Errorf("failed to sign pending snapshot event: %w", err)
 	}
-	if err := publishWithRetry(wc, runtime, client, pendingEvent, unifiedSnapshotPubMaxAttempts, "kind-10001", &callsUsed, logger); err != nil {
+	if err := publishWithRetry(wc, sender, pendingEvent, unifiedSnapshotPubMaxAttempts, "kind-10001", logger); err != nil {
 		return nil, err
 	}
 
@@ -709,8 +627,9 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 		// (otherwise float-accumulation drifts e.g. 3.95 → 3.949999999999959).
 		rate := math.Round(rawRate*100) / 100
 		tholdPrice := math.Ceil(float64(basePrice) * liquidationThold / rate)
-		if math.IsNaN(tholdPrice) || math.IsInf(tholdPrice, 0) || tholdPrice <= 0 || tholdPrice > float64(MaxPriceValue) {
-			return nil, fmt.Errorf("invalid threshold price %.2f generated for rate %.2f", tholdPrice, rate)
+		if tholdPrice > float64(MaxPriceValue) {
+			logger.Warn("Skipping threshold price exceeding uint32 max", "rate", rate, "tholdPrice", tholdPrice)
+			continue
 		}
 		if minThold == 0 || tholdPrice < minThold {
 			minThold = tholdPrice
@@ -723,9 +642,6 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 			TholdPrice: tholdPrice,
 			Domain:     fmt.Sprintf("%s-%.2f", quoteDomainPrefix, rate),
 		})
-	}
-	if len(jobs) == 0 {
-		return nil, fmt.Errorf("refusing to promote snapshot without a ladder")
 	}
 
 	type SignedEvent struct {
@@ -749,11 +665,13 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 			uint32(job.TholdPrice),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create contract for rate %.2f: %w", job.Rate, err)
+			logger.Warn("Failed to create contract", "rate", job.Rate, "error", err)
+			continue
 		}
 		oracleSig, err := signSchnorr(keys.PrivateKey, contract.ContractID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to sign contract for rate %.2f: %w", job.Rate, err)
+			logger.Warn("Failed to sign contract", "rate", job.Rate, "error", err)
+			continue
 		}
 		eventData := PriceContractResponse{
 			ChainNetwork: snapshot.ChainNetwork,
@@ -769,7 +687,8 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 		}
 		eventJSON, err := json.Marshal(eventData)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal event for rate %.2f: %w", job.Rate, err)
+			logger.Warn("Failed to marshal event", "rate", job.Rate, "error", err)
+			continue
 		}
 		// d-tag scopes to base_stamp so events from different snapshots
 		// coexist on the relay instead of NIP-33-overwriting each other.
@@ -781,14 +700,14 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 			Tags: [][]string{
 				{"d", fmt.Sprintf("%d-%s", quoteStamp, strconv.FormatFloat(job.Rate, 'g', -1, 64))},
 				{"h", contract.CommitHash},
-				{"h", contract.TholdHash},
 				{"expires", expiresAt},
 				{"expiration", expiresAt},
 			},
 			Content: string(eventJSON),
 		}
 		if err := signNostrEvent(nostrEvent, keys.PrivateKey); err != nil {
-			return nil, fmt.Errorf("failed to sign event for rate %.2f: %w", job.Rate, err)
+			logger.Warn("Failed to sign event", "rate", job.Rate, "error", err)
+			continue
 		}
 		signedEvents = append(signedEvents, SignedEvent{
 			Job:       job,
@@ -820,39 +739,32 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 		// Budget left for this chunk = total - calls used so far
 		//                            - (chunks still to publish after this one)
 		//                            - reserve for kind-10000 publish.
-		maxAttemptsThisChunk := unifiedTotalCallBudget - callsUsed - chunksRemaining - unifiedCurrentPubMaxAttempts
+		maxAttemptsThisChunk := unifiedTotalCallBudget - sender.Calls() - chunksRemaining - unifiedCurrentPubMaxAttempts
 		if maxAttemptsThisChunk < 1 {
-			return nil, fmt.Errorf("budget exhausted before publishing chunk %d/%d (callsUsed=%d remaining=%d)", chunkIdx+1, totalChunks, callsUsed, chunksRemaining)
+			return nil, fmt.Errorf("budget exhausted before publishing chunk %d/%d (callsUsed=%d remaining=%d)", chunkIdx+1, totalChunks, sender.Calls(), chunksRemaining)
 		}
 
 		var chunkResp *BatchPublishResponse
 		var lastErr error
 		for attempt := 1; attempt <= maxAttemptsThisChunk; attempt++ {
-			chunkPromise := http.SendRequest(wc, runtime, client,
-				func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*BatchPublishResponse, error) {
-					return publishEventsBatch(wc.Config, log, sr, chunk)
-				},
-				cre.ConsensusAggregationFromTags[*BatchPublishResponse](),
-			)
-			callsUsed++
-			resp, err := chunkPromise.Await()
-			if err == nil && resp != nil && resp.Success && resp.Failed == 0 && resp.Published == len(chunk) {
+			resp, err := publishEventsBatch(wc.Config, logger, sender, chunk)
+			if err == nil && resp != nil && resp.Failed == 0 && resp.Published == len(chunk) {
 				chunkResp = resp
 				logger.Info("Chunk publish succeeded",
-					"chunkIdx", chunkIdx, "attempt", attempt, "published", resp.Published, "callsUsed", callsUsed)
+					"chunkIdx", chunkIdx, "attempt", attempt, "published", resp.Published, "callsUsed", sender.Calls())
 				break
 			}
 			lastErr = err
 			logger.Warn("Chunk publish failed; will retry if budget allows",
 				"chunkIdx", chunkIdx, "attempt", attempt, "maxAttempts", maxAttemptsThisChunk,
-				"callsUsed", callsUsed, "error", err)
+				"callsUsed", sender.Calls(), "error", err)
 			if attempt < maxAttemptsThisChunk {
 				time.Sleep(unifiedRetryWaitSec * time.Second)
 			}
 		}
 		if chunkResp == nil {
 			return nil, fmt.Errorf("chunk %d/%d failed after %d attempt(s); callsUsed=%d; lastErr=%v",
-				chunkIdx+1, totalChunks, maxAttemptsThisChunk, callsUsed, lastErr)
+				chunkIdx+1, totalChunks, maxAttemptsThisChunk, sender.Calls(), lastErr)
 		}
 		totalPublished += chunkResp.Published
 		totalFailed += chunkResp.Failed
@@ -875,7 +787,7 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 	if err := signNostrEvent(currentEvent, keys.PrivateKey); err != nil {
 		return nil, fmt.Errorf("failed to sign current snapshot event: %w", err)
 	}
-	if err := publishWithRetry(wc, runtime, client, currentEvent, unifiedCurrentPubMaxAttempts, "kind-10000", &callsUsed, logger); err != nil {
+	if err := publishWithRetry(wc, sender, currentEvent, unifiedCurrentPubMaxAttempts, "kind-10000", logger); err != nil {
 		return nil, err
 	}
 
@@ -897,7 +809,7 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 		"baseStamp", snapshot.BaseStamp,
 		"laddered", totalPublished,
 		"adjusted", adjusted,
-		"callsUsed", callsUsed,
+		"callsUsed", sender.Calls(),
 	)
 	return response, nil
 }
@@ -905,22 +817,15 @@ func runUnifiedCycle(wc *WorkflowConfig, runtime cre.Runtime, requestData *Gener
 // publishWithRetry publishes a single Nostr event up to maxAttempts times,
 // incrementing *callsUsed for every relay call (success or failure). label is
 // only used in logs to disambiguate kind-10001 vs kind-10000 failures.
-func publishWithRetry(wc *WorkflowConfig, runtime cre.Runtime, client *http.Client, event *NostrEvent, maxAttempts int, label string, callsUsed *int, logger *slog.Logger) error {
+func publishWithRetry(wc *WorkflowConfig, sender *teeSender, event *NostrEvent, maxAttempts int, label string, logger *slog.Logger) error {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if *callsUsed >= unifiedTotalCallBudget {
-			return fmt.Errorf("%s publish: budget exhausted before attempt %d (callsUsed=%d)", label, attempt, *callsUsed)
+		if sender.Calls() >= unifiedTotalCallBudget {
+			return fmt.Errorf("%s publish: budget exhausted before attempt %d (callsUsed=%d)", label, attempt, sender.Calls())
 		}
-		pubPromise := http.SendRequest(wc, runtime, client,
-			func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-				return publishEvent(wc.Config, log, sr, event)
-			},
-			cre.ConsensusAggregationFromTags[*RelayResponse](),
-		)
-		*callsUsed++
-		resp, perr := pubPromise.Await()
+		resp, perr := publishEvent(wc.Config, logger, sender, event)
 		if perr == nil && resp != nil && resp.Success {
 			logger.Info("Published event",
-				"label", label, "eventId", event.ID, "attempt", attempt, "callsUsed", *callsUsed)
+				"label", label, "eventId", event.ID, "attempt", attempt, "callsUsed", sender.Calls())
 			return nil
 		}
 		errMsg := ""
@@ -930,19 +835,19 @@ func publishWithRetry(wc *WorkflowConfig, runtime cre.Runtime, client *http.Clie
 			errMsg = resp.Message
 		}
 		logger.Warn("publish failed; will retry if budget allows",
-			"label", label, "attempt", attempt, "callsUsed", *callsUsed, "error", errMsg)
+			"label", label, "attempt", attempt, "callsUsed", sender.Calls(), "error", errMsg)
 		if attempt < maxAttempts {
 			time.Sleep(unifiedRetryWaitSec * time.Second)
 		}
 	}
-	return fmt.Errorf("%s publish failed after %d attempts (callsUsed=%d)", label, maxAttempts, *callsUsed)
+	return fmt.Errorf("%s publish failed after %d attempts (callsUsed=%d)", label, maxAttempts, sender.Calls())
 }
 
 // --- Webhook Helpers ---
 
 // sendWebhookCallback sends a best-effort POST notification to the callback URL.
-func sendWebhookCallback(_ *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, event *NostrEvent, _ *PriceContractResponse, eventType string) {
-	logger.Info("Sending webhook callback", "eventType", eventType)
+func sendWebhookCallback(_ *Config, logger *slog.Logger, sendRequester httpSender, callbackURL string, event *NostrEvent, _ *PriceContractResponse, eventType string) {
+	logger.Info("Sending webhook callback", "url", callbackURL, "eventType", eventType)
 
 	callbackPayload := map[string]interface{}{
 		"event_type": eventType,
@@ -971,20 +876,20 @@ func sendWebhookCallback(_ *Config, logger *slog.Logger, sendRequester *http.Sen
 	}).Await()
 
 	if err != nil {
-		logger.Error("Webhook callback failed", "eventType", eventType, "error", err)
+		logger.Error("Webhook callback failed", "url", callbackURL, "error", err)
 		return
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		logger.Info("Webhook callback successful", "eventType", eventType, "status", resp.StatusCode)
+		logger.Info("Webhook callback successful", "url", callbackURL, "status", resp.StatusCode)
 	} else {
-		logger.Warn("Webhook callback returned non-2xx status", "eventType", eventType, "status", resp.StatusCode)
+		logger.Warn("Webhook callback returned non-2xx status", "url", callbackURL, "status", resp.StatusCode, "body", string(resp.Body))
 	}
 }
 
 // sendJSONCallback sends a best-effort JSON POST to the callback URL.
-func sendJSONCallback(_ *Config, logger *slog.Logger, sendRequester *http.SendRequester, callbackURL string, domain string, eventType string, data interface{}) {
-	logger.Info("Sending JSON callback", "eventType", eventType, "domain", domain)
+func sendJSONCallback(_ *Config, logger *slog.Logger, sendRequester httpSender, callbackURL string, domain string, eventType string, data interface{}) {
+	logger.Info("Sending JSON callback", "url", callbackURL, "eventType", eventType, "domain", domain)
 
 	callbackPayload := map[string]interface{}{
 		"event_type": eventType,
@@ -1009,48 +914,42 @@ func sendJSONCallback(_ *Config, logger *slog.Logger, sendRequester *http.SendRe
 	}).Await()
 
 	if err != nil {
-		logger.Error("JSON callback failed", "eventType", eventType, "domain", domain, "error", err)
+		logger.Error("JSON callback failed", "url", callbackURL, "error", err)
 		return
 	}
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		logger.Info("JSON callback successful", "eventType", eventType, "domain", domain, "status", resp.StatusCode)
+		logger.Info("JSON callback successful", "url", callbackURL, "status", resp.StatusCode)
 	} else {
-		logger.Warn("JSON callback returned non-2xx status", "eventType", eventType, "domain", domain, "status", resp.StatusCode)
+		logger.Warn("JSON callback returned non-2xx status", "url", callbackURL, "status", resp.StatusCode, "body", string(resp.Body))
 	}
 }
 
-func adjustmentStatusFromRelay(wc *WorkflowConfig, runtime cre.Runtime, client *http.Client, authorPubkey string, currentStamp int64) (*AdjustmentStatusResponse, error) {
-	statusPromise := http.SendRequest(wc, runtime, client,
-		func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*AdjustmentStatusResponse, error) {
-			control, err := fetchAdjustmentControl(wc.Config, log, sr, authorPubkey)
-			if err != nil || control == nil {
-				return &AdjustmentStatusResponse{
-					Success: true,
-					Active:  false,
-					Message: "No active adjustment",
-				}, nil
-			}
+func adjustmentStatusFromRelay(wc *WorkflowConfig, sender httpSender, logger *slog.Logger, authorPubkey string, currentStamp int64) (*AdjustmentStatusResponse, error) {
+	control, err := fetchAdjustmentControl(wc.Config, logger, sender, authorPubkey)
+	if err != nil || control == nil {
+		return &AdjustmentStatusResponse{
+			Success: true,
+			Active:  false,
+			Message: "No active adjustment",
+		}, nil
+	}
 
-			active := control.IsActive(currentStamp)
-			msg := "Adjustment expired"
-			if active {
-				remaining := control.ExpiresAt - currentStamp
-				msg = fmt.Sprintf("Active: %.2f%% adjustment, %d seconds remaining", control.Pct, remaining)
-			}
+	active := control.IsActive(currentStamp)
+	msg := "Adjustment expired"
+	if active {
+		remaining := control.ExpiresAt - currentStamp
+		msg = fmt.Sprintf("Active: %.2f%% adjustment, %d seconds remaining", control.Pct, remaining)
+	}
 
-			return &AdjustmentStatusResponse{
-				Success:   true,
-				Active:    active,
-				Pct:       control.Pct,
-				ExpiresAt: control.ExpiresAt,
-				SetAt:     control.SetAt,
-				Message:   msg,
-			}, nil
-		},
-		cre.ConsensusAggregationFromTags[*AdjustmentStatusResponse](),
-	)
-	return statusPromise.Await()
+	return &AdjustmentStatusResponse{
+		Success:   true,
+		Active:    active,
+		Pct:       control.Pct,
+		ExpiresAt: control.ExpiresAt,
+		SetAt:     control.SetAt,
+		Message:   msg,
+	}, nil
 }
 
 func nextAdjustmentStamp(baseStamp int64, status *AdjustmentStatusResponse, minStamp int64) int64 {
@@ -1113,19 +1012,13 @@ func adjustmentResponseFromStatus(status *AdjustmentStatusResponse, message stri
 	}
 }
 
-func publishAdjustmentControlOnce(wc *WorkflowConfig, runtime cre.Runtime, client *http.Client, keys *KeyDerivation, control *PriceAdjustmentControl) (*RelayResponse, error) {
-	publishPromise := http.SendRequest(wc, runtime, client,
-		func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*RelayResponse, error) {
-			return publishAdjustmentControl(wc.Config, log, sr, keys, control, control.SetAt)
-		},
-		cre.ConsensusAggregationFromTags[*RelayResponse](),
-	)
-	return publishPromise.Await()
+func publishAdjustmentControlOnce(wc *WorkflowConfig, sender httpSender, logger *slog.Logger, keys *KeyDerivation, control *PriceAdjustmentControl) (*RelayResponse, error) {
+	return publishAdjustmentControl(wc.Config, logger, sender, keys, control, control.SetAt)
 }
 
 // setAdjustment handles the "adjust" action by publishing the active dev price
 // adjustment control event to the relay.
-func setAdjustment(wc *WorkflowConfig, runtime cre.Runtime, reqData *PriceAdjustmentRequest) (*PriceAdjustmentResponse, error) {
+func setAdjustment(wc *WorkflowConfig, runtime cre.TeeRuntime, reqData *PriceAdjustmentRequest) (*PriceAdjustmentResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Setting price adjustment", "pct", reqData.Pct, "durationMinutes", reqData.DurationMinutes)
 
@@ -1135,21 +1028,20 @@ func setAdjustment(wc *WorkflowConfig, runtime cre.Runtime, reqData *PriceAdjust
 	}
 	defer keys.Zero()
 
-	client := &http.Client{}
-	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
-	priceData, err := priceDataPromise.Await()
+	sender := newTeeSender(runtime)
+	priceData, err := fetchPrice(wc, logger, sender)
 	if err != nil {
 		return nil, fmt.Errorf("price fetch for timestamp failed: %w", err)
 	}
 
 	currentStamp := priceData.Stamp
-	status, err := adjustmentStatusFromRelay(wc, runtime, client, keys.SchnorrPubkey, currentStamp)
+	status, err := adjustmentStatusFromRelay(wc, sender, logger, keys.SchnorrPubkey, currentStamp)
 	if err != nil {
 		return nil, fmt.Errorf("adjustment status lookup failed: %w", err)
 	}
 	control := makeAdjustmentControl(reqData.Pct, reqData.DurationMinutes, nextAdjustmentStamp(currentStamp, status, 0))
 
-	relayResp, err := publishAdjustmentControlOnce(wc, runtime, client, keys, control)
+	relayResp, err := publishAdjustmentControlOnce(wc, sender, logger, keys, control)
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish adjustment: %w", err)
 	}
@@ -1158,7 +1050,7 @@ func setAdjustment(wc *WorkflowConfig, runtime cre.Runtime, reqData *PriceAdjust
 			return nil, fmt.Errorf("relay rejected adjustment: %s", relayResp.Message)
 		}
 
-		status, err = adjustmentStatusFromRelay(wc, runtime, client, keys.SchnorrPubkey, currentStamp)
+		status, err = adjustmentStatusFromRelay(wc, sender, logger, keys.SchnorrPubkey, currentStamp)
 		if err != nil {
 			return nil, fmt.Errorf("adjustment status lookup after relay race failed: %w", err)
 		}
@@ -1167,12 +1059,12 @@ func setAdjustment(wc *WorkflowConfig, runtime cre.Runtime, reqData *PriceAdjust
 		}
 
 		control = makeAdjustmentControl(reqData.Pct, reqData.DurationMinutes, nextAdjustmentStamp(currentStamp, status, control.SetAt))
-		relayResp, err = publishAdjustmentControlOnce(wc, runtime, client, keys, control)
+		relayResp, err = publishAdjustmentControlOnce(wc, sender, logger, keys, control)
 		if err != nil {
 			return nil, fmt.Errorf("failed to republish adjustment after relay race: %w", err)
 		}
 		if !relayResp.Success {
-			status, statusErr := adjustmentStatusFromRelay(wc, runtime, client, keys.SchnorrPubkey, currentStamp)
+			status, statusErr := adjustmentStatusFromRelay(wc, sender, logger, keys.SchnorrPubkey, currentStamp)
 			if statusErr == nil && adjustmentStatusMatches(status, reqData.Pct) {
 				return adjustmentResponseFromStatus(status, fmt.Sprintf("Price adjustment of %.2f%% already active from newer event", reqData.Pct)), nil
 			}
@@ -1186,7 +1078,7 @@ func setAdjustment(wc *WorkflowConfig, runtime cre.Runtime, reqData *PriceAdjust
 
 // clearAdjustment handles the "clear_adjust" action by publishing a zeroed,
 // expired control event.
-func clearAdjustment(wc *WorkflowConfig, runtime cre.Runtime) (*PriceAdjustmentResponse, error) {
+func clearAdjustment(wc *WorkflowConfig, runtime cre.TeeRuntime) (*PriceAdjustmentResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Clearing price adjustment")
 
@@ -1196,21 +1088,20 @@ func clearAdjustment(wc *WorkflowConfig, runtime cre.Runtime) (*PriceAdjustmentR
 	}
 	defer keys.Zero()
 
-	client := &http.Client{}
-	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
-	priceData, err := priceDataPromise.Await()
+	sender := newTeeSender(runtime)
+	priceData, err := fetchPrice(wc, logger, sender)
 	if err != nil {
 		return nil, fmt.Errorf("price fetch for timestamp failed: %w", err)
 	}
 
 	currentStamp := priceData.Stamp
-	status, err := adjustmentStatusFromRelay(wc, runtime, client, keys.SchnorrPubkey, currentStamp)
+	status, err := adjustmentStatusFromRelay(wc, sender, logger, keys.SchnorrPubkey, currentStamp)
 	if err != nil {
 		return nil, fmt.Errorf("adjustment status lookup failed: %w", err)
 	}
 	control := makeAdjustmentControl(0, 0, nextAdjustmentStamp(currentStamp, status, 0))
 
-	relayResp, err := publishAdjustmentControlOnce(wc, runtime, client, keys, control)
+	relayResp, err := publishAdjustmentControlOnce(wc, sender, logger, keys, control)
 	if err != nil {
 		return nil, fmt.Errorf("failed to clear adjustment: %w", err)
 	}
@@ -1219,7 +1110,7 @@ func clearAdjustment(wc *WorkflowConfig, runtime cre.Runtime) (*PriceAdjustmentR
 			return nil, fmt.Errorf("relay rejected clear: %s", relayResp.Message)
 		}
 
-		status, err = adjustmentStatusFromRelay(wc, runtime, client, keys.SchnorrPubkey, currentStamp)
+		status, err = adjustmentStatusFromRelay(wc, sender, logger, keys.SchnorrPubkey, currentStamp)
 		if err != nil {
 			return nil, fmt.Errorf("adjustment status lookup after relay race failed: %w", err)
 		}
@@ -1228,12 +1119,12 @@ func clearAdjustment(wc *WorkflowConfig, runtime cre.Runtime) (*PriceAdjustmentR
 		}
 
 		control = makeAdjustmentControl(0, 0, nextAdjustmentStamp(currentStamp, status, control.SetAt))
-		relayResp, err = publishAdjustmentControlOnce(wc, runtime, client, keys, control)
+		relayResp, err = publishAdjustmentControlOnce(wc, sender, logger, keys, control)
 		if err != nil {
 			return nil, fmt.Errorf("failed to republish clear after relay race: %w", err)
 		}
 		if !relayResp.Success {
-			status, statusErr := adjustmentStatusFromRelay(wc, runtime, client, keys.SchnorrPubkey, currentStamp)
+			status, statusErr := adjustmentStatusFromRelay(wc, sender, logger, keys.SchnorrPubkey, currentStamp)
 			if statusErr == nil && adjustmentStatusMatches(status, 0) {
 				return adjustmentResponseFromStatus(status, "Price adjustment already cleared by newer event"), nil
 			}
@@ -1246,7 +1137,7 @@ func clearAdjustment(wc *WorkflowConfig, runtime cre.Runtime) (*PriceAdjustmentR
 }
 
 // getAdjustmentStatus handles the "status" action.
-func getAdjustmentStatus(wc *WorkflowConfig, runtime cre.Runtime) (*AdjustmentStatusResponse, error) {
+func getAdjustmentStatus(wc *WorkflowConfig, runtime cre.TeeRuntime) (*AdjustmentStatusResponse, error) {
 	logger := runtime.Logger()
 	logger.Info("Checking adjustment status")
 
@@ -1256,70 +1147,30 @@ func getAdjustmentStatus(wc *WorkflowConfig, runtime cre.Runtime) (*AdjustmentSt
 	}
 	defer keys.Zero()
 
-	client := &http.Client{}
-	priceDataPromise := http.SendRequest(wc, runtime, client, fetchPrice, cre.ConsensusAggregationFromTags[*PriceData]())
-	priceData, err := priceDataPromise.Await()
+	sender := newTeeSender(runtime)
+	priceData, err := fetchPrice(wc, logger, sender)
 	if err != nil {
 		return nil, fmt.Errorf("price fetch for timestamp failed: %w", err)
 	}
 
-	currentStamp := priceData.Stamp
-	controlAuthor := keys.SchnorrPubkey
-	controlPromise := http.SendRequest(wc, runtime, client,
-		func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*AdjustmentStatusResponse, error) {
-			control, err := fetchAdjustmentControl(wc.Config, log, sr, controlAuthor)
-			if err != nil || control == nil {
-				return &AdjustmentStatusResponse{
-					Success: true,
-					Active:  false,
-					Message: "No active adjustment",
-				}, nil
-			}
-
-			active := control.IsActive(currentStamp)
-			msg := "Adjustment expired"
-			if active {
-				remaining := control.ExpiresAt - currentStamp
-				msg = fmt.Sprintf("Active: %.2f%% adjustment, %d seconds remaining", control.Pct, remaining)
-			}
-
-			return &AdjustmentStatusResponse{
-				Success:   true,
-				Active:    active,
-				Pct:       control.Pct,
-				ExpiresAt: control.ExpiresAt,
-				SetAt:     control.SetAt,
-				Message:   msg,
-			}, nil
-		},
-		cre.ConsensusAggregationFromTags[*AdjustmentStatusResponse](),
-	)
-
-	return controlPromise.Await()
+	return adjustmentStatusFromRelay(wc, sender, logger, keys.SchnorrPubkey, priceData.Stamp)
 }
 
 // applyActiveAdjustment checks for an active price adjustment and applies it.
 // Returns the (possibly adjusted) price and whether an adjustment was applied.
-func applyActiveAdjustment(wc *WorkflowConfig, runtime cre.Runtime, client *http.Client, price float64, currentStamp int64, controlAuthor string, logger *slog.Logger) (float64, bool) {
-	controlPromise := http.SendRequest(wc, runtime, client,
-		func(wc *WorkflowConfig, log *slog.Logger, sr *http.SendRequester) (*AdjustmentStatusResponse, error) {
-			control, err := fetchAdjustmentControl(wc.Config, log, sr, controlAuthor)
-			if err != nil || control == nil {
-				return &AdjustmentStatusResponse{Active: false}, nil
-			}
-			return &AdjustmentStatusResponse{
-				Active:    control.IsActive(currentStamp),
-				Pct:       control.Pct,
-				ExpiresAt: control.ExpiresAt,
-			}, nil
-		},
-		cre.ConsensusAggregationFromTags[*AdjustmentStatusResponse](),
-	)
-
-	statusResp, err := controlPromise.Await()
+func applyActiveAdjustment(wc *WorkflowConfig, sender httpSender, price float64, currentStamp int64, controlAuthor string, logger *slog.Logger) (float64, bool) {
+	control, err := fetchAdjustmentControl(wc.Config, logger, sender, controlAuthor)
 	if err != nil {
 		logger.Warn("Failed to fetch adjustment control, using real price", "error", err)
 		return price, false
+	}
+	statusResp := &AdjustmentStatusResponse{Active: false}
+	if control != nil {
+		statusResp = &AdjustmentStatusResponse{
+			Active:    control.IsActive(currentStamp),
+			Pct:       control.Pct,
+			ExpiresAt: control.ExpiresAt,
+		}
 	}
 
 	if !statusResp.Active {

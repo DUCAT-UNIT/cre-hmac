@@ -172,7 +172,8 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 	// Parse price report response
 	var report struct {
 		Report struct {
-			FullReport string `json:"fullReport"` // Hex-encoded signed report
+			ObservationsTimestamp int64  `json:"observationsTimestamp"` // DON consensus timestamp
+			FullReport            string `json:"fullReport"`            // Hex-encoded Merkle root report
 		} `json:"report"`
 	}
 	if err := json.Unmarshal(resp.Body, &report); err != nil {
@@ -191,7 +192,7 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 	//   1. A proper Solidity-ABI decode of the fullReport envelope.
 	//   2. A proper v3 decode reading the price as a SIGNED int192 at offset 192.
 	//   3. DON signature verification (gated by RequireReportVerification).
-	price, observationsTimestamp, err := decodeAndVerifyReport(report.Report.FullReport, wc.Config, logger)
+	price, err := decodeAndVerifyReport(report.Report.FullReport, wc.Config, logger)
 	if err != nil {
 		return nil, fmt.Errorf("price decode/verify failed: %w", err)
 	}
@@ -201,9 +202,8 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 		return nil, fmt.Errorf("invalid price received: %w", err)
 	}
 
-	// The event timestamp is the observation timestamp embedded in the signed
-	// report blob, not mutable metadata in the outer HTTP JSON response.
-	priceStamp := observationsTimestamp
+	// Convert milliseconds to seconds for consistency with Unix timestamps
+	priceStamp := serverTime / 1000
 
 	// SECURITY: Validate timestamp precision and bounds after conversion
 	// Ensures the Unix timestamp is within reasonable range (2000-2100)
@@ -220,18 +220,18 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 	// clock; reject (do not merely warn) when the signed timestamp is too far
 	// from server time, and require it to be present — a report we cannot
 	// staleness-check (or one that is stale/replayed) must not drive liquidations.
+	observationsTimestamp := report.Report.ObservationsTimestamp
 	if observationsTimestamp <= 0 {
 		return nil, fmt.Errorf("report missing observations timestamp; cannot verify price freshness")
 	}
-	// Compare the signed report timestamp with the Data Engine's server time.
-	serverTimeSec := serverTime / 1000
-	timeDiff := serverTimeSec - observationsTimestamp
+	// ObservationsTimestamp is in seconds (Unix), compare with priceStamp.
+	timeDiff := priceStamp - observationsTimestamp
 	if timeDiff < 0 {
 		timeDiff = -timeDiff
 	}
 	if timeDiff > MaxPriceStalenessSec {
 		return nil, fmt.Errorf("price report is stale: signed observation time %d differs from server time %d by %ds (max %ds)",
-			observationsTimestamp, serverTimeSec, timeDiff, MaxPriceStalenessSec)
+			observationsTimestamp, priceStamp, timeDiff, MaxPriceStalenessSec)
 	}
 
 	logger.Info("Price fetched successfully", "price", price, "stamp", priceStamp)
@@ -244,9 +244,8 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 }
 
 // decodeAndVerifyReport decodes the Chainlink Data Streams fullReport, reads the
-// price as a SIGNED int192 at the correct offset 192, returns the SIGNED
-// observations timestamp from that blob, and (when configured) cryptographically
-// verifies the DON signatures.
+// price as a SIGNED int192 at the correct offset 192, and (when configured)
+// cryptographically verifies the DON signatures.
 //
 // SECURITY (H1): This is money-path code and FAILS CLOSED. The price is returned
 // only if:
@@ -257,51 +256,51 @@ func fetchPriceOnce(wc *WorkflowConfig, logger *slog.Logger, requester *http.Sen
 //     EffectiveReportSignerThreshold() distinct DON signers (all in
 //     cfg.ReportSigners) signed the report.
 //
-// Config validation permits cfg.RequireReportVerification=false only with a
-// loopback Data Streams endpoint. That development mode logs a warning on every
-// fetch.
-func decodeAndVerifyReport(reportHex string, cfg *Config, logger *slog.Logger) (float64, int64, error) {
+// When cfg.RequireReportVerification is false, signature verification is SKIPPED
+// but a LOUD warning is logged on every fetch and the (correctly-decoded) price
+// is still returned — this is the rollout escape hatch, not a steady state.
+func decodeAndVerifyReport(reportHex string, cfg *Config, logger *slog.Logger) (float64, error) {
 	if reportHex == "" {
-		return 0, 0, fmt.Errorf("report hex cannot be empty")
+		return 0, fmt.Errorf("report hex cannot be empty")
 	}
 
 	reportBytes, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(reportHex, "0x"), "0X"))
 	if err != nil {
-		return 0, 0, fmt.Errorf("hex decode failed: %w", err)
+		return 0, fmt.Errorf("hex decode failed: %w", err)
 	}
 
 	// 1. Decode the outer Solidity-ABI fullReport envelope.
 	reportContext, reportBlob, rs, ss, vs, err := datastream.DecodeFullReport(reportBytes)
 	if err != nil {
-		return 0, 0, fmt.Errorf("fullReport decode failed: %w", err)
+		return 0, fmt.Errorf("fullReport decode failed: %w", err)
 	}
 
 	// 2. Decode the v3 reportBlob: feedId + signed int192 price at offset 192.
-	feedID, priceInt, signedObservationsTimestamp, err := datastream.DecodeV3Price(reportBlob)
+	feedID, priceInt, _, err := datastream.DecodeV3Price(reportBlob)
 	if err != nil {
-		return 0, 0, fmt.Errorf("v3 report decode failed: %w", err)
+		return 0, fmt.Errorf("v3 report decode failed: %w", err)
 	}
 
 	// 3. The decoded feedId MUST match the configured feed (fail closed).
 	if !datastream.FeedIDMatches(feedID, cfg.FeedID) {
-		return 0, 0, fmt.Errorf("report feedId 0x%x does not match configured feed_id %s", feedID, cfg.FeedID)
+		return 0, fmt.Errorf("report feedId 0x%x does not match configured feed_id %s", feedID, cfg.FeedID)
 	}
 
 	// Price must be positive (BTC/USD never negative for our use).
 	if priceInt.Sign() <= 0 {
-		return 0, 0, fmt.Errorf("decoded price is non-positive: %s", priceInt.String())
+		return 0, fmt.Errorf("decoded price is non-positive: %s", priceInt.String())
 	}
 
 	// 4. DON signature verification, gated for rollout.
 	if cfg.RequireReportVerification {
 		authorized, err := datastream.BuildAuthorizedSignerSet(cfg.ReportSigners)
 		if err != nil {
-			return 0, 0, fmt.Errorf("invalid report_signers config: %w", err)
+			return 0, fmt.Errorf("invalid report_signers config: %w", err)
 		}
 		threshold := cfg.EffectiveReportSignerThreshold()
 		if err := datastream.VerifyReportSigners(reportContext, reportBlob, rs, ss, vs, authorized, threshold); err != nil {
 			// Fail closed: reject the price entirely.
-			return 0, 0, fmt.Errorf("DON signature verification failed: %w", err)
+			return 0, fmt.Errorf("DON signature verification failed: %w", err)
 		}
 		logger.Debug("Chainlink report DON signatures verified",
 			"signatures", len(rs),
@@ -329,7 +328,7 @@ func decodeAndVerifyReport(reportHex string, cfg *Config, logger *slog.Logger) (
 		"verified", cfg.RequireReportVerification,
 	)
 
-	return price, int64(signedObservationsTimestamp), nil
+	return price, nil
 }
 
 // validatePriceForEncoding validates price bounds
